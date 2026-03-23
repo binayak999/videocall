@@ -99,11 +99,27 @@ npm run start
 
 ### 9. Run Prisma migrations
 
+**Production / staging (VPS, Docker DB, etc.)** — apply committed migrations without prompts:
+
 ```bash
-npm run db:migrate -w @bandr/db
+cd /path/to/bandr
+npm run db:migrate:deploy
 ```
 
-If prompted, name the migration or apply existing migrations. Ensure root `.env` exists so `DATABASE_URL` is loaded.
+This runs `prisma migrate deploy` using **`DATABASE_URL` from the repo root `.env`**. That URL must be the **same database** your API uses (`apps/api/.env` → `DATABASE_URL`). If you only set `DATABASE_URL` under `apps/api/.env`, either copy it into root `.env` or run:
+
+```bash
+cd packages/db
+npx dotenv -e ../../apps/api/.env -- prisma migrate deploy
+```
+
+**Local development** — create/iterate migrations interactively:
+
+```bash
+npm run db:migrate
+```
+
+(`db:migrate` is `prisma migrate dev`; do **not** use that for automated server deploys.)
 
 ---
 
@@ -144,6 +160,16 @@ pm2 restart bandr-api bandr-signaling
 ## Part D — Nginx (optional)
 
 Put TLS + reverse proxy in front: see `deploy/nginx.example.conf` (e.g. `video.upliftsolutions.com.np` → `127.0.0.1:4001` and `/socket.io/` → `127.0.0.1:4002`).
+
+### ERR_TOO_MANY_REDIRECTS in the browser
+
+This usually means **HTTP ↔ HTTPS** is bouncing. Common case: **Cloudflare** (or another CDN) with SSL mode **Flexible** — the visitor uses HTTPS, but the origin is reached over **HTTP** on port 80. If nginx responds with `301 https://…` for every request on port 80, the browser keeps following the same URL and loops.
+
+**Fix (pick one):**
+
+1. **Cloudflare:** SSL/TLS → Overview → set encryption mode to **Full** or **Full (strict)** (your origin must listen on **443** with a valid certificate; Let’s Encrypt on the box is fine).
+2. **Or** use the **port 80** server block in `deploy/nginx.example.conf` (proxy when `X-Forwarded-Proto` is `https` instead of redirecting).
+3. **Or** remove any **unconditional** `return 301 https://…` on port 80 that certbot may have added in a separate file under `sites-enabled/`.
 
 ---
 
