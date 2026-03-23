@@ -54,6 +54,8 @@ cd /path/to/bandr
 npm ci
 ```
 
+Use the **repo root** for installs (`npm ci` / `npm install`). Running install only inside `apps/api` skips workspace linking and can break `@bandr/db` resolution at build or runtime.
+
 ### 7. Configure app env files
 
 Create **`apps/api/.env`** and **`apps/signaling/.env`** (not committed). Minimum:
