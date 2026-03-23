@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Meet clone — dev</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="layout">
+      <header class="header">
+        <h1>Meet clone</h1>
+        <p class="sub">Local dev dashboard · API + signaling smoke tests</p>
+      </header>
+
+      <section class="card" aria-labelledby="status-title">
+        <h2 id="status-title">Services</h2>
+        <div class="grid two">
+          <div>
+            <h3>API</h3>
+            <pre id="api-health" class="out">Loading…</pre>
+          </div>
+          <div>
+            <h3>Signaling</h3>
+            <pre id="signaling-health" class="out">Loading…</pre>
+          </div>
+        </div>
+        <button type="button" class="btn secondary" id="btn-refresh-status">
+          Refresh status
+        </button>
+      </section>
+
+      <section class="card" aria-labelledby="auth-title">
+        <h2 id="auth-title">Auth</h2>
+        <div class="grid two">
+          <form id="form-register" class="stack">
+            <h3>Register</h3>
+            <label>
+              Email
+              <input name="email" type="email" autocomplete="email" required />
+            </label>
+            <label>
+              Name
+              <input name="name" type="text" autocomplete="name" required />
+            </label>
+            <label>
+              Password
+              <input
+                name="password"
+                type="password"
+                autocomplete="new-password"
+                minlength="8"
+                required
+              />
+            </label>
+            <button type="submit" class="btn">Register</button>
+          </form>
+          <form id="form-login" class="stack">
+            <h3>Login</h3>
+            <label>
+              Email
+              <input name="email" type="email" autocomplete="email" required />
+            </label>
+            <label>
+              Password
+              <input
+                name="password"
+                type="password"
+                autocomplete="current-password"
+                required
+              />
+            </label>
+            <button type="submit" class="btn">Login</button>
+          </form>
+        </div>
+        <div class="token-row">
+          <span class="muted">JWT (stored in this tab)</span>
+          <code id="token-preview" class="token-preview">—</code>
+          <button type="button" class="btn ghost" id="btn-clear-token">
+            Clear
+          </button>
+        </div>
+        <pre id="auth-result" class="out compact" hidden></pre>
+      </section>
+
+      <section class="card" aria-labelledby="meetings-title">
+        <h2 id="meetings-title">Meetings</h2>
+        <div class="grid two">
+          <form id="form-create-meeting" class="stack">
+            <h3>Create (protected)</h3>
+            <label>
+              Title <span class="muted">(optional)</span>
+              <input name="title" type="text" placeholder="Weekly sync" />
+            </label>
+            <button type="submit" class="btn">Create meeting</button>
+          </form>
+          <form id="form-get-meeting" class="stack">
+            <h3>Lookup by code (public)</h3>
+            <label>
+              Code
+              <input name="code" type="text" required placeholder="nanoid" />
+            </label>
+            <button type="submit" class="btn secondary">Fetch meeting</button>
+          </form>
+        </div>
+        <pre id="meetings-result" class="out" hidden></pre>
+      </section>
+
+      <section class="card" aria-labelledby="video-title">
+        <h2 id="video-title">Video call</h2>
+        <p class="muted" style="margin: 0 0 0.75rem">
+          1:1 WebRTC: log in, create a meeting, then open
+          <a href="meeting.html">meeting.html</a> on each device using
+          <code>http://&lt;this-computer-LAN-IP&gt;:4001/meeting.html</code> (servers bind
+          to <code>0.0.0.0</code>). Signaling auto-fills to the same host on port 4002.
+          Open firewall ports 4001 and 4002. For camera/mic on a LAN IP, enable HTTPS
+          (mkcert — see <code>apps/api/.env</code> comments).
+        </p>
+        <a class="btn secondary" href="meeting.html" style="display: inline-block"
+          >Open video room</a
+        >
+      </section>
+
+      <footer class="footer muted">
+        Open this page at <code>http://localhost:4001/</code> while
+        <code>npm run dev</code> is running.
+      </footer>
+    </div>
+    <script src="app.js" defer></script>
+  </body>
+</html>

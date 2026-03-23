@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Video call — Meet clone</title>
+    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="meeting.css" />
+  </head>
+  <body>
+    <div class="layout">
+      <nav class="nav-back">
+        <a href="index.html">← Dev dashboard</a>
+      </nav>
+
+      <header class="header">
+        <h1>1:1 video (WebRTC)</h1>
+        <p class="sub">
+          Log in on the dashboard first (JWT). Open this page as
+          <code>http://&lt;your-LAN-IP&gt;:4001/meeting.html</code> on each device. The
+          signaling URL defaults to <strong>this host on port 4002</strong> (change only if
+          signaling runs elsewhere). Allow ports <strong>4001</strong> and
+          <strong>4002</strong> in your firewall.
+        </p>
+      </header>
+
+      <section class="card">
+        <h2>Connection</h2>
+        <div class="stack">
+          <label>
+            Signaling server
+            <input
+              id="input-signal"
+              type="url"
+              placeholder="http://127.0.0.1:4002"
+              autocomplete="off"
+            />
+          </label>
+          <label>
+            Meeting code
+            <input
+              id="input-code"
+              type="text"
+              placeholder="From POST /api/meetings"
+              autocomplete="off"
+            />
+          </label>
+        </div>
+        <div class="toolbar">
+          <button type="button" class="btn" id="btn-connect">Connect</button>
+          <button type="button" class="btn secondary" id="btn-leave" disabled>
+            Leave room
+          </button>
+        </div>
+        <p id="status-line" class="muted" style="margin-top: 0.75rem"></p>
+        <pre id="log" class="out log" aria-live="polite"></pre>
+      </section>
+
+      <section class="card">
+        <h2>Video</h2>
+        <div class="video-wrap">
+          <div class="video-box">
+            <video id="local" playsinline autoplay muted></video>
+            <span class="label">You</span>
+          </div>
+          <div class="video-box">
+            <video id="remote" playsinline autoplay></video>
+            <span class="label">Peer</span>
+          </div>
+        </div>
+      </section>
+
+      <footer class="footer muted">
+        Browsers only allow camera/mic on <strong>secure contexts</strong>:
+        <code>https://</code> or <code>http://localhost</code>. On a LAN IP like
+        <code>192.168.x.x</code> you must use <strong>HTTPS</strong> (e.g. mkcert — see comments in
+        <code>apps/api/.env</code>). Then open
+        <code>https://your-ip:4001/meeting.html</code> and trust the cert when prompted.
+      </footer>
+    </div>
+
+    <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
+    <script src="meeting.js" defer></script>
+  </body>
+</html>
