@@ -75,12 +75,11 @@ router.post("/register", async (req, res) => {
     const token = signToken(user.id);
     res.status(201).json({ token, user });
   } catch (err: unknown) {
-    if (
-      err instanceof Prisma.PrismaClientKnownRequestError &&
-      err.code === "P2002"
-    ) {
-      res.status(409).json({ error: "Email already registered" });
-      return;
+    if (err instanceof Prisma.PrismaClientKnownRequestError) {
+      if (err.code === "P2002") {
+        res.status(409).json({ error: "Email already registered" });
+        return;
+      }
     }
     console.error(err);
     res.status(500).json({ error: "Internal server error" });

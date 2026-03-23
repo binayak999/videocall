@@ -3,6 +3,10 @@
   "compilerOptions": {
     "outDir": "./dist",
     "rootDir": "./src",
+    "baseUrl": ".",
+    "paths": {
+      "@bandr/db": ["../../packages/db/dist/index"]
+    },
     "types": ["node"]
   },
   "include": ["src/**/*.ts", "src/**/*.d.ts"],
