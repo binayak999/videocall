@@ -15,7 +15,7 @@ At the repo root, create `.env` with:
 
 ```env
 DATABASE_URL="postgresql://postgres:postgres@localhost:5432/meetclone"
-REDIS_URL="redis://localhost:6379"
+REDIS_URL="redis://localhost:6380"
 ```
 
 (`packages/db` scripts use this file via `dotenv -e ../../.env`.)
@@ -65,7 +65,7 @@ NODE_ENV=production
 HOST=127.0.0.1
 PORT=4001
 DATABASE_URL="postgresql://postgres:postgres@localhost:5432/meetclone"
-REDIS_URL="redis://localhost:6379"
+REDIS_URL="redis://localhost:6380"
 JWT_SECRET="<long-random-string>"
 SIGNALING_URL="http://127.0.0.1:4002"
 ```
