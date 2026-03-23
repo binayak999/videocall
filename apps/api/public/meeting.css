@@ -1,13 +1,36 @@
-.video-wrap {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+.video-stage {
+  display: flex;
+  flex-direction: column;
   gap: 1rem;
   margin-top: 1rem;
 }
 
-@media (max-width: 700px) {
-  .video-wrap {
-    grid-template-columns: 1fr;
+.video-local {
+  max-width: 320px;
+  align-self: flex-start;
+}
+
+.remote-videos {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 0.75rem;
+}
+
+@media (min-width: 900px) {
+  .video-stage {
+    flex-direction: row;
+    align-items: flex-start;
+  }
+
+  .video-local {
+    flex: 0 0 280px;
+    max-width: none;
+    width: 280px;
+  }
+
+  .remote-videos {
+    flex: 1 1 auto;
+    min-width: 0;
   }
 }
 

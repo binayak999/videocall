@@ -14,9 +14,10 @@
       </nav>
 
       <header class="header">
-        <h1>1:1 video (WebRTC)</h1>
+        <h1>Group video (WebRTC mesh)</h1>
         <p class="sub">
-          Log in on the dashboard first (JWT). Open this page as
+          Up to <strong>20</strong> participants per room (browser mesh: each peer connects to
+          every other peer). Log in on the dashboard first (JWT). Open this page as
           <code>http://&lt;your-LAN-IP&gt;:4001/meeting.html</code> on each device. The
           signaling URL defaults to <strong>this host on port 4002</strong> (change only if
           signaling runs elsewhere). Allow ports <strong>4001</strong> and
@@ -58,15 +59,12 @@
 
       <section class="card">
         <h2>Video</h2>
-        <div class="video-wrap">
-          <div class="video-box">
+        <div class="video-stage">
+          <div class="video-box video-local">
             <video id="local" playsinline autoplay muted></video>
             <span class="label">You</span>
           </div>
-          <div class="video-box">
-            <video id="remote" playsinline autoplay></video>
-            <span class="label">Peer</span>
-          </div>
+          <div id="remote-videos" class="remote-videos" aria-label="Remote participants"></div>
         </div>
       </section>
 
