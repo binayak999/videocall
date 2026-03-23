@@ -81,6 +81,12 @@ const listenHost =
   hostEnv !== undefined && hostEnv.length > 0 ? hostEnv : "0.0.0.0";
 
 const isDev = process.env.NODE_ENV !== "production";
+const cspScriptSrc = [
+  "'self'",
+  "'unsafe-inline'",
+  "https://cdn.socket.io",
+  "https://cdn.tailwindcss.com",
+];
 // COOP is ignored (and browsers console-warn) on non-secure origins like http://192.168.x.x.
 // We omit the header entirely so dev/LAN HTTP stays quiet; re-enable behind HTTPS if you need isolation.
 const crossOriginOpenerPolicy = false;
@@ -92,7 +98,7 @@ app.use(
         contentSecurityPolicy: {
           useDefaults: true,
           directives: {
-            scriptSrc: ["'self'", "https://cdn.socket.io"],
+            scriptSrc: cspScriptSrc,
             connectSrc: ["'self'", "http:", "https:", "ws:", "wss:"],
             // Default Helmet CSP includes upgrade-insecure-requests → browser fetches
             // https://<lan-ip>:4001/*.css over TLS; our server is HTTP-only → ERR_SSL_PROTOCOL_ERROR.
@@ -105,7 +111,7 @@ app.use(
         contentSecurityPolicy: {
           useDefaults: true,
           directives: {
-            scriptSrc: ["'self'", "https://cdn.socket.io"],
+            scriptSrc: cspScriptSrc,
             connectSrc: ["'self'", "https:", "wss:", "http:", "ws:"],
           },
         },
@@ -136,30 +142,96 @@ app.get("/health", (_req, res) => {
 });
 
 app.get("/api/signaling-health", async (_req, res) => {
-  const base = (process.env.SIGNALING_URL ?? "http://127.0.0.1:4002").replace(
-    /\/$/,
-    "",
-  );
-  try {
-    const r = await fetch(`${base}/health`);
-    const text = await r.text();
-    let body: unknown = text;
-    if (text.length > 0) {
-      try {
-        body = JSON.parse(text) as unknown;
-      } catch {
-        body = { raw: text };
+  const requestHealth = async (
+    base: string,
+  ): Promise<{ ok: boolean; status: number; text: string }> => {
+    const healthUrl = `${base}/health`;
+    const url = new URL(healthUrl);
+    const isTls = url.protocol === "https:";
+    if (!isTls) {
+      const r = await fetch(healthUrl);
+      const text = await r.text();
+      return { ok: r.ok, status: r.status, text };
+    }
+
+    return await new Promise((resolve, reject) => {
+      const req = https.request(
+        {
+          hostname: url.hostname,
+          port: url.port.length > 0 ? Number.parseInt(url.port, 10) : 443,
+          path: `${url.pathname}${url.search}`,
+          method: "GET",
+          rejectUnauthorized: false,
+        },
+        (r) => {
+          let body = "";
+          r.setEncoding("utf8");
+          r.on("data", (chunk: string) => {
+            body += chunk;
+          });
+          r.on("end", () => {
+            resolve({
+              ok: (r.statusCode ?? 500) >= 200 && (r.statusCode ?? 500) < 300,
+              status: r.statusCode ?? 500,
+              text: body,
+            });
+          });
+        },
+      );
+      req.on("error", reject);
+      req.end();
+    });
+  };
+
+  const explicitBase =
+    process.env.SIGNALING_URL !== undefined && process.env.SIGNALING_URL.length > 0
+      ? process.env.SIGNALING_URL.replace(/\/$/, "")
+      : null;
+  const candidates =
+    explicitBase !== null
+      ? [explicitBase]
+      : ["http://127.0.0.1:4002", "https://127.0.0.1:4002"];
+
+  let lastError: unknown = null;
+  for (const base of candidates) {
+    try {
+      const r = await requestHealth(base);
+      const text = r.text;
+      let body: unknown = text;
+      if (text.length > 0) {
+        try {
+          body = JSON.parse(text) as unknown;
+        } catch {
+          body = { raw: text };
+        }
       }
-    }
-    if (!r.ok) {
-      res.status(502).json({ status: "error", upstreamStatus: r.status, body });
+      if (!r.ok) {
+        lastError = { status: r.status, body };
+        continue;
+      }
+      res.json(body);
       return;
+    } catch (err: unknown) {
+      lastError = err;
     }
-    res.json(body);
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : "unknown error";
-    res.status(502).json({ status: "error", detail: message });
   }
+
+  if (
+    typeof lastError === "object" &&
+    lastError !== null &&
+    "status" in lastError &&
+    typeof (lastError as { status: unknown }).status === "number"
+  ) {
+    const errorWithStatus = lastError as { status: number; body?: unknown };
+    res
+      .status(502)
+      .json({ status: "error", upstreamStatus: errorWithStatus.status, body: errorWithStatus.body });
+    return;
+  }
+
+  const message =
+    lastError instanceof Error ? lastError.message : "unable to reach signaling health endpoint";
+  res.status(502).json({ status: "error", detail: message });
 });
 
 app.use("/api/auth", authRouter);
