@@ -106,12 +106,7 @@ cd /path/to/bandr
 npm run db:migrate:deploy
 ```
 
-This runs `prisma migrate deploy` using **`DATABASE_URL` from the repo root `.env`**. That URL must be the **same database** your API uses (`apps/api/.env` → `DATABASE_URL`). If you only set `DATABASE_URL` under `apps/api/.env`, either copy it into root `.env` or run:
-
-```bash
-cd packages/db
-npx dotenv -e ../../apps/api/.env -- prisma migrate deploy
-```
+This runs `prisma migrate deploy` with env from **repo root `.env`**, then **`apps/api/.env`** (later file wins for duplicate keys). Put `DATABASE_URL` in either place; most servers only define it in `apps/api/.env`, which is enough. It must match the database your API uses.
 
 **Local development** — create/iterate migrations interactively:
 
