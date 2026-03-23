@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "predev": "npm run build -w @bandr/db",
+    "prebuild": "npm run build -w @bandr/db",
     "dev": "nodemon",
     "build": "tsc",
     "start": "node -r dotenv/config dist/index.js"

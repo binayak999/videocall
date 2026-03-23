@@ -56,6 +56,8 @@ npm ci
 
 Use the **repo root** for installs (`npm ci` / `npm install`). Running install only inside `apps/api` skips workspace linking and can break `@bandr/db` resolution at build or runtime.
 
+The **absolute** path on the server (e.g. `/var/www/docker/video`) does not matter. What matters is a **normal monorepo checkout**: root `package.json` with workspaces, plus `apps/` and `packages/` as in this repo. TypeScript and Node resolve `@bandr/db` via the workspace link under the root `node_modules`, not via a hardcoded filesystem path.
+
 ### 7. Configure app env files
 
 Create **`apps/api/.env`** and **`apps/signaling/.env`** (not committed). Minimum:
