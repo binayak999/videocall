@@ -91,6 +91,12 @@ JWT_SECRET="<same-as-api>"
 npm run build
 ```
 
+To run **API + signaling in the foreground** (no PM2), from repo root:
+
+```bash
+npm run start
+```
+
 ### 9. Run Prisma migrations
 
 ```bash

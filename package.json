@@ -8,6 +8,7 @@
   ],
   "scripts": {
     "build": "turbo run build",
+    "start": "turbo run start --filter=api --filter=signaling",
     "dev": "turbo run dev",
     "db:generate": "npm run db:generate -w @bandr/db",
     "db:migrate": "npm run db:migrate -w @bandr/db",
