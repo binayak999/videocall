@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Meet — Video call</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="meeting.css" />
+  </head>
+  <body>
+
+    <!-- ═══════════════ LOBBY ═══════════════ -->
+    <div id="lobby" class="lobby-screen">
+      <div class="lobby-card">
+
+        <!-- Left: live camera preview -->
+        <div class="lobby-preview">
+          <video id="local-preview" playsinline autoplay muted class="mirror"></video>
+
+          <!-- Camera-off placeholder -->
+          <div id="preview-cam-off" class="cam-off-overlay" style="display:none">
+            <div class="avatar-circle">
+              <svg viewBox="0 0 24 24" fill="#9aa0a6" width="40" height="40">
+                <path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z"/>
+              </svg>
+            </div>
+          </div>
+
+          <!-- Mic / cam toggles -->
+          <div class="preview-controls">
+            <button id="lobby-mic-btn" class="ctrl-btn ctrl-btn--active" title="Toggle mic">
+              <svg id="lobby-mic-icon-on" viewBox="0 0 24 24" fill="white" width="20" height="20">
+                <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1-9c0-.55.45-1 1-1s1 .45 1 1v6c0 .55-.45 1-1 1s-1-.45-1-1V5zm6 6c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+              </svg>
+              <svg id="lobby-mic-icon-off" viewBox="0 0 24 24" fill="white" width="20" height="20" style="display:none">
+                <path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z"/>
+              </svg>
+            </button>
+            <button id="lobby-cam-btn" class="ctrl-btn ctrl-btn--active" title="Toggle camera">
+              <svg id="lobby-cam-icon-on" viewBox="0 0 24 24" fill="white" width="20" height="20">
+                <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/>
+              </svg>
+              <svg id="lobby-cam-icon-off" viewBox="0 0 24 24" fill="white" width="20" height="20" style="display:none">
+                <path d="M21 6.5l-4-4-9.86 9.86-2.09-2.09L4 11.36l2.11 2.11L3 16.5V21h4.5l3.03-3.03 2.11 2.11 1.09-1.09-2.09-2.09L21 6.5zM7.04 19H5v-2.04l9.86-9.86 2.04 2.04L7.04 19z"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- Right: join form -->
+        <div class="lobby-form">
+          <h2 class="lobby-title">Ready to join?</h2>
+          <p id="status-line" class="lobby-status"></p>
+
+          <input id="input-code" type="text" placeholder="Enter meeting code"
+            autocomplete="off" class="meet-input" />
+
+          <details class="advanced-toggle">
+            <summary>Advanced</summary>
+            <input id="input-signal" type="url" placeholder="Signaling URL (http://host:4002)"
+              autocomplete="off" class="meet-input" style="margin-top:8px;font-size:12px" />
+          </details>
+
+          <button id="btn-connect" type="button" class="join-btn">Join now</button>
+
+          <a href="index.html" class="back-link">&#8592; Dashboard</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════ CALL VIEW ═══════════════ -->
+    <div id="call-view" style="display:none">
+
+      <!-- Video grid fills the entire screen -->
+      <div id="remote-videos" class="meet-grid">
+        <div id="waiting-placeholder" class="waiting-placeholder">
+          <div class="waiting-icon">
+            <svg viewBox="0 0 24 24" fill="#9aa0a6" width="32" height="32">
+              <path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/>
+            </svg>
+          </div>
+          <p>Waiting for others to join&hellip;</p>
+        </div>
+      </div>
+
+      <!-- Local video PiP -->
+      <div id="local-pip" class="local-pip">
+        <video id="local" playsinline autoplay muted class="mirror"></video>
+        <div id="pip-cam-off" class="cam-off-overlay" style="display:none">
+          <svg viewBox="0 0 24 24" fill="#9aa0a6" width="28" height="28">
+            <path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z"/>
+          </svg>
+        </div>
+        <div class="pip-label">
+          <span>You</span>
+          <svg id="pip-mic-off" viewBox="0 0 24 24" fill="#ea4335" width="12" height="12" style="display:none">
+            <path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z"/>
+          </svg>
+        </div>
+      </div>
+
+      <!-- Top info overlay -->
+      <div class="call-top-bar">
+        <div class="call-top-left">
+          <span class="call-brand">Meet</span>
+          <span id="call-timer" class="call-timer">0:00</span>
+        </div>
+        <div class="call-top-right">
+          <span id="peer-count" class="call-peers"></span>
+          <span id="meeting-code-badge" class="call-code-badge"></span>
+        </div>
+      </div>
+
+      <!-- Bottom controls overlay -->
+      <div class="call-bottom-bar">
+        <button id="btn-mic" class="ctrl-btn ctrl-btn--active ctrl-btn--lg" title="Mute/Unmute">
+          <svg id="mic-icon-on" viewBox="0 0 24 24" fill="white" width="24" height="24">
+            <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3zm-1-9c0-.55.45-1 1-1s1 .45 1 1v6c0 .55-.45 1-1 1s-1-.45-1-1V5zm6 6c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z"/>
+          </svg>
+          <svg id="mic-icon-off" viewBox="0 0 24 24" fill="white" width="24" height="24" style="display:none">
+            <path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z"/>
+          </svg>
+        </button>
+        <button id="btn-cam" class="ctrl-btn ctrl-btn--active ctrl-btn--lg" title="Toggle camera">
+          <svg id="cam-icon-on" viewBox="0 0 24 24" fill="white" width="24" height="24">
+            <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"/>
+          </svg>
+          <svg id="cam-icon-off" viewBox="0 0 24 24" fill="white" width="24" height="24" style="display:none">
+            <path d="M21 6.5l-4-4-9.86 9.86-2.09-2.09L4 11.36l2.11 2.11L3 16.5V21h4.5l3.03-3.03 2.11 2.11 1.09-1.09-2.09-2.09L21 6.5zM7.04 19H5v-2.04l9.86-9.86 2.04 2.04L7.04 19z"/>
+          </svg>
+        </button>
+        <button id="btn-leave" class="ctrl-btn ctrl-btn--leave ctrl-btn--lg" title="Leave call">
+          <svg viewBox="0 0 24 24" fill="white" width="24" height="24">
+            <path d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Toast -->
+    <div id="toast" class="toast" style="display:none">
+      <span id="toast-msg"></span>
+    </div>
+
+    <!-- Debug log (Shift+D) -->
+    <pre id="log" class="debug-log" style="display:none" aria-live="polite"></pre>
+
+    <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
+    <script src="meeting.js" defer></script>
+  </body>
+</html>
