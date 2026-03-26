@@ -1,5 +1,6 @@
 import "dotenv/config";
 import "./types/express-augmentation";
+import { createHmac } from "node:crypto";
 import fs from "node:fs";
 import https from "node:https";
 import path from "node:path";
@@ -233,6 +234,36 @@ app.get("/api/signaling-health", async (_req, res) => {
   const message =
     lastError instanceof Error ? lastError.message : "unable to reach signaling health endpoint";
   res.status(502).json({ status: "error", detail: message });
+});
+
+app.get("/api/turn-credentials", (_req, res) => {
+  const secret = process.env.TURN_SECRET?.trim();
+  const host = process.env.TURN_HOST?.trim();
+  if (!secret || !host) {
+    res.status(500).json({ error: "TURN_SECRET or TURN_HOST is not configured" });
+    return;
+  }
+
+  const ttlSeconds = 24 * 60 * 60;
+  const expiresAt = Math.floor(Date.now() / 1000) + ttlSeconds;
+  const username = `${expiresAt}`;
+  const credential = createHmac("sha1", secret).update(username).digest("base64");
+  const hostNoScheme = host.replace(/^turns?:\/\//i, "").replace(/\/+$/, "");
+
+  res.json({
+    iceServers: [
+      { urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"] },
+      {
+        urls: [
+          `turn:${hostNoScheme}:3478?transport=udp`,
+          `turn:${hostNoScheme}:3478?transport=tcp`,
+          `turns:${hostNoScheme}:5349?transport=tcp`,
+        ],
+        username,
+        credential,
+      },
+    ],
+  });
 });
 
 app.get("/api", (req, res) => {

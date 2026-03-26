@@ -10,6 +10,7 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [react(), tailwindcss()],
     server: {
+      allowedHosts: ['3468-2400-1a00-4b20-1fc2-18cb-f6da-2f0c-b76a.ngrok-free.app'],
       proxy: {
         '/api': {
           target: proxyTarget,
