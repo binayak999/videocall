@@ -29,6 +29,7 @@ model Meeting {
   endsAt    DateTime?
 
   participants Participant[]
+  chatMessages ChatMessage[]
 }
 
 model Participant {
@@ -41,4 +42,16 @@ model Participant {
   role      String
   joinedAt  DateTime  @default(now())
   leftAt    DateTime?
+}
+
+model ChatMessage {
+  id           String   @id @default(cuid())
+  meetingId    String
+  meeting      Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  senderUserId String
+  senderName   String
+  text         String
+  createdAt    DateTime @default(now())
+
+  @@index([meetingId, createdAt])
 }

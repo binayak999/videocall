@@ -50,10 +50,10 @@ export function LoginPage() {
 
       {/* centered card */}
       <div className="relative z-10 flex h-[calc(100vh-80px)] items-center justify-center px-4">
-        <div className="w-full max-w-sm rounded-[22px] bg-gradient-to-br from-white/90 to-white/70 backdrop-blur-xl p-7">
+        <div className="w-full max-w-sm rounded-[22px] bg-[#1c1c1e]/90 backdrop-blur-xl p-7">
 
-          <h1 className="text-2xl font-bold tracking-tight text-gray-900">Sign in</h1>
-          <p className="mt-1.5 text-sm text-gray-500">
+          <h1 className="text-2xl font-bold tracking-tight text-white/90">Sign in</h1>
+          <p className="mt-1.5 text-sm text-white/50">
             Don't have an account?{' '}
             <Link to="/register" className="text-[#f59e0b] hover:text-[#fbbf24] transition">
               Register
@@ -62,26 +62,26 @@ export function LoginPage() {
 
           <form onSubmit={onSubmit} className="mt-6 flex flex-col gap-3">
             <label className="flex flex-col gap-1">
-              <span className="text-xs font-medium text-gray-500 uppercase tracking-wider">Email</span>
+              <span className="text-xs font-medium text-white/50 uppercase tracking-wider">Email</span>
               <input
                 value={email}
                 onChange={e => setEmail(e.target.value)}
                 type="email"
                 autoComplete="email"
                 required
-                className="h-11 rounded-xl border border-gray-200 bg-white/80 px-4 text-sm text-gray-900 placeholder-gray-300 outline-none transition focus:border-[#f59e0b]/50 focus:bg-white/[0.09]"
+                className="h-11 rounded-xl border border-white/8 bg-white/6 px-4 text-sm text-white/90 placeholder-white/20 outline-none transition focus:border-[#f59e0b]/50 focus:bg-white/9"
               />
             </label>
 
             <label className="flex flex-col gap-1">
-              <span className="text-xs font-medium text-gray-500 uppercase tracking-wider">Password</span>
+              <span className="text-xs font-medium text-white/50 uppercase tracking-wider">Password</span>
               <input
                 value={password}
                 onChange={e => setPassword(e.target.value)}
                 type="password"
                 autoComplete="current-password"
                 required
-                className="h-11 rounded-xl border border-gray-200 bg-white/80 px-4 text-sm text-gray-900 placeholder-gray-300 outline-none transition focus:border-[#f59e0b]/50 focus:bg-white/[0.09]"
+                className="h-11 rounded-xl border border-white/8 bg-white/6 px-4 text-sm text-white/90 placeholder-white/20 outline-none transition focus:border-[#f59e0b]/50 focus:bg-white/9"
               />
             </label>
 
