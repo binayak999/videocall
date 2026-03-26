@@ -1,0 +1,1 @@
+{"version":3,"file":"express-augmentation.d.ts","sourceRoot":"","sources":["../../src/types/express-augmentation.ts"],"names":[],"mappings":"AAAA;;;GAGG;AACH,OAAO,EAAE,CAAC;AAEV,OAAO,CAAC,MAAM,CAAC;IACb,UAAU,OAAO,CAAC;QAChB,UAAU,OAAO;YACf,MAAM,CAAC,EAAE,MAAM,CAAC;SACjB;KACF;CACF"}
