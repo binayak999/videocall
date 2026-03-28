@@ -58,6 +58,20 @@ export function Layout() {
               Home
             </NavLink>
 
+            {authed && (
+              <NavLink
+                to="/recordings"
+                className={({ isActive }) =>
+                  cx(
+                    'rounded-lg px-3 py-2 text-sm no-underline transition',
+                    isActive ? 'bg-(--code-bg) text-(--text-h)' : 'text-(--text) hover:bg-(--social-bg)',
+                  )
+                }
+              >
+                Recordings
+              </NavLink>
+            )}
+
             {!authed ? (
               <>
                 <NavLink

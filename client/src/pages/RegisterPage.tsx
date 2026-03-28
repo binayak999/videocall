@@ -31,7 +31,7 @@ export function RegisterPage() {
   }
 
   return (
-    <div className="fixed inset-0 overflow-hidden" style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+    <div className="fixed inset-0 flex flex-col overflow-x-hidden overflow-y-auto" style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}>
 
       {/* background image */}
       <img
@@ -43,15 +43,15 @@ export function RegisterPage() {
       />
 
       {/* header */}
-      <div className="relative z-20 flex items-center px-10 py-4">
+      <div className="relative z-20 flex shrink-0 items-center px-4 py-3 sm:px-8 sm:py-4 lg:px-10">
         <Link to="/">
-          <img src="/nexivo_logo.svg" alt="Nexivo" className="h-14 w-auto" draggable={false} />
+          <img src="/nexivo_logo.svg" alt="Nexivo" className="h-10 w-auto sm:h-14" draggable={false} />
         </Link>
       </div>
 
       {/* centered card */}
-      <div className="relative z-10 flex h-[calc(100vh-80px)] items-center justify-center px-4">
-        <div className="w-full max-w-sm rounded-[22px] bg-[#1c1c1e]/90 backdrop-blur-xl p-7">
+      <div className="relative z-10 flex min-h-0 flex-1 items-center justify-center px-4 py-6 sm:min-h-[calc(100vh-80px)] sm:py-0">
+        <div className="w-full max-w-sm rounded-[22px] bg-[#1c1c1e]/90 p-6 backdrop-blur-xl sm:p-7">
 
           <h1 className="text-2xl font-bold tracking-tight text-white/90">Create account</h1>
           <p className="mt-1.5 text-sm text-white/50">

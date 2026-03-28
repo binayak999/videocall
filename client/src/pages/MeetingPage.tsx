@@ -1,13 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { QRCodeSVG } from 'qrcode.react'
+import { Link, useLocation, useParams } from 'react-router-dom'
 import { io, type Socket } from 'socket.io-client'
-import { errorMessage, getMeeting } from '../lib/api'
+import {
+  completeMeetingRecording,
+  errorMessage,
+  getMeeting,
+  uploadMeetingRecordingViaApi,
+} from '../lib/api'
 import { getToken } from '../lib/auth'
 import { getIceServers } from '../lib/ice'
+import { startCameraBackgroundPipeline, type CameraBackgroundPipeline } from '../lib/cameraBackgroundPipeline'
+import { HostMeetingRecorder } from '../lib/hostMeetingRecorder'
+import { classifyCameraFrame, preloadModerationModel } from '../lib/videoContentModeration'
 import type { Meeting } from '../lib/types'
-import '../meeting.css'
 
 type CallView = 'detail' | 'lobby' | 'call'
+
+type CameraBackgroundUiMode = 'none' | 'blur-low' | 'blur-high' | 'image'
+
+function isBlurMode(m: CameraBackgroundUiMode): boolean { return m === 'blur-low' || m === 'blur-high' }
+function blurAmountForMode(m: CameraBackgroundUiMode): number { return m === 'blur-low' ? 4 : 16 }
 
 interface PeerState {
   pc: RTCPeerConnection
@@ -24,6 +37,11 @@ interface ChatMessage {
   createdAt: string
 }
 
+interface ParticipantRosterEntry {
+  userName: string
+  userId: string
+}
+
 const DEFAULT_STUN_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
@@ -32,6 +50,10 @@ const DEFAULT_STUN_SERVERS: RTCIceServer[] = [
 
 function shortId(id: string) {
   return id.length <= 8 ? id : id.slice(0, 6) + '\u2026'
+}
+
+function cx(...classes: Array<string | false | null | undefined>): string {
+  return classes.filter(Boolean).join(' ')
 }
 
 function RemoteConnectionIcon({ size = 14, className }: { size?: number; className?: string }) {
@@ -97,8 +119,39 @@ function getUserIdFromToken(token: string): string {
   }
 }
 
+function RemoteCameraThumb({
+  cameraId,
+  streamsRef,
+  ready,
+}: {
+  cameraId: string
+  streamsRef: { current: Map<string, MediaStream> }
+  ready: boolean
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null)
+  useEffect(() => {
+    if (!ready) return
+    const stream = streamsRef.current.get(cameraId)
+    if (!stream || !videoRef.current) return
+    videoRef.current.srcObject = stream
+    void videoRef.current.play().catch(() => {})
+  }, [cameraId, ready, streamsRef])
+
+  return (
+    <div className="shrink-0 h-9 w-14 overflow-hidden rounded-lg bg-black/40 relative">
+      {ready
+        ? <video ref={videoRef} playsInline muted autoPlay className="h-full w-full -scale-x-100 object-cover" />
+        : <div className="absolute inset-0 flex items-center justify-center">
+            <div className="h-2.5 w-2.5 rounded-full border-2 border-white/30 border-t-white/80 animate-spin" />
+          </div>
+      }
+    </div>
+  )
+}
+
 export function MeetingPage() {
   const params = useParams()
+  const location = useLocation()
   const code = (params.code ?? '').trim()
 
   // meeting detail
@@ -121,6 +174,8 @@ export function MeetingPage() {
   const [pipCamOff, setPipCamOff] = useState(true)
   const [showDebug, setShowDebug] = useState(false)
   const [debugLog, setDebugLog] = useState('')
+  const [hasWeakNetwork, setHasWeakNetwork] = useState(false)
+  const [presenterPage, setPresenterPage] = useState(0)
   const [screenSharing, setScreenSharing] = useState(false)
   const [screenSharingPeers, setScreenSharingPeers] = useState<Set<string>>(new Set())
   const [companionAvailable, setCompanionAvailable] = useState(false)
@@ -128,6 +183,9 @@ export function MeetingPage() {
   const [controlledBy, setControlledBy] = useState<string | null>(null)
   const [incomingControlReq, setIncomingControlReq] = useState<{ from: string; fromName: string } | null>(null)
   const [chatOpen, setChatOpen] = useState(false)
+  const [callSettingsOpen, setCallSettingsOpen] = useState(false)
+  const [recordingActive, setRecordingActive] = useState(false)
+  const [recordingBusy, setRecordingBusy] = useState(false)
   const [chatDraft, setChatDraft] = useState('')
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
   const [chatUnread, setChatUnread] = useState(0)
@@ -136,6 +194,8 @@ export function MeetingPage() {
   const [hostJoinRequests, setHostJoinRequests] = useState<{ requestId: string; name: string }[]>([])
   const [isHostInCall, setIsHostInCall] = useState(false)
   const [hostPeerId, setHostPeerId] = useState<string | null>(null)
+  const [participantRoster, setParticipantRoster] = useState<Record<string, ParticipantRosterEntry>>({})
+  const [callLocalSocketId, setCallLocalSocketId] = useState<string | null>(null)
   const [whiteboardOpen, setWhiteboardOpen] = useState(false)
   const [whiteboardColor, setWhiteboardColor] = useState('#ffffff')
   const [whiteboardWidth, setWhiteboardWidth] = useState(3)
@@ -143,6 +203,13 @@ export function MeetingPage() {
   const [whiteboardEditors, setWhiteboardEditors] = useState<string[]>([])
   const [whiteboardRevokeUserId, setWhiteboardRevokeUserId] = useState('')
   const [incomingWhiteboardReq, setIncomingWhiteboardReq] = useState<{ from: string; fromName: string } | null>(null)
+  const [cameraBgMode, setCameraBgMode] = useState<CameraBackgroundUiMode>('none')
+  const [localCameraDevices, setLocalCameraDevices] = useState<MediaDeviceInfo[]>([])
+  const [remoteCameras, setRemoteCameras] = useState<Map<string, { label: string; ready: boolean }>>(new Map())
+  const [activeCameraId, setActiveCameraId] = useState<string | null>(null) // null = default | 'local:deviceId' | 'remote:socketId'
+  const activeCameraIdRef = useRef<string | null>(null)
+  const [showCameraPanel, setShowCameraPanel] = useState(false)
+  const [cameraShareUrl, setCameraShareUrl] = useState<string | null>(null)
 
   // refs
   const socketRef = useRef<Socket | null>(null)
@@ -169,10 +236,27 @@ export function MeetingPage() {
   const iceServersRef = useRef<RTCIceServer[]>(DEFAULT_STUN_SERVERS)
   const controlledByRef = useRef<string | null>(null)
   const controllingPeerRef = useRef<string | null>(null)
+  const controlUnavailableNotifiedRef = useRef<Set<string>>(new Set())
   const lastMouseSendRef = useRef(0)
+  const iceRestartTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
+  const statsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const autoVideoPausedRef = useRef(false)
+  const swipeContainerRef = useRef<HTMLDivElement>(null)
   const whiteboardCanvasRef = useRef<HTMLCanvasElement>(null)
   const whiteboardLastPointRef = useRef<{ x: number; y: number } | null>(null)
   const whiteboardDrawingRef = useRef(false)
+  const cameraModerationFiredRef = useRef(false)
+  const cameraModerationStreakRef = useRef(0)
+  const applyContentPolicyViolationRef = useRef<() => void>(() => {})
+  const cameraBgPipelineRef = useRef<CameraBackgroundPipeline | null>(null)
+  const remoteCameraPcsRef = useRef<Map<string, RTCPeerConnection>>(new Map())
+  const remoteCameraStreamsRef = useRef<Map<string, MediaStream>>(new Map())
+  const cameraBgImageElRef = useRef<HTMLImageElement | null>(null)
+  const cameraBgImageObjectUrlRef = useRef<string | null>(null)
+  const cameraBgFileInputRef = useRef<HTMLInputElement>(null)
+  const recordingRootRef = useRef<HTMLDivElement>(null)
+  const hostRecorderRef = useRef<HostMeetingRecorder | null>(null)
+  const recordingStartedAtRef = useRef(0)
 
   // fetch meeting detail
   useEffect(() => {
@@ -250,25 +334,69 @@ export function MeetingPage() {
     return () => document.removeEventListener('keydown', handler)
   }, [])
 
+  useEffect(() => {
+    if (!callSettingsOpen) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setCallSettingsOpen(false)
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [callSettingsOpen])
+
   // auto-start camera when lobby opens
   useEffect(() => {
     if (callView !== 'lobby') return
     ensureStream().catch(() => setPreviewCamOff(true))
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [callView])
 
-  // sync local PiP srcObject after call view mounts
   useEffect(() => {
-    if (callView === 'call' && localPipRef.current && localStreamRef.current) {
-      localPipRef.current.srcObject = localStreamRef.current
-    }
-    if (callView === 'call' && localPresenterRef.current && localStreamRef.current) {
-      localPresenterRef.current.srcObject = localStreamRef.current
-    }
-    if (callView === 'call' && localStripRef.current && localStreamRef.current) {
-      localStripRef.current.srcObject = localStreamRef.current
+    preloadModerationModel()
+  }, [])
+
+  useEffect(() => {
+    if (callView === 'lobby') {
+      cameraModerationFiredRef.current = false
+      cameraModerationStreakRef.current = 0
     }
   }, [callView])
+
+  // Sync local video elements whenever layout mounts or screen share starts/stops.
+  // localPresenterRef and localStripRef live inside the conditionally-rendered swipe
+  // container, so they mount only when presenterMode becomes true — we must re-run
+  // this effect then, not just on callView change.
+  useEffect(() => {
+    if (callView !== 'call') return
+    const camStream = localStreamRef.current
+    const screenStream = screenStreamRef.current
+
+    // PiP: show screen + audio while sharing, otherwise camera
+    if (localPipRef.current) {
+      if (screenSharing && screenStream) {
+        const s = new MediaStream([
+          ...screenStream.getVideoTracks(),
+          ...(camStream?.getAudioTracks() ?? []),
+        ])
+        localPipRef.current.srcObject = s
+      } else if (camStream) {
+        localPipRef.current.srcObject = camStream
+      }
+      void localPipRef.current.play().catch(() => {})
+    }
+
+    // Presenter full-screen tile: show screen share when local user is sharing
+    if (localPresenterRef.current) {
+      localPresenterRef.current.srcObject =
+        (screenSharing && screenStream) ? screenStream : camStream ?? null
+      void localPresenterRef.current.play().catch(() => {})
+    }
+
+    // Participants page strip tile: always show camera
+    if (localStripRef.current && camStream) {
+      localStripRef.current.srcObject = camStream
+      void localStripRef.current.play().catch(() => {})
+    }
+    // screenSharingPeers (Set identity) + screenSharing: re-run when presenter mode changes.
+  }, [callView, screenSharing, screenSharingPeers])
 
   // keep chat pinned to latest message
   useEffect(() => {
@@ -279,6 +407,25 @@ export function MeetingPage() {
   useEffect(() => {
     if (chatOpen) setChatUnread(0)
   }, [chatOpen])
+
+  // Reset to presenter page when screen share starts/stops
+  useEffect(() => {
+    setPresenterPage(0)
+    const el = swipeContainerRef.current
+    if (el) el.scrollLeft = 0
+  }, [screenSharing, screenSharingPeers])
+
+  // Re-sync peer streams to video elements after any layout change (grid ↔ presenter).
+  // ontrack may fire while the element is mid-transition and miss the assignment.
+  useEffect(() => {
+    for (const [id, stream] of peerStreamRefs.current.entries()) {
+      const el = peerVideoRefs.current.get(id)
+      if (el && el.srcObject !== stream) {
+        el.srcObject = stream
+        void el.play().catch(() => {})
+      }
+    }
+  }, [peerIds, screenSharingPeers])
 
   // Detect companion app and open WebSocket bridge
   useEffect(() => {
@@ -317,12 +464,25 @@ export function MeetingPage() {
 
   // cleanup on unmount
   useEffect(() => {
+    const peersMap = peersRef.current
+    const iceTimersMap = iceRestartTimersRef.current
     return () => {
+      if (cameraBgImageObjectUrlRef.current) {
+        URL.revokeObjectURL(cameraBgImageObjectUrlRef.current)
+        cameraBgImageObjectUrlRef.current = null
+      }
+      const unmountPipedRaw = cameraBgPipelineRef.current?.getRawTrack() ?? null
+      cameraBgPipelineRef.current?.stop()
+      cameraBgPipelineRef.current = null
       socketRef.current?.disconnect()
       localStreamRef.current?.getTracks().forEach(t => t.stop())
+      if (unmountPipedRaw?.readyState === 'live') unmountPipedRaw.stop()
       screenStreamRef.current?.getTracks().forEach(t => t.stop())
-      for (const s of peersRef.current.values()) s.pc.close()
-      peersRef.current.clear()
+      for (const s of peersMap.values()) s.pc.close()
+      peersMap.clear()
+      for (const t of iceTimersMap.values()) clearTimeout(t)
+      iceTimersMap.clear()
+      if (statsIntervalRef.current) clearInterval(statsIntervalRef.current)
       if (timerRef.current) clearInterval(timerRef.current)
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
     }
@@ -346,6 +506,214 @@ export function MeetingPage() {
     setChatMessages(prev => [...prev, { id, senderId, senderName, senderUserId, text, createdAt }])
     if (!chatOpen && senderId !== mySocketIdRef.current) setChatUnread(prev => prev + 1)
   }, [chatOpen])
+
+  /** Stops the ML background pipeline; returns the raw camera track if it was only wired through the pipeline (caller may still be using it). */
+  function teardownCameraBackgroundPipeline(): MediaStreamTrack | null {
+    const p = cameraBgPipelineRef.current
+    if (!p) return null
+    const raw = p.getRawTrack()
+    const ls = localStreamRef.current
+    const proc = p.getProcessedTrack()
+    if (ls) {
+      for (const t of ls.getVideoTracks()) {
+        if (t.id === proc.id) ls.removeTrack(t)
+      }
+    }
+    p.stop()
+    cameraBgPipelineRef.current = null
+    return raw
+  }
+
+  /** Inbound tracks from phone/camera-source WebRTC must never be .stop()'d — that kills the receiver and shows black. */
+  function isInboundRemoteCameraVideoTrack(track: MediaStreamTrack): boolean {
+    if (track.kind !== 'video') return false
+    for (const stream of remoteCameraStreamsRef.current.values()) {
+      if (stream.getVideoTracks().some(t => t.id === track.id)) return true
+    }
+    return false
+  }
+
+  async function pushLocalVideoToPeersAndPreview(videoTrack: MediaStreamTrack) {
+    const ls = localStreamRef.current
+    if (!ls) return
+    if (!screenSharingRef.current) {
+      for (const [remoteId, { pc }] of peersRef.current.entries()) {
+        const sender = pc.getSenders().find(s => s.track?.kind === 'video')
+        if (sender) {
+          await sender.replaceTrack(videoTrack)
+        } else {
+          pc.addTrack(videoTrack, ls)
+          void renegotiate(remoteId)
+        }
+      }
+    }
+    if (localPreviewRef.current) {
+      localPreviewRef.current.srcObject = ls
+      void localPreviewRef.current.play().catch(() => {})
+    }
+    if (localPipRef.current && !screenSharingRef.current) {
+      localPipRef.current.srcObject = ls
+      void localPipRef.current.play().catch(() => {})
+    }
+    if (localStripRef.current) {
+      localStripRef.current.srcObject = ls
+      void localStripRef.current.play().catch(() => {})
+    }
+  }
+
+  async function applyCameraWithBackgroundSettings(
+    rawTrack: MediaStreamTrack,
+    mode: CameraBackgroundUiMode,
+    bgImageEl: HTMLImageElement | null,
+  ) {
+    teardownCameraBackgroundPipeline()
+    const ls = localStreamRef.current ?? await ensureStream()
+    for (const t of [...ls.getVideoTracks()]) {
+      ls.removeTrack(t)
+      if (t.id !== rawTrack.id && !isInboundRemoteCameraVideoTrack(t)) t.stop()
+    }
+
+    if (mode === 'none') {
+      ls.addTrack(rawTrack)
+      await pushLocalVideoToPeersAndPreview(rawTrack)
+      return
+    }
+    if (mode === 'image' && !bgImageEl) {
+      showToast('Choose a background image first')
+      ls.addTrack(rawTrack)
+      await pushLocalVideoToPeersAndPreview(rawTrack)
+      return
+    }
+    try {
+      showToast('Loading background effect…', 2200)
+      const pipeline = await startCameraBackgroundPipeline(
+        rawTrack,
+        isBlurMode(mode) ? 'blur' : 'image',
+        mode === 'image' ? bgImageEl : null,
+        isBlurMode(mode) ? { blurAmount: blurAmountForMode(mode) } : undefined,
+      )
+      cameraBgPipelineRef.current = pipeline
+      const out = pipeline.getProcessedTrack()
+      ls.addTrack(out)
+      await pushLocalVideoToPeersAndPreview(out)
+    } catch (e) {
+      appendLog('background pipeline', String(e))
+      showToast('Background effect failed — using normal camera')
+      ls.addTrack(rawTrack)
+      await pushLocalVideoToPeersAndPreview(rawTrack)
+    }
+  }
+
+  async function reapplyCameraBackgroundWithMode(mode: CameraBackgroundUiMode) {
+    if (!camEnabled) return
+    const img = cameraBgImageElRef.current
+    const p = cameraBgPipelineRef.current
+    const raw = p?.getRawTrack() ?? localStreamRef.current?.getVideoTracks()[0]
+    if (!raw || raw.kind !== 'video') return
+
+    if (p && mode !== 'none') {
+      if (mode === 'image' && !img) {
+        showToast('Choose a background image')
+        return
+      }
+      p.setMode(isBlurMode(mode) ? 'blur' : 'image')
+      p.setBackgroundImage(mode === 'image' ? img : null)
+      if (isBlurMode(mode)) p.setBlurAmount(blurAmountForMode(mode))
+      return
+    }
+
+    await applyCameraWithBackgroundSettings(raw, mode, img)
+  }
+
+  function handleCameraBackgroundFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0]
+    e.target.value = ''
+    if (!f?.type.startsWith('image/')) {
+      showToast('Choose an image file')
+      return
+    }
+    if (cameraBgImageObjectUrlRef.current) {
+      URL.revokeObjectURL(cameraBgImageObjectUrlRef.current)
+      cameraBgImageObjectUrlRef.current = null
+    }
+    const url = URL.createObjectURL(f)
+    cameraBgImageObjectUrlRef.current = url
+    const img = new Image()
+    img.onload = () => {
+      cameraBgImageElRef.current = img
+      setCameraBgMode('image')
+      void reapplyCameraBackgroundWithMode('image')
+    }
+    img.onerror = () => {
+      showToast('Could not load image')
+      URL.revokeObjectURL(url)
+      cameraBgImageObjectUrlRef.current = null
+    }
+    img.src = url
+  }
+
+  // ── Multi-camera ──────────────────────────────────────────────────────────
+
+  async function enumerateLocalCameras() {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices()
+      setLocalCameraDevices(devices.filter(d => d.kind === 'videoinput'))
+    } catch { /* ignore */ }
+  }
+
+  async function generateCameraToken() {
+    const socket = socketRef.current
+    if (!socket) return
+    socket.emit('camera:generate-token', {}, (res: { ok: boolean; token?: string; error?: string }) => {
+      if (!res.ok || !res.token) { showToast(res.error ?? 'Could not generate camera link'); return }
+      const url = `${window.location.origin}/camera/${res.token}`
+      setCameraShareUrl(url)
+    })
+  }
+
+  async function switchCamera(sourceId: string | null) {
+    let newTrack: MediaStreamTrack | null = null
+
+    if (sourceId === null || sourceId.startsWith('local:')) {
+      const deviceId = sourceId?.slice(6)
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: deviceId ? { deviceId: { exact: deviceId } } : true,
+      }).catch(() => null)
+      if (!stream) { showToast('Could not access camera'); return }
+      newTrack = stream.getVideoTracks()[0] ?? null
+    } else if (sourceId.startsWith('remote:')) {
+      const camId = sourceId.slice(7)
+      newTrack = remoteCameraStreamsRef.current.get(camId)?.getVideoTracks()[0] ?? null
+      // Allow switching even if track is not flowing yet — markReady will push it again when media starts
+      if (!newTrack) {
+        // Track hasn't arrived yet — mark as selected so markReady will auto-apply it
+        activeCameraIdRef.current = sourceId
+        setActiveCameraId(sourceId)
+        showToast('Connecting camera… video will appear shortly')
+        return
+      }
+    }
+
+    if (!newTrack) { showToast('Camera track unavailable'); return }
+
+    activeCameraIdRef.current = sourceId
+    teardownCameraBackgroundPipeline()
+    const ls = localStreamRef.current
+    if (ls) {
+      for (const t of [...ls.getVideoTracks()]) {
+        ls.removeTrack(t)
+        if (!isInboundRemoteCameraVideoTrack(t)) t.stop()
+      }
+      ls.addTrack(newTrack)
+    }
+    await pushLocalVideoToPeersAndPreview(newTrack)
+    setActiveCameraId(sourceId)
+    if (isBlurMode(cameraBgMode) || cameraBgMode === 'image') {
+      void applyCameraWithBackgroundSettings(newTrack, cameraBgMode, cameraBgImageElRef.current)
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
 
   async function ensureStream() {
     if (localStreamRef.current) return localStreamRef.current
@@ -390,7 +758,16 @@ export function MeetingPage() {
     const pc = new RTCPeerConnection({ iceServers: iceServersRef.current })
 
     if (localStreamRef.current) {
-      for (const t of localStreamRef.current.getTracks()) pc.addTrack(t, localStreamRef.current)
+      if (screenSharingRef.current && screenStreamRef.current) {
+        // Screen share is active — send screen video to the new peer instead of camera
+        for (const t of localStreamRef.current.getAudioTracks()) {
+          pc.addTrack(t, localStreamRef.current)
+        }
+        const screenTrack = screenStreamRef.current.getVideoTracks()[0]
+        if (screenTrack) pc.addTrack(screenTrack, localStreamRef.current)
+      } else {
+        for (const t of localStreamRef.current.getTracks()) pc.addTrack(t, localStreamRef.current)
+      }
     }
 
     pc.ontrack = ev => {
@@ -409,7 +786,32 @@ export function MeetingPage() {
       }
     }
 
-    pc.onconnectionstatechange = () => appendLog('pc[' + shortId(remoteId) + ']', pc.connectionState)
+    pc.onconnectionstatechange = () => {
+      const cs = pc.connectionState
+      appendLog('pc[' + shortId(remoteId) + ']', cs)
+      if (cs === 'failed') {
+        const existing = iceRestartTimersRef.current.get(remoteId)
+        if (existing) clearTimeout(existing)
+        iceRestartTimersRef.current.delete(remoteId)
+        void iceRestart(remoteId)
+      } else if (cs === 'disconnected') {
+        if (!iceRestartTimersRef.current.has(remoteId)) {
+          const timer = setTimeout(() => {
+            iceRestartTimersRef.current.delete(remoteId)
+            const s = peersRef.current.get(remoteId)
+            if (s && (s.pc.connectionState === 'disconnected' || s.pc.connectionState === 'failed')) {
+              void iceRestart(remoteId)
+            }
+          }, 2000)
+          iceRestartTimersRef.current.set(remoteId, timer)
+        }
+      } else if (cs === 'connected') {
+        const existing = iceRestartTimersRef.current.get(remoteId)
+        if (existing) { clearTimeout(existing); iceRestartTimersRef.current.delete(remoteId) }
+        setHasWeakNetwork(false)
+        void applyBitrateCaps(pc)
+      }
+    }
 
     const state: PeerState = { pc, pendingIce, remoteDescriptionReady: false }
     peersRef.current.set(remoteId, state)
@@ -422,6 +824,8 @@ export function MeetingPage() {
   }
 
   function removePeer(remoteId: string) {
+    const timer = iceRestartTimersRef.current.get(remoteId)
+    if (timer) { clearTimeout(timer); iceRestartTimersRef.current.delete(remoteId) }
     peersRef.current.get(remoteId)?.pc.close()
     peersRef.current.delete(remoteId)
     preConnectIceRef.current.delete(remoteId)
@@ -432,6 +836,8 @@ export function MeetingPage() {
   }
 
   function resetAllPeers() {
+    for (const timer of iceRestartTimersRef.current.values()) clearTimeout(timer)
+    iceRestartTimersRef.current.clear()
     for (const s of peersRef.current.values()) s.pc.close()
     peersRef.current.clear()
     preConnectIceRef.current.clear()
@@ -439,6 +845,7 @@ export function MeetingPage() {
     peerVideoCallbackRefs.current.clear()
     peerStreamRefs.current.clear()
     setPeerIds([])
+    setParticipantRoster({})
   }
 
   function getPeerVideoRef(remoteId: string) {
@@ -505,11 +912,19 @@ export function MeetingPage() {
     })
     socket.on('meeting:peer-joined', (payload: unknown) => {
       if (!payload || typeof payload !== 'object') return
-      const peerId = (payload as { peerId?: unknown }).peerId
+      const p = payload as { peerId?: unknown; userName?: unknown; userId?: unknown }
+      const peerId = p.peerId
       if (typeof peerId !== 'string' || peerId === mySocketIdRef.current) return
+      const userName = typeof p.userName === 'string' ? p.userName : 'Guest'
+      const userId = typeof p.userId === 'string' ? p.userId : ''
+      setParticipantRoster(prev => ({ ...prev, [peerId]: { userName, userId } }))
       appendLog('peer-joined', shortId(peerId))
-      showToast('Someone joined the call')
+      showToast(`${userName} joined the call`)
       if (shouldInitiateOffer(peerId)) void createAndSendOffer(peerId).catch(e => appendLog('offer error', String(e)))
+      // Re-announce screen share so the newly joined peer learns the current state
+      if (screenSharingRef.current) {
+        socket.emit('meeting:screenshare', { sharing: true })
+      }
     })
     socket.on('meeting:join-request', (payload: unknown) => {
       if (!payload || typeof payload !== 'object') return
@@ -541,6 +956,8 @@ export function MeetingPage() {
       setHostPeerId(p.hostPeerId)
       const iAmHost = p.hostUserId === myUserIdRef.current
       setIsHostInCall(iAmHost)
+      const newHostUserId = p.hostUserId
+      setMeeting(prev => (prev ? { ...prev, hostId: newHostUserId } : prev))
       showToast(iAmHost ? 'You are now the host' : 'Host changed')
     })
     socket.on('webrtc:offer', async (msg: unknown) => {
@@ -603,6 +1020,84 @@ export function MeetingPage() {
       if (!state.remoteDescriptionReady) { state.pendingIce.push(init); return }
       try { await state.pc.addIceCandidate(init) } catch { /* ignore stale ICE */ }
     })
+    // ── Multi-camera source events ────────────────────────────────────────
+    socket.on('camera:source-connected', async ({ cameraId, label }: { cameraId: string; label: string }) => {
+      // Clean up any stale PC from a previous connection with the same camera ID
+      remoteCameraPcsRef.current.get(cameraId)?.close()
+      remoteCameraPcsRef.current.delete(cameraId)
+      remoteCameraStreamsRef.current.delete(cameraId)
+      setRemoteCameras(prev => new Map(prev).set(cameraId, { label: label || 'Remote Camera', ready: false }))
+      showToast(`Camera "${label || 'Remote Camera'}" connected`)
+      // Tell camera source to send us an offer
+      socket.emit('camera:request-offer', { to: cameraId, hostId: socket.id })
+    })
+
+    socket.on('camera:source-disconnected', ({ cameraId }: { cameraId: string }) => {
+      setRemoteCameras(prev => { const m = new Map(prev); m.delete(cameraId); return m })
+      remoteCameraPcsRef.current.get(cameraId)?.close()
+      remoteCameraPcsRef.current.delete(cameraId)
+      remoteCameraStreamsRef.current.delete(cameraId)
+      setActiveCameraId(prev => {
+        const next = prev === `remote:${cameraId}` ? null : prev
+        activeCameraIdRef.current = next
+        return next
+      })
+      showToast('A camera source disconnected')
+    })
+
+    socket.on('camera:offer', async ({ from, sdp }: { from: string; sdp: RTCSessionDescriptionInit }) => {
+      // Offer from a camera source — close any stale PC, create recvonly PC, answer it
+      remoteCameraPcsRef.current.get(from)?.close()
+      const pc = new RTCPeerConnection({ iceServers: iceServersRef.current })
+      remoteCameraPcsRef.current.set(from, pc)
+      pc.ontrack = ev => {
+        const stream = ev.streams[0] ?? new MediaStream([ev.track])
+        remoteCameraStreamsRef.current.set(from, stream)
+        // Mark ready when track unmutes (media actually flowing), not just on ontrack
+        const track = ev.track
+        const markReady = () => {
+          setRemoteCameras(prev => {
+            const entry = prev.get(from)
+            if (!entry || entry.ready) return prev
+            return new Map(prev).set(from, { ...entry, ready: true })
+          })
+          // If user already selected this camera, apply the track now that media flows
+          if (activeCameraIdRef.current === `remote:${from}`) {
+            const ls = localStreamRef.current
+            if (ls) {
+              for (const vt of [...ls.getVideoTracks()]) {
+                if (vt.id === track.id) continue
+                ls.removeTrack(vt)
+                if (!isInboundRemoteCameraVideoTrack(vt)) vt.stop()
+              }
+              if (!ls.getVideoTracks().some(vt => vt.id === track.id)) ls.addTrack(track)
+            }
+            void pushLocalVideoToPeersAndPreview(track)
+          }
+        }
+        if (!track.muted) {
+          markReady()
+        } else {
+          track.addEventListener('unmute', markReady, { once: true })
+          // Fallback: mark ready after 4 s even if unmute never fires
+          setTimeout(markReady, 4000)
+        }
+      }
+      pc.onicecandidate = ev => {
+        if (ev.candidate) socket.emit('camera:ice', { to: from, candidate: ev.candidate.toJSON() })
+      }
+      await pc.setRemoteDescription(new RTCSessionDescription(sdp))
+      const answer = await pc.createAnswer()
+      await pc.setLocalDescription(answer)
+      socket.emit('camera:answer', { to: from, sdp: pc.localDescription })
+    })
+
+    socket.on('camera:ice', async ({ from, candidate }: { from: string; candidate: RTCIceCandidateInit }) => {
+      const pc = remoteCameraPcsRef.current.get(from)
+      if (pc && candidate) await pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => {})
+    })
+    // ─────────────────────────────────────────────────────────────────────
+
     socket.on('meeting:peer-left', (payload: unknown) => {
       const peerId =
         payload && typeof payload === 'object' && 'peerId' in (payload as object)
@@ -611,11 +1106,17 @@ export function MeetingPage() {
       if (typeof peerId === 'string') {
         appendLog('peer-left', shortId(peerId))
         removePeer(peerId)
+        setParticipantRoster(prev => {
+          const next = { ...prev }
+          delete next[peerId]
+          return next
+        })
         setScreenSharingPeers(prev => { const s = new Set(prev); s.delete(peerId); return s })
         showToast('A participant left')
       } else {
         appendLog('peer-left (full reset)')
         resetAllPeers()
+        setParticipantRoster({})
         setScreenSharingPeers(new Set())
       }
     })
@@ -650,6 +1151,12 @@ export function MeetingPage() {
       if (p.from !== controlledByRef.current) return
       if (companionWsRef.current?.readyState === WebSocket.OPEN) {
         companionWsRef.current.send(JSON.stringify({ type: 'control-event', ...p }))
+      } else if (typeof p.from === 'string' && !controlUnavailableNotifiedRef.current.has(p.from)) {
+        // Notify the requester once that companion is not running on this machine
+        controlUnavailableNotifiedRef.current.add(p.from)
+        socket.emit('meeting:control-unavailable', { to: p.from })
+        controlledByRef.current = null
+        setControlledBy(null)
       }
     })
     socket.on('meeting:control-release', (payload: unknown) => {
@@ -661,13 +1168,19 @@ export function MeetingPage() {
       companionWsRef.current?.send(JSON.stringify({ type: 'control-released' }))
       showToast('Remote control session ended')
     })
+    socket.on('meeting:control-unavailable', () => {
+      setControllingPeer(null)
+      controllingPeerRef.current = null
+      showToast('Remote control requires the Bandr Companion app on the other machine — ask them to install and run it', 6000)
+    })
     socket.on('meeting:screenshare', (payload: unknown) => {
       if (!payload || typeof payload !== 'object') return
       const { peerId, sharing } = payload as { peerId?: unknown; sharing?: unknown }
       if (typeof peerId !== 'string' || typeof sharing !== 'boolean') return
       setScreenSharingPeers(prev => {
         const s = new Set(prev)
-        sharing ? s.add(peerId) : s.delete(peerId)
+        if (sharing) s.add(peerId)
+        else s.delete(peerId)
         return s
       })
     })
@@ -763,6 +1276,7 @@ export function MeetingPage() {
 
   function finalizeJoin(a: Record<string, unknown>) {
     mySocketIdRef.current = socketRef.current?.id ?? mySocketIdRef.current
+    setCallLocalSocketId(mySocketIdRef.current || null)
     appendLog('joined', a)
     const peerList = Array.isArray(a.peerIds)
       ? (a.peerIds as unknown[]).filter((id): id is string => typeof id === 'string')
@@ -804,6 +1318,27 @@ export function MeetingPage() {
     setChatDraft('')
     setIsHostInCall(a.isHost === true)
     setHostPeerId(typeof a.hostPeerId === 'string' ? a.hostPeerId : (a.isHost === true ? mySocketIdRef.current : null))
+    {
+      const nextRoster: Record<string, ParticipantRosterEntry> = {}
+      const roster = a.peerRoster
+      if (Array.isArray(roster)) {
+        for (const row of roster) {
+          if (!row || typeof row !== 'object') continue
+          const r = row as { peerId?: unknown; userId?: unknown; userName?: unknown }
+          if (typeof r.peerId !== 'string') continue
+          nextRoster[r.peerId] = {
+            userId: typeof r.userId === 'string' ? r.userId : '',
+            userName: typeof r.userName === 'string' ? r.userName : 'Guest',
+          }
+        }
+      }
+      const sid = mySocketIdRef.current
+      if (sid) {
+        const selfName = typeof a.selfName === 'string' ? a.selfName : 'You'
+        nextRoster[sid] = { userName: selfName, userId: myUserIdRef.current }
+      }
+      setParticipantRoster(nextRoster)
+    }
     setHostJoinRequests([])
     setWhiteboardOpen(a.whiteboardActive === true)
     setWhiteboardOwnerId(typeof a.whiteboardOwnerId === 'string' ? a.whiteboardOwnerId : null)
@@ -821,8 +1356,18 @@ export function MeetingPage() {
     )
     setCallView('call')
     startTimer()
+    startNetworkStats()
     const n = typeof a.peerCount === 'number' ? a.peerCount : peerList.length + 1
     showToast(n <= 1 ? "You're the only one here" : `${n} people in this call`)
+
+    const focus = (location.state as { meetingFocus?: string } | null)?.meetingFocus
+    if (focus === 'Whiteboard') {
+      queueMicrotask(() => { openWhiteboard() })
+    } else if (focus === 'Chat') {
+      setChatOpen(true)
+    } else if (focus === 'Screen Share') {
+      queueMicrotask(() => { void toggleScreenShare() })
+    }
   }
 
   function respondJoinRequest(requestId: string, accepted: boolean) {
@@ -890,6 +1435,19 @@ export function MeetingPage() {
   }
 
   function leave() {
+    const hr = hostRecorderRef.current
+    hostRecorderRef.current = null
+    if (hr) void hr.stop().catch(() => {})
+    setRecordingActive(false)
+
+    const leavePipedRaw = teardownCameraBackgroundPipeline()
+    if (leavePipedRaw && leavePipedRaw.readyState === 'live') leavePipedRaw.stop()
+    if (cameraBgImageObjectUrlRef.current) {
+      URL.revokeObjectURL(cameraBgImageObjectUrlRef.current)
+      cameraBgImageObjectUrlRef.current = null
+    }
+    cameraBgImageElRef.current = null
+
     const socket = socketRef.current
     socket?.emit('meeting:leave')
     if (controllingPeerRef.current) {
@@ -906,18 +1464,23 @@ export function MeetingPage() {
     setScreenSharingPeers(new Set())
     controllingPeerRef.current = null
     controlledByRef.current = null
+    controlUnavailableNotifiedRef.current.clear()
     setControllingPeer(null)
     setControlledBy(null)
     setIncomingControlReq(null)
     setConnectBtnDisabled(false)
     stopTimer()
+    stopNetworkStats()
     setChatMessages([])
     setChatHasMore(false)
     setChatUnread(0)
     setChatOpen(false)
+    setCallSettingsOpen(false)
     setChatDraft('')
     setIsHostInCall(false)
     setHostPeerId(null)
+    setParticipantRoster({})
+    setCallLocalSocketId(null)
     setHostJoinRequests([])
     setWhiteboardOpen(false)
     setWhiteboardOwnerId(null)
@@ -928,8 +1491,84 @@ export function MeetingPage() {
     setCamEnabled(false)
     setPreviewCamOff(true)
     setPipCamOff(true)
+    setHasWeakNetwork(false)
     setCallView('lobby')
     showToast('You left the call')
+  }
+
+  function collectRecordingAudioStreams(): MediaStream[] {
+    const streams: MediaStream[] = []
+    const local = localStreamRef.current
+    if (local?.getAudioTracks().some(t => t.readyState === 'live')) {
+      streams.push(local)
+    }
+    const screen = screenStreamRef.current
+    if (screen?.getAudioTracks().some(t => t.readyState === 'live')) {
+      streams.push(screen)
+    }
+    for (const s of peerStreamRefs.current.values()) {
+      if (s.getAudioTracks().some(t => t.readyState === 'live')) {
+        streams.push(s)
+      }
+    }
+    return streams
+  }
+
+  function startHostRecording() {
+    if (!isHostInCall || hostRecorderRef.current) {
+      return
+    }
+    const root = recordingRootRef.current
+    if (!root) {
+      showToast('Recording area not ready')
+      return
+    }
+    const rec = new HostMeetingRecorder()
+    try {
+      rec.start(root, collectRecordingAudioStreams())
+      hostRecorderRef.current = rec
+      recordingStartedAtRef.current = Date.now()
+      setRecordingActive(true)
+      showToast('Recording…')
+    } catch (e: unknown) {
+      showToast(errorMessage(e))
+    }
+  }
+
+  async function stopHostRecordingAndUpload() {
+    const rec = hostRecorderRef.current
+    hostRecorderRef.current = null
+    if (!rec) {
+      setRecordingActive(false)
+      return
+    }
+    setRecordingBusy(true)
+    try {
+      const blob = await rec.stop()
+      setRecordingActive(false)
+      if (blob.size < 2048) {
+        showToast('Recording was empty')
+        return
+      }
+      const meetingCode = activeMeetingCode.trim()
+      if (!meetingCode) {
+        showToast('No meeting code')
+        return
+      }
+      const uploaded = await uploadMeetingRecordingViaApi(meetingCode, blob)
+      const durationSec = Math.max(1, Math.round((Date.now() - recordingStartedAtRef.current) / 1000))
+      await completeMeetingRecording(meetingCode, {
+        key: uploaded.key,
+        sizeBytes: blob.size,
+        durationSec,
+        mimeType: uploaded.contentType,
+      })
+      showToast('Recording saved')
+    } catch (e: unknown) {
+      showToast(errorMessage(e))
+    } finally {
+      setRecordingBusy(false)
+    }
   }
 
   function sendChatMessage() {
@@ -1079,7 +1718,10 @@ export function MeetingPage() {
     try {
       let audioTrack = localStream.getAudioTracks()[0] ?? null
       if (!audioTrack) {
-        const micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+        const micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          video: false,
+        })
         const newAudioTrack = micStream.getAudioTracks()[0]
         if (!newAudioTrack) throw new Error('No microphone track available')
         localStream.addTrack(newAudioTrack)
@@ -1112,11 +1754,13 @@ export function MeetingPage() {
     if (!next) {
       if (!localStreamRef.current) return
       const localStream = localStreamRef.current
+      const pipedRaw = teardownCameraBackgroundPipeline()
       for (const t of localStream.getVideoTracks()) {
         t.enabled = false
         t.stop()
         localStream.removeTrack(t)
       }
+      if (pipedRaw && pipedRaw.readyState === 'live') pipedRaw.stop()
       setCamEnabled(false)
       setPipCamOff(!screenSharingRef.current)
       setPreviewCamOff(true)
@@ -1125,35 +1769,22 @@ export function MeetingPage() {
     }
 
     try {
-      const localStream = localStreamRef.current ?? await ensureStream()
-      const cameraStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
+      await ensureStream()
+      const cameraStream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 640, max: 1280 }, height: { ideal: 480, max: 720 }, frameRate: { ideal: 15, max: 30 } },
+        audio: false,
+      })
       const newVideoTrack = cameraStream.getVideoTracks()[0]
       if (!newVideoTrack) throw new Error('No camera track available')
       newVideoTrack.enabled = true
 
-      for (const t of localStream.getVideoTracks()) localStream.removeTrack(t)
-      localStream.addTrack(newVideoTrack)
-
-      // Only push camera to peers if not currently screen sharing
-      if (!screenSharingRef.current) {
-        for (const [remoteId, { pc }] of peersRef.current.entries()) {
-          const sender = pc.getSenders().find(s => s.track?.kind === 'video')
-          if (sender) {
-            await sender.replaceTrack(newVideoTrack)
-          } else {
-            pc.addTrack(newVideoTrack, localStream)
-            void renegotiate(remoteId)
-          }
-        }
-        if (localPipRef.current) localPipRef.current.srcObject = localStream
-      }
-
-      if (localPreviewRef.current) localPreviewRef.current.srcObject = localStream
+      await applyCameraWithBackgroundSettings(newVideoTrack, cameraBgMode, cameraBgImageElRef.current)
 
       setCamEnabled(true)
       setPipCamOff(false)
       setPreviewCamOff(false)
       showToast('Camera on')
+      void enumerateLocalCameras()
     } catch (e) {
       appendLog('camera toggle error', String(e))
       showToast('Unable to turn camera on')
@@ -1179,6 +1810,7 @@ export function MeetingPage() {
 
   function respondControl(from: string, accepted: boolean) {
     setIncomingControlReq(null)
+    controlUnavailableNotifiedRef.current.delete(from)
     socketRef.current?.emit('meeting:control-response', { to: from, accepted })
     if (accepted) {
       setControlledBy(from)
@@ -1198,7 +1830,10 @@ export function MeetingPage() {
       return { normX: mx / rect.width, normY: my / rect.height }
     }
     const { videoWidth, videoHeight } = videoEl
-    const scale = Math.max(rect.width / videoWidth, rect.height / videoHeight)
+    const objectFit = videoEl.style.objectFit
+    const scale = objectFit === 'contain'
+      ? Math.min(rect.width / videoWidth, rect.height / videoHeight)
+      : Math.max(rect.width / videoWidth, rect.height / videoHeight)
     const ox = (rect.width - videoWidth * scale) / 2
     const oy = (rect.height - videoHeight * scale) / 2
     return {
@@ -1235,6 +1870,97 @@ export function MeetingPage() {
     sendControlEvent(peerId, { eventType: 'keydown', key: e.key })
   }
 
+  function scrollToPresenterPage(page: number) {
+    const el = swipeContainerRef.current
+    if (!el) return
+    el.scrollTo({ left: page * el.clientWidth, behavior: 'smooth' })
+    setPresenterPage(page)
+  }
+
+  function handleSwipeScroll() {
+    const el = swipeContainerRef.current
+    if (!el) return
+    setPresenterPage(Math.round(el.scrollLeft / el.clientWidth))
+  }
+
+  async function setVideoSendersActive(pc: RTCPeerConnection, active: boolean) {
+    for (const sender of pc.getSenders()) {
+      if (sender.track?.kind !== 'video') continue
+      const params = sender.getParameters()
+      if (!params.encodings?.length) continue
+      for (const enc of params.encodings) enc.active = active
+      try { await sender.setParameters(params) } catch { /* ignore */ }
+    }
+  }
+
+  async function checkNetworkStats() {
+    for (const [, { pc }] of peersRef.current.entries()) {
+      if (pc.connectionState !== 'connected') continue
+      try {
+        const stats = await pc.getStats()
+        for (const report of stats.values()) {
+          if (report.type !== 'candidate-pair') continue
+          const pair = report as { nominated?: boolean; availableOutgoingBitrate?: number }
+          if (!pair.nominated || pair.availableOutgoingBitrate === undefined) continue
+          const avail = pair.availableOutgoingBitrate
+          if (avail < 80_000 && !autoVideoPausedRef.current) {
+            autoVideoPausedRef.current = true
+            setHasWeakNetwork(true)
+            showToast('Weak network — video paused to keep audio')
+            for (const [, peer] of peersRef.current.entries()) {
+              void setVideoSendersActive(peer.pc, false)
+            }
+          } else if (avail > 300_000 && autoVideoPausedRef.current) {
+            autoVideoPausedRef.current = false
+            showToast('Network improved — video resumed')
+            for (const [, peer] of peersRef.current.entries()) {
+              void setVideoSendersActive(peer.pc, true)
+            }
+          }
+          return // only need one nominated pair
+        }
+      } catch { /* ignore */ }
+      return // checked one connected peer, that's enough
+    }
+  }
+
+  function startNetworkStats() {
+    if (statsIntervalRef.current) clearInterval(statsIntervalRef.current)
+    autoVideoPausedRef.current = false
+    statsIntervalRef.current = setInterval(() => { void checkNetworkStats() }, 5000)
+  }
+
+  function stopNetworkStats() {
+    if (statsIntervalRef.current) { clearInterval(statsIntervalRef.current); statsIntervalRef.current = null }
+    autoVideoPausedRef.current = false
+  }
+
+  async function iceRestart(remoteId: string) {
+    const state = peersRef.current.get(remoteId)
+    if (!state || !socketRef.current?.connected) return
+    setHasWeakNetwork(true)
+    try {
+      appendLog('ice restart →', shortId(remoteId))
+      const offer = await state.pc.createOffer({ iceRestart: true })
+      await state.pc.setLocalDescription(offer)
+      const sdp = state.pc.localDescription?.toJSON()
+      if (sdp) socketRef.current.emit('webrtc:offer', { to: remoteId, sdp })
+    } catch (e) {
+      appendLog('ice restart error', String(e))
+    }
+  }
+
+  async function applyBitrateCaps(pc: RTCPeerConnection) {
+    for (const sender of pc.getSenders()) {
+      if (!sender.track) continue
+      const params = sender.getParameters()
+      if (!params.encodings || params.encodings.length === 0) params.encodings = [{}]
+      const maxBitrate = sender.track.kind === 'video' ? 500_000 : 48_000
+      for (const enc of params.encodings) enc.maxBitrate = maxBitrate
+      try { await sender.setParameters(params) } catch { /* browser may not support */ }
+    }
+  }
+
   async function renegotiate(remoteId: string) {
     const state = peersRef.current.get(remoteId)
     if (!state || !socketRef.current?.connected) return
@@ -1248,8 +1974,9 @@ export function MeetingPage() {
     }
   }
 
-  async function stopScreenShare() {
-    screenStreamRef.current?.getTracks().forEach(t => t.stop())
+  async function stopScreenShare(opts?: { silent?: boolean }) {
+    const stream = screenStreamRef.current
+    if (stream) stream.getTracks().forEach(t => t.stop())
     screenStreamRef.current = null
     screenSharingRef.current = false
     socketRef.current?.emit('meeting:screenshare', { sharing: false })
@@ -1266,7 +1993,7 @@ export function MeetingPage() {
     }
     setPipCamOff(!cameraTrack)
     setScreenSharing(false)
-    showToast('Screen sharing stopped')
+    if (!opts?.silent) showToast('Screen sharing stopped')
   }
 
   async function toggleScreenShare() {
@@ -1287,6 +2014,10 @@ export function MeetingPage() {
         const sender = pc.getSenders().find(s => s.track?.kind === 'video')
         if (sender) {
           await sender.replaceTrack(screenTrack)
+          void renegotiate(remoteId)
+        } else {
+          // No video sender yet (camera was off) — add the track and negotiate
+          pc.addTrack(screenTrack, localStreamRef.current!)
           void renegotiate(remoteId)
         }
       }
@@ -1314,13 +2045,99 @@ export function MeetingPage() {
     }
   }
 
+  async function applyContentPolicyViolation() {
+    if (cameraModerationFiredRef.current) return
+    cameraModerationFiredRef.current = true
+    try {
+      socketRef.current?.emit('meeting:policy-violation', { code: 'camera_nsfw_local' })
+    } catch {
+      /* ignore */
+    }
+
+    if (screenSharingRef.current) {
+      await stopScreenShare({ silent: true }).catch(() => {})
+    }
+
+    const modPipedRaw = teardownCameraBackgroundPipeline()
+    const localStream = localStreamRef.current
+    if (localStream) {
+      for (const t of localStream.getVideoTracks()) {
+        t.enabled = false
+        t.stop()
+        localStream.removeTrack(t)
+      }
+    }
+    if (modPipedRaw && modPipedRaw.readyState === 'live') modPipedRaw.stop()
+    setCamEnabled(false)
+    setPipCamOff(true)
+    setPreviewCamOff(true)
+    if (localPreviewRef.current) localPreviewRef.current.srcObject = localStreamRef.current
+
+    showToast('Nudity and sexual content on camera are not allowed. You will be disconnected.', 8000)
+    appendLog('content policy', 'local camera moderated')
+    window.setTimeout(() => {
+      leave()
+    }, 600)
+  }
+
+  applyContentPolicyViolationRef.current = () => {
+    void applyContentPolicyViolation()
+  }
+
+  // Sample outgoing camera frames during calls (local preview). Two consecutive hits reduce false positives.
+  useEffect(() => {
+    if (callView !== 'call' || !camEnabled) {
+      cameraModerationStreakRef.current = 0
+      return
+    }
+    if ((import.meta.env as Record<string, string | undefined>).VITE_CAMERA_MODERATION === 'false') return
+
+    let cancelled = false
+    const tick = async () => {
+      if (cancelled || cameraModerationFiredRef.current) return
+      const video = localPreviewRef.current
+      if (!video || video.videoWidth < 16) return
+      const { violation } = await classifyCameraFrame(video)
+      if (cancelled || cameraModerationFiredRef.current) return
+      if (violation) {
+        cameraModerationStreakRef.current += 1
+        if (cameraModerationStreakRef.current >= 2) {
+          applyContentPolicyViolationRef.current()
+        }
+      } else {
+        cameraModerationStreakRef.current = 0
+      }
+    }
+
+    const id = window.setInterval(() => { void tick() }, 2800)
+    return () => {
+      cancelled = true
+      window.clearInterval(id)
+    }
+  }, [callView, camEnabled])
+
   const shareUrl = useMemo(() => {
     if (typeof window === 'undefined') return ''
     return `${window.location.origin}/m/${encodeURIComponent(code)}`
   }, [code])
 
   const timerDisplay = `${Math.floor(timerSeconds / 60)}:${String(timerSeconds % 60).padStart(2, '0')}`
-  const participantCount = peerIds.length + 1
+  const rosterCount = Object.keys(participantRoster).length
+  const participantCount = rosterCount > 0 ? rosterCount : peerIds.length + 1
+  const rosterRemoteIdsSorted = useMemo(() => {
+    const me = callLocalSocketId ?? ''
+    return Object.keys(participantRoster)
+      .filter(id => id !== me)
+      .sort((a, b) =>
+        participantRoster[a].userName.localeCompare(participantRoster[b].userName, undefined, { sensitivity: 'base' }),
+      )
+  }, [participantRoster, callLocalSocketId])
+
+  function rosterLabel(peerId: string) {
+    const e = participantRoster[peerId]
+    if (e?.userName) return e.userName
+    return `Peer ${shortId(peerId)}`
+  }
   const isSoloInCall = peerIds.length === 0
   const remotePresenterId = peerIds.find(id => screenSharingPeers.has(id)) ?? null
   const presenterIsLocal = !remotePresenterId && screenSharing
@@ -1341,30 +2158,38 @@ export function MeetingPage() {
     peerIds.length <= 9 ? { gridTemplateColumns: 'repeat(3,1fr)', gridTemplateRows: 'repeat(3,1fr)' } :
     { gridTemplateColumns: 'repeat(4,1fr)', gridTemplateRows: `repeat(${Math.ceil(peerIds.length / 4)},1fr)` }
 
+  const stripTileCount = stripPeerIds.length + (presenterIsLocal ? 0 : 1)
+  const stripGridStyle: React.CSSProperties =
+    stripTileCount <= 1 ? {} :
+    stripTileCount <= 2 ? { gridTemplateColumns: 'repeat(2,1fr)', gridTemplateRows: '1fr' } :
+    stripTileCount <= 4 ? { gridTemplateColumns: 'repeat(2,1fr)', gridTemplateRows: 'repeat(2,1fr)' } :
+    { gridTemplateColumns: 'repeat(3,1fr)', gridTemplateRows: `repeat(${Math.ceil(stripTileCount / 3)},1fr)` }
+
   return (
     <>
       {/* ── Meeting detail ── */}
       {callView === 'detail' && (
         <div
-          className="meeting-route-root fixed inset-0 overflow-hidden"
+          className="meeting-route-root fixed inset-0 flex flex-col overflow-hidden"
           style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}
         >
         {/* background */}
         <img src="/image.png" alt="" aria-hidden draggable={false} className="pointer-events-none absolute inset-0 h-full w-full select-none object-cover" />
 
         {/* header */}
-        <div className="relative z-20 flex items-center justify-between px-10 py-4">
+        <div className="relative z-20 flex items-center justify-between gap-3 px-4 py-3 sm:px-8 sm:py-4 lg:px-10">
           <Link to="/">
-            <img src="/nexivo_logo.svg" alt="Nexivo" className="h-14 w-auto" draggable={false} />
+            <img src="/nexivo_logo.svg" alt="Nexivo" className="h-10 w-auto sm:h-14" draggable={false} />
           </Link>
-          <Link to="/" className="rounded-full border border-black/10 bg-white/60 px-4 py-1.5 text-sm font-medium text-gray-600 backdrop-blur-sm transition hover:bg-white/80">
-            ← Back home
+          <Link to="/" className="shrink-0 rounded-full border border-black/10 bg-white/60 px-3 py-1.5 text-xs font-medium text-gray-600 backdrop-blur-sm transition hover:bg-white/80 sm:px-4 sm:text-sm">
+            <span className="sm:hidden">Back</span>
+            <span className="hidden sm:inline">← Back home</span>
           </Link>
         </div>
 
         {/* centered card */}
-        <div className="relative z-10 flex h-[calc(100vh-80px)] items-center justify-center px-4">
-          <div className="w-full max-w-md rounded-[22px] bg-[#1c1c1e]/95 backdrop-blur-xl p-7 md:min-h-[560px]">
+        <div className="relative z-10 flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-4 py-6 sm:py-8">
+          <div className="w-full max-w-md rounded-[22px] bg-[#1c1c1e]/95 p-5 backdrop-blur-xl sm:p-7 md:min-h-[560px]">
 
             <p className="text-[0.6rem] font-bold uppercase tracking-[0.2em] text-white/30">Meeting</p>
             <h1 className="mt-1 text-2xl font-bold tracking-tight text-white/90">
@@ -1381,7 +2206,7 @@ export function MeetingPage() {
                 </div>
               ) : meeting ? (
                 <>
-                  <div className="flex flex-col gap-3 rounded-2xl border border-white/[0.07] bg-white/5 p-4">
+                  <div className="flex flex-col gap-3 rounded-2xl border border-white/7 bg-white/5 p-4">
                     <div>
                       <p className="text-[0.6rem] font-semibold uppercase tracking-wider text-white/30">Title</p>
                       <p className="mt-0.5 text-sm font-semibold text-white/80">{meeting.title ?? 'Untitled meeting'}</p>
@@ -1397,11 +2222,11 @@ export function MeetingPage() {
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-2 rounded-2xl border border-white/[0.07] bg-white/5 p-3">
+                  <div className="flex items-center gap-2 rounded-2xl border border-white/7 bg-white/5 p-3">
                     <code className="flex-1 truncate text-xs text-white/50">{shareUrl}</code>
                     <button
                       type="button"
-                      className="rounded-xl border border-white/10 bg-white/8 px-3 py-1.5 text-xs font-semibold text-white/70 transition hover:bg-white/[0.14]"
+                      className="rounded-xl border border-white/10 bg-white/8 px-3 py-1.5 text-xs font-semibold text-white/70 transition hover:bg-white/14"
                       onClick={async () => { try { await navigator.clipboard.writeText(shareUrl) } catch { /* ignore */ } }}
                     >
                       Copy
@@ -1431,7 +2256,7 @@ export function MeetingPage() {
       {/* ── Lobby overlay (same shell as meeting detail) ── */}
       {callView === 'lobby' && (
         <div
-          className="meeting-route-root fixed inset-0 z-100 overflow-hidden"
+          className="meeting-route-root fixed inset-0 z-100 flex flex-col overflow-hidden"
           style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}
         >
           <img
@@ -1442,32 +2267,33 @@ export function MeetingPage() {
             className="pointer-events-none absolute inset-0 h-full w-full select-none object-cover"
           />
 
-          <div className="relative z-20 flex items-center justify-between px-10 py-4">
+          <div className="relative z-20 flex items-center justify-between gap-3 px-4 py-3 sm:px-8 sm:py-4 lg:px-10">
             <Link to="/">
-              <img src="/nexivo_logo.svg" alt="Nexivo" className="h-14 w-auto" draggable={false} />
+              <img src="/nexivo_logo.svg" alt="Nexivo" className="h-10 w-auto sm:h-14" draggable={false} />
             </Link>
             <Link
               to="/"
-              className="rounded-full border border-black/10 bg-white/60 px-4 py-1.5 text-sm font-medium text-gray-600 backdrop-blur-sm transition hover:bg-white/80"
+              className="shrink-0 rounded-full border border-black/10 bg-white/60 px-3 py-1.5 text-xs font-medium text-gray-600 backdrop-blur-sm transition hover:bg-white/80 sm:px-4 sm:text-sm"
             >
-              ← Back home
+              <span className="sm:hidden">Back</span>
+              <span className="hidden sm:inline">← Back home</span>
             </Link>
           </div>
 
-          <div className="relative z-10 flex min-h-[calc(100vh-80px)] items-center justify-center px-4 py-6">
-            <div className="w-full max-w-4xl rounded-[22px] bg-[#1c1c1e]/95 p-6 backdrop-blur-xl md:min-h-[560px] md:p-7">
+          <div className="relative z-10 flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-4 py-6 sm:min-h-[calc(100vh-80px)]">
+            <div className="w-full max-w-4xl rounded-[22px] bg-[#1c1c1e]/95 p-5 backdrop-blur-xl sm:p-6 md:min-h-[560px] md:p-7">
               <p className="text-[0.6rem] font-bold uppercase tracking-[0.2em] text-white/30">Video call</p>
               <h2 className="mt-1 text-2xl font-bold tracking-tight text-white/90">Ready to join?</h2>
               <p className="mt-1 font-mono text-sm text-white/50">{code.length > 0 ? code : '—'}</p>
 
               <div className="mt-6 flex flex-col gap-6 lg:flex-row lg:items-stretch">
-                <div className="relative w-full flex-1 overflow-hidden rounded-2xl border border-white/[0.07] bg-black/35 aspect-video lg:aspect-auto lg:min-h-[380px]">
+                <div className="relative w-full flex-1 overflow-hidden rounded-2xl border border-white/7 bg-black/35 aspect-video lg:aspect-auto lg:min-h-[380px]">
                   <video
                     ref={localPreviewRef}
                     playsInline
                     autoPlay
                     muted
-                    className="mirror absolute h-full w-full object-cover"
+                    className="absolute h-full w-full -scale-x-100 object-cover"
                   />
                   {previewCamOff && (
                     <div className="absolute inset-0 flex items-center justify-center bg-[#1c1c1e]/90">
@@ -1571,43 +2397,81 @@ export function MeetingPage() {
 
       {/* ── Call view overlay ── */}
       {callView === 'call' && (
-        <div className="meeting-route-root" style={{ position: 'fixed', inset: 0, background: '#111', zIndex: 100 }}>
-          {/* Video grid */}
-          <div className={`meet-grid ${presenterMode ? 'meet-grid--presenter' : ''}`} style={presenterMode ? undefined : gridStyle}>
-            {peerIds.length === 0 && (
-              <div className="waiting-placeholder">
-                <div className="waiting-icon">
-                  <svg viewBox="0 0 24 24" fill="#9aa0a6" width="32" height="32">
-                    <path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z" />
-                  </svg>
+        <div className="meeting-route-root fixed inset-0 z-100 bg-[#111]">
+          <div ref={recordingRootRef} className="absolute inset-0">
+          {/* Video grid — regular mode */}
+          {!presenterMode && (
+            <div className="absolute inset-0 grid gap-1.5 bg-[#111]" style={gridStyle}>
+              {peerIds.length === 0 && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3.5 text-sm text-[#9aa0a6]">
+                  <div className="flex h-16 w-16 items-center justify-center rounded-full bg-[#2d2e30]">
+                    <svg viewBox="0 0 24 24" fill="#9aa0a6" width="32" height="32">
+                      <path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z" />
+                    </svg>
+                  </div>
+                  <p>Waiting for others to join&hellip;</p>
                 </div>
-                <p>Waiting for others to join&hellip;</p>
-              </div>
-            )}
-            {presenterMode ? (
-              <>
-                <div className="presenter-main">
+              )}
+              {peerIds.map(id => (
+                <div key={id} className="group relative min-h-0 min-w-0 overflow-hidden rounded-[10px] bg-[#2d2e30]">
+                  <video
+                    ref={getPeerVideoRef(id)}
+                    playsInline
+                    autoPlay
+                    style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: screenSharingPeers.has(id) ? 'none' : 'scaleX(-1)' }}
+                  />
+                  <div className="absolute bottom-2.5 left-3 max-w-[calc(100%-16px)] truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">{rosterLabel(id)}</div>
+                  {screenSharingPeers.has(id) && !controllingPeer && !controlledBy && (
+                    <button
+                      type="button"
+                      className="absolute bottom-2.5 left-1/2 z-10 flex -translate-x-1/2 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-full border border-white/20 bg-[#111]/75 px-3.5 py-1.5 text-xs font-semibold text-white opacity-0 backdrop-blur-sm transition-[opacity,background] hover:border-sky-400/40 hover:bg-blue-600/85 group-hover:opacity-100"
+                      onClick={() => requestControl(id)}
+                      title={companionAvailable ? 'Request control' : 'Requires Bandr Companion app'}
+                    >
+                      <RemoteConnectionIcon size={13} />
+                      {companionAvailable ? 'Request Control' : 'Needs Companion'}
+                    </button>
+                  )}
+                  {controllingPeer === id && (
+                    <div
+                      className="absolute inset-0 z-10 cursor-crosshair outline-3 -outline-offset-[3px] outline-blue-600/70 focus:outline-blue-500"
+                      onMouseMove={e => handleControlMouseMove(e, id)}
+                      onClick={e => handleControlClick(e, id)}
+                      onDoubleClick={e => handleControlDblClick(e, id)}
+                      onContextMenu={e => { e.preventDefault(); handleControlClick(e, id) }}
+                      onWheel={e => handleControlScroll(e, id)}
+                      onKeyDown={e => handleControlKey(e, id)}
+                      tabIndex={0}
+                    />
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Presenter mode — swipe between full-screen share and participant tiles */}
+          {presenterMode && (
+            <div className="absolute inset-0">
+              <div
+                ref={swipeContainerRef}
+                className="absolute inset-0 flex snap-x snap-mandatory overflow-x-auto [-webkit-overflow-scrolling:touch] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+                onScroll={handleSwipeScroll}
+              >
+                {/* Page 1: full-screen shared screen */}
+                <div className="relative h-full w-full shrink-0 grow-0 basis-full snap-start bg-black">
                   {remotePresenterId ? (
-                    <div className="meet-tile meet-tile--presenter">
+                    <div className="group absolute inset-0 min-h-0 min-w-0 overflow-hidden rounded-none bg-[#2d2e30]">
                       <video
                         ref={getPeerVideoRef(remotePresenterId)}
                         playsInline
                         autoPlay
-                        style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: 'none' }}
+                        style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block', background: '#000' }}
                       />
-                      <div className="meet-tile-label">Peer {shortId(remotePresenterId)} • Presenting</div>
-                      {isHostInCall && remotePresenterId !== hostPeerId && (
-                        <button
-                          className="host-transfer-btn"
-                          onClick={() => transferHost(remotePresenterId)}
-                          title="Assign as host"
-                        >
-                          Make host
-                        </button>
-                      )}
+                      <div className="absolute bottom-2.5 left-3 max-w-[calc(100%-16px)] truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">{rosterLabel(remotePresenterId)} · Presenting</div>
                       {!controllingPeer && !controlledBy && (
                         <button
-                          className="request-control-btn request-control-btn--visible"
+                          type="button"
+                          className="absolute bottom-2.5 left-1/2 z-10 flex -translate-x-1/2 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-full border border-white/20 bg-[#111]/75 px-3.5 py-1.5 text-xs font-semibold text-white opacity-100 backdrop-blur-sm transition-[opacity,background] hover:border-sky-400/40 hover:bg-blue-600/85"
                           onClick={() => requestControl(remotePresenterId)}
                           title={companionAvailable ? 'Request control' : 'Requires Bandr Companion app'}
                         >
@@ -1617,7 +2481,7 @@ export function MeetingPage() {
                       )}
                       {controllingPeer === remotePresenterId && (
                         <div
-                          className="control-overlay"
+                          className="absolute inset-0 z-10 cursor-crosshair outline-3 -outline-offset-[3px] outline-blue-600/70 focus:outline-blue-500"
                           onMouseMove={e => handleControlMouseMove(e, remotePresenterId)}
                           onClick={e => handleControlClick(e, remotePresenterId)}
                           onDoubleClick={e => handleControlDblClick(e, remotePresenterId)}
@@ -1629,94 +2493,86 @@ export function MeetingPage() {
                       )}
                     </div>
                   ) : (
-                    <div className="meet-tile meet-tile--presenter">
-                      <video ref={localPresenterRef} playsInline autoPlay muted style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: 'none' }} />
-                      <div className="meet-tile-label">You • Presenting</div>
+                    <div className="absolute inset-0 min-h-0 min-w-0 overflow-hidden rounded-none bg-[#2d2e30]">
+                      <video ref={localPresenterRef} playsInline autoPlay muted style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block', background: '#000' }} />
+                      <div className="absolute bottom-2.5 left-3 rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">You · Presenting</div>
                     </div>
                   )}
                 </div>
-                <div className="presenter-strip">
-                  {!presenterIsLocal && (
-                    <div className="meet-tile meet-tile--thumb">
-                      <video ref={localStripRef} playsInline autoPlay muted style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: 'scaleX(-1)' }} />
-                      <div className="meet-tile-label">You</div>
-                    </div>
-                  )}
-                  {stripPeerIds.map(id => (
-                    <div key={id} className="meet-tile meet-tile--thumb">
-                      <video
-                        ref={getPeerVideoRef(id)}
-                        playsInline
-                        autoPlay
-                        style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: screenSharingPeers.has(id) ? 'none' : 'scaleX(-1)' }}
-                      />
-                      <div className="meet-tile-label">Peer {shortId(id)}</div>
-                      {isHostInCall && id !== hostPeerId && (
-                        <button className="host-transfer-btn" onClick={() => transferHost(id)} title="Assign as host">
-                          Make host
-                        </button>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </>
-            ) : (
-              peerIds.map(id => (
-                <div key={id} className="meet-tile">
-                  <video
-                    ref={getPeerVideoRef(id)}
-                    playsInline
-                    autoPlay
-                    style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: screenSharingPeers.has(id) ? 'none' : 'scaleX(-1)' }}
-                  />
-                  <div className="meet-tile-label">Peer {shortId(id)}</div>
-                  {isHostInCall && id !== hostPeerId && (
-                    <button className="host-transfer-btn" onClick={() => transferHost(id)} title="Assign as host">
-                      Make host
-                    </button>
-                  )}
 
-                  {/* Request control button — shown on screen-sharing peers */}
-                  {screenSharingPeers.has(id) && !controllingPeer && !controlledBy && (
-                    <button
-                      className="request-control-btn"
-                      onClick={() => requestControl(id)}
-                      title={companionAvailable ? 'Request control' : 'Requires Bandr Companion app'}
-                    >
-                      <RemoteConnectionIcon size={13} />
-                      {companionAvailable ? 'Request Control' : 'Needs Companion'}
-                    </button>
-                  )}
-
-                  {/* Invisible overlay capturing input when we're in control */}
-                  {controllingPeer === id && (
-                    <div
-                      className="control-overlay"
-                      onMouseMove={e => handleControlMouseMove(e, id)}
-                      onClick={e => handleControlClick(e, id)}
-                      onDoubleClick={e => handleControlDblClick(e, id)}
-                      onContextMenu={e => { e.preventDefault(); handleControlClick(e, id) }}
-                      onWheel={e => handleControlScroll(e, id)}
-                      onKeyDown={e => handleControlKey(e, id)}
-                      tabIndex={0}
-                    />
-                  )}
+                {/* Page 2: participant tiles */}
+                <div className="relative flex h-full w-full shrink-0 grow-0 basis-full snap-start flex-col gap-2.5 overflow-y-auto bg-[#111] px-4 pt-16 pb-24 max-sm:px-2.5 max-sm:pt-[52px] max-sm:pb-[92px]">
+                  <p className="mb-1 shrink-0 text-center text-[13px] font-semibold text-white/40">Participants ({stripTileCount})</p>
+                  <div className="grid min-h-0 flex-1 gap-2" style={stripGridStyle}>
+                    {!presenterIsLocal && (
+                      <div className="group relative min-h-0 min-w-0 overflow-hidden rounded-[10px] bg-[#2d2e30]">
+                        <video ref={localStripRef} playsInline autoPlay muted style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: 'scaleX(-1)' }} />
+                        <div className="absolute bottom-2.5 left-3 rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">You</div>
+                        {pipCamOff && (
+                          <div className="absolute inset-0 flex items-center justify-center bg-[#2d2e30]">
+                            <svg viewBox="0 0 24 24" fill="#9aa0a6" width="28" height="28"><path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z" /></svg>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {stripPeerIds.map(id => (
+                      <div key={id} className="group relative min-h-0 min-w-0 overflow-hidden rounded-[10px] bg-[#2d2e30]">
+                        <video
+                          ref={getPeerVideoRef(id)}
+                          playsInline
+                          autoPlay
+                          style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: 'scaleX(-1)' }}
+                        />
+                        <div className="absolute bottom-2.5 left-3 max-w-[calc(100%-16px)] truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">{rosterLabel(id)}</div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              ))
-            )}
-          </div>
+              </div>
+
+              {/* Swipe page dots */}
+              <div className="pointer-events-auto absolute bottom-[88px] left-1/2 z-25 flex -translate-x-1/2 items-center gap-2 max-sm:bottom-24">
+                <button
+                  type="button"
+                  className={cx(
+                    'h-2 w-2 cursor-pointer rounded-full border-0 p-0 transition-all hover:bg-white/60',
+                    presenterPage === 0 ? 'w-[22px] rounded bg-white' : 'bg-white/30',
+                  )}
+                  onClick={() => scrollToPresenterPage(0)}
+                  aria-label="View screen share"
+                />
+                <button
+                  type="button"
+                  className={cx(
+                    'h-2 w-2 cursor-pointer rounded-full border-0 p-0 transition-all hover:bg-white/60',
+                    presenterPage === 1 ? 'w-[22px] rounded bg-white' : 'bg-white/30',
+                  )}
+                  onClick={() => scrollToPresenterPage(1)}
+                  aria-label="View participants"
+                />
+              </div>
+            </div>
+          )}
 
           {/* Local PiP */}
-          <div className={`local-pip ${isSoloInCall ? 'local-pip--solo' : 'local-pip--floating'} ${presenterMode ? 'local-pip--hidden' : ''}`}>
-            <video ref={localPipRef} playsInline autoPlay muted className={screenSharing ? '' : 'mirror'} />
+          <div
+            className={cx(
+              'z-15 overflow-hidden rounded-xl border border-white/12 bg-[#2d2e30] shadow-2xl',
+              presenterMode && 'hidden',
+              isSoloInCall
+                ? 'absolute top-14 right-2.5 bottom-[104px] left-2.5 sm:top-[62px] sm:right-6 sm:bottom-[108px] sm:left-6'
+                : 'absolute right-2.5 bottom-[88px] aspect-video w-[min(168px,40vw)] sm:bottom-24 sm:right-4 sm:w-[196px]',
+            )}
+          >
+            <video ref={localPipRef} playsInline autoPlay muted className={screenSharing ? 'block h-full w-full object-cover' : 'block h-full w-full -scale-x-100 object-cover'} />
             {pipCamOff && (
-              <div className="cam-off-overlay">
+              <div className="absolute inset-0 flex items-center justify-center bg-[#2d2e30]">
                 <svg viewBox="0 0 24 24" fill="#9aa0a6" width="28" height="28">
                   <path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z" />
                 </svg>
               </div>
             )}
-            <div className="pip-label">
+            <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between bg-linear-to-t from-black/65 to-transparent px-2.5 py-1.5 text-xs text-white">
               <span>You</span>
               {!micEnabled && (
                 <svg viewBox="0 0 24 24" fill="#ea4335" width="12" height="12">
@@ -1725,37 +2581,88 @@ export function MeetingPage() {
               )}
             </div>
           </div>
+          </div>
 
           {/* Top bar */}
-          <div className="call-top-bar">
-            <div className="call-top-left">
-              <span className="call-brand">Meet</span>
-              <span className="call-timer">{timerDisplay}</span>
+          <div className="pointer-events-none absolute top-0 right-0 left-0 z-20 flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 bg-linear-to-b from-black/55 to-transparent px-5 py-3.5 max-sm:px-3 max-sm:py-2.5">
+            <div className="pointer-events-auto flex flex-wrap items-center gap-3 max-sm:gap-y-1.5">
+              <span className="text-base font-semibold max-sm:text-sm">Meet</span>
+              <span className="text-[13px] text-[#9aa0a6] tabular-nums">{timerDisplay}</span>
+              {recordingActive && (
+                <span className="rounded-full bg-red-600/90 px-2 py-0.5 text-[11px] font-bold tracking-wide text-white">REC</span>
+              )}
             </div>
-            <div className="call-top-right">
-              <span className="call-peers">
-                {participantCount === 1 ? '1 participant' : `${participantCount} participants`}
-              </span>
+            <div className="pointer-events-auto flex flex-wrap items-center gap-2.5 max-sm:gap-y-1.5">
+              <details className="relative">
+                <summary className="cursor-pointer list-none text-[13px] text-[#9aa0a6] hover:text-white/80 [&::-webkit-details-marker]:hidden">
+                  {participantCount === 1 ? '1 in call' : `${participantCount} in call`}
+                  <span className="text-white/40"> · People</span>
+                </summary>
+                <div className="absolute right-0 top-[calc(100%+6px)] z-50 w-[min(calc(100vw-24px),280px)] rounded-xl border border-white/10 bg-[#1c1c1e]/98 py-2 shadow-2xl backdrop-blur-xl">
+                  <p className="px-3 pb-2 text-[0.65rem] font-bold uppercase tracking-wider text-white/35">In this meeting</p>
+                  <ul className="max-h-[min(50vh,320px)] overflow-y-auto px-1">
+                    {callLocalSocketId && (
+                      <li className="flex flex-wrap items-center gap-x-2 gap-y-1 px-2 py-2 text-left text-sm text-white/90">
+                        <span className="min-w-0 truncate font-medium">
+                          {participantRoster[callLocalSocketId]?.userName ?? 'You'}
+                          <span className="font-normal text-white/40"> (you)</span>
+                        </span>
+                        {hostPeerId === callLocalSocketId && (
+                          <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-300">Host</span>
+                        )}
+                      </li>
+                    )}
+                    {rosterRemoteIdsSorted.map(id => (
+                      <li
+                        key={id}
+                        className="flex items-center justify-between gap-2 border-t border-white/8 px-2 py-2 text-left text-sm"
+                      >
+                        <span className="min-w-0 flex-1 truncate text-white/90">
+                          {rosterLabel(id)}
+                          {hostPeerId === id && (
+                            <span className="ml-2 inline-flex shrink-0 rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-300">Host</span>
+                          )}
+                        </span>
+                        {isHostInCall && id !== hostPeerId && (
+                          <button
+                            type="button"
+                            className="shrink-0 rounded-lg border border-white/15 bg-white/8 px-2 py-1 text-[11px] font-semibold text-white/90 hover:bg-amber-500/20 hover:text-amber-200"
+                            onClick={() => transferHost(id)}
+                          >
+                            Make host
+                          </button>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </details>
               {companionAvailable && (
-                <span className="companion-badge" title="Bandr Companion connected">
+                <span className="pointer-events-auto inline-flex items-center gap-1 rounded-full border border-emerald-400/25 bg-emerald-400/12 px-2 py-0.5 text-[11px] font-semibold text-emerald-400" title="Bandr Companion connected">
                   <RemoteConnectionIcon size={11} />
                   Companion
                 </span>
               )}
-              <span className="call-code-badge">{activeMeetingCode}</span>
+              {hasWeakNetwork && (
+                <span className="rounded-full bg-red-500/85 px-2.5 py-0.5 text-[11px] text-white animate-pulse" title="Network issues detected — attempting to reconnect">
+                  Reconnecting…
+                </span>
+              )}
+              <span className="rounded-full bg-[#3c4043]/85 px-2.5 py-0.5 font-mono text-[11px] text-white">{activeMeetingCode}</span>
             </div>
           </div>
 
           {whiteboardOpen && (
-            <div className="whiteboard-layer">
-              <div className="whiteboard-toolbar">
-                <span className="whiteboard-title">Whiteboard</span>
+            <div className="absolute top-[52px] right-4 bottom-24 left-4 z-26 overflow-hidden rounded-[14px] border border-white/16 bg-[#0c0c0e]/92 shadow-2xl backdrop-blur-sm max-sm:top-12 max-sm:right-2 max-sm:bottom-[92px] max-sm:left-2">
+              <div className="absolute top-2.5 left-2.5 z-2 inline-flex flex-wrap items-center gap-2 rounded-full border border-white/14 bg-[#141416]/85 px-2.5 py-1.5">
+                <span className="mr-1 text-xs font-bold text-white">Whiteboard</span>
                 {!whiteboardCanEdit && (
-                  <button type="button" onClick={requestWhiteboardEdit}>Ask to collaborate</button>
+                  <button type="button" className="cursor-pointer rounded-full border border-white/15 bg-white/8 px-2.5 py-1 text-xs text-white hover:bg-white/16" onClick={requestWhiteboardEdit}>Ask to collaborate</button>
                 )}
                 {whiteboardIsOwner && whiteboardOtherEditors.length > 0 && (
                   <>
                     <select
+                      className="cursor-pointer rounded-full border border-white/15 bg-white/8 px-2 py-1 text-xs text-white"
                       value={whiteboardRevokeUserId}
                       onChange={e => setWhiteboardRevokeUserId(e.target.value)}
                       title="Select collaborator to remove"
@@ -1764,13 +2671,14 @@ export function MeetingPage() {
                         <option key={id} value={id}>{`Editor ${shortId(id)}`}</option>
                       ))}
                     </select>
-                    <button type="button" onClick={revokeWhiteboardEdit} disabled={!whiteboardRevokeUserId}>
+                    <button type="button" className="cursor-pointer rounded-full border border-white/15 bg-white/8 px-2.5 py-1 text-xs text-white hover:bg-white/16" onClick={revokeWhiteboardEdit} disabled={!whiteboardRevokeUserId}>
                       Remove access
                     </button>
                   </>
                 )}
                 <input
                   type="color"
+                  className="h-6 w-6 cursor-pointer border-0 bg-transparent p-0"
                   value={whiteboardColor}
                   onChange={e => setWhiteboardColor(e.target.value)}
                   title="Brush color"
@@ -1778,6 +2686,7 @@ export function MeetingPage() {
                 />
                 <input
                   type="range"
+                  className="w-[90px] max-sm:w-16"
                   min={1}
                   max={12}
                   value={whiteboardWidth}
@@ -1785,12 +2694,12 @@ export function MeetingPage() {
                   title="Brush size"
                   disabled={!whiteboardCanEdit}
                 />
-                <button type="button" onClick={clearWhiteboard} disabled={!whiteboardCanEdit}>Clear</button>
-                {whiteboardIsOwner && <button type="button" onClick={closeWhiteboard}>Close</button>}
+                <button type="button" className="cursor-pointer rounded-full border border-white/15 bg-white/8 px-2.5 py-1 text-xs text-white hover:bg-white/16" onClick={clearWhiteboard} disabled={!whiteboardCanEdit}>Clear</button>
+                {whiteboardIsOwner && <button type="button" className="cursor-pointer rounded-full border border-white/15 bg-white/8 px-2.5 py-1 text-xs text-white hover:bg-white/16" onClick={closeWhiteboard}>Close</button>}
               </div>
               <canvas
                 ref={whiteboardCanvasRef}
-                className="whiteboard-canvas"
+                className="absolute inset-0 h-full w-full touch-none cursor-crosshair"
                 onPointerDown={e => {
                   if (!whiteboardCanEdit) return
                   if (e.button !== 0) return
@@ -1826,34 +2735,136 @@ export function MeetingPage() {
             </div>
           )}
           {incomingWhiteboardReq && whiteboardIsOwner && (
-            <div className="control-request-dialog">
-              <p className="control-request-title">Whiteboard collaboration request</p>
-              <p className="control-request-body">
+            <div className="absolute bottom-[90px] left-1/2 z-40 w-[min(360px,calc(100vw-32px))] -translate-x-1/2 rounded-[14px] border border-white/14 bg-[#161618]/97 p-4 shadow-2xl backdrop-blur-md">
+              <p className="mb-2 text-[13px] font-bold text-white">Whiteboard collaboration request</p>
+              <p className="mb-3.5 text-[13px] leading-snug text-white/70">
                 <strong>{incomingWhiteboardReq.fromName}</strong> wants to edit the whiteboard.
               </p>
-              <div className="control-request-actions">
-                <button className="control-req-allow" onClick={() => respondWhiteboardEditRequest(true)}>Allow</button>
-                <button className="control-req-deny" onClick={() => respondWhiteboardEditRequest(false)}>Deny</button>
+              <div className="flex gap-2">
+                <button type="button" className="flex-1 cursor-pointer rounded-lg border-0 bg-blue-600 py-2 text-[13px] font-semibold text-white hover:bg-blue-700" onClick={() => respondWhiteboardEditRequest(true)}>Allow</button>
+                <button type="button" className="flex-1 cursor-pointer rounded-lg border border-white/15 bg-white/7 py-2 text-[13px] font-semibold text-white/75 hover:bg-white/12" onClick={() => respondWhiteboardEditRequest(false)}>Deny</button>
               </div>
             </div>
           )}
 
-          {chatOpen && (
-            <aside className="chat-panel" aria-label="Meeting chat">
-              <div className="chat-panel-header">
-                <div className="chat-panel-title">
-                  <span>Meeting chat</span>
-                  <small>{participantCount === 1 ? 'Just you' : `${participantCount} participants`}</small>
-                </div>
-                <button type="button" className="chat-close-btn" onClick={() => setChatOpen(false)} aria-label="Close chat">
+          {callSettingsOpen && (
+            <aside
+              className="absolute top-4 bottom-4 left-4 z-25 flex w-[min(320px,85vw)] flex-col overflow-hidden rounded-[22px] border border-white/7 bg-[#1c1c1e]/95 shadow-2xl backdrop-blur-xl max-[900px]:w-[min(300px,90vw)] max-[480px]:top-auto max-[480px]:right-0 max-[480px]:bottom-0 max-[480px]:left-0 max-[480px]:h-[70vh] max-[480px]:w-full max-[480px]:rounded-t-[18px] max-[480px]:rounded-b-none max-[480px]:border-x-0 max-[480px]:border-b-0 max-[480px]:border-t max-[480px]:border-white/10"
+              aria-label="Call settings"
+            >
+              <div className="flex shrink-0 items-center justify-between border-b border-white/7 px-4 pb-3.5 pt-4 text-[13px] font-semibold text-white/90">
+                <span>Call settings</span>
+                <button
+                  type="button"
+                  className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full border border-white/10 bg-white/6 text-base leading-none text-white/60 transition hover:border-white/16 hover:bg-white/12 hover:text-white"
+                  onClick={() => setCallSettingsOpen(false)}
+                  aria-label="Close settings"
+                >
                   ✕
                 </button>
               </div>
-              <div className="chat-messages">
+              <div className="flex flex-1 flex-col gap-4 overflow-auto px-4 py-4 [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-white/20">
+                <div>
+                  <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Camera background</p>
+                  <input
+                    ref={cameraBgFileInputRef}
+                    type="file"
+                    accept="image/*"
+                    className="sr-only"
+                    onChange={handleCameraBackgroundFile}
+                    aria-hidden
+                    tabIndex={-1}
+                  />
+                  <label htmlFor="meeting-camera-bg-mode-panel" className="sr-only">
+                    Camera background
+                  </label>
+                  <select
+                    id="meeting-camera-bg-mode-panel"
+                    value={cameraBgMode}
+                    onChange={e => {
+                      const v = e.target.value as CameraBackgroundUiMode
+                      setCameraBgMode(v)
+                      void reapplyCameraBackgroundWithMode(v)
+                    }}
+                    className="w-full cursor-pointer rounded-xl border border-white/10 bg-white/5 px-3 py-2.5 text-[13px] font-medium text-white outline-none focus:border-amber-500/45 focus:bg-white/8"
+                  >
+                    <option value="none">None</option>
+                    <option value="blur-low">Blur – Soft</option>
+                    <option value="blur-high">Blur – Strong</option>
+                    <option value="image">Image</option>
+                  </select>
+                  {cameraBgMode === 'image' && (
+                    <button
+                      type="button"
+                      onClick={() => cameraBgFileInputRef.current?.click()}
+                      className="mt-2.5 w-full cursor-pointer rounded-xl border border-white/12 bg-white/8 py-2.5 text-[13px] font-semibold text-white/90 transition hover:border-amber-500/35 hover:bg-white/12"
+                    >
+                      Upload background image
+                    </button>
+                  )}
+                </div>
+                {isHostInCall && (
+                  <div className="border-t border-white/10 pt-4">
+                    <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Recording</p>
+                    <p className="mb-3 text-[12px] leading-snug text-white/45">
+                      Records what is on screen (tiles + your preview) and mixes participant audio. Stopping uploads the file for you as host.
+                    </p>
+                    {recordingActive ? (
+                      <button
+                        type="button"
+                        disabled={recordingBusy}
+                        onClick={() => void stopHostRecordingAndUpload()}
+                        className="w-full cursor-pointer rounded-xl border-0 bg-red-600 py-2.5 text-[13px] font-semibold text-white hover:bg-red-500 disabled:cursor-not-allowed disabled:opacity-45"
+                      >
+                        {recordingBusy ? 'Saving…' : 'Stop and upload'}
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={recordingBusy}
+                        onClick={startHostRecording}
+                        className="w-full cursor-pointer rounded-xl border border-white/12 bg-white/8 py-2.5 text-[13px] font-semibold text-white/90 hover:border-amber-500/35 hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-45"
+                      >
+                        Start recording
+                      </button>
+                    )}
+                    {recordingActive && !recordingBusy && (
+                      <p className="mt-2 flex items-center gap-2 text-[12px] font-medium text-red-400">
+                        <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-red-500" aria-hidden />
+                        Recording
+                      </p>
+                    )}
+                    <Link
+                      to="/recordings"
+                      className="mt-3 block text-center text-[12px] font-medium text-amber-400/90 no-underline hover:text-amber-300"
+                    >
+                      My recordings
+                    </Link>
+                  </div>
+                )}
+              </div>
+            </aside>
+          )}
+
+          {chatOpen && (
+            <aside
+              className="absolute top-4 right-4 bottom-4 z-25 flex w-[min(320px,85vw)] flex-col overflow-hidden rounded-[22px] border border-white/7 bg-[#1c1c1e]/95 shadow-2xl backdrop-blur-xl max-[900px]:w-[min(300px,90vw)] max-[480px]:top-auto max-[480px]:right-0 max-[480px]:bottom-0 max-[480px]:left-0 max-[480px]:h-[70vh] max-[480px]:w-full max-[480px]:rounded-t-[18px] max-[480px]:rounded-b-none max-[480px]:border-x-0 max-[480px]:border-b-0 max-[480px]:border-t max-[480px]:border-white/10"
+              aria-label="Meeting chat"
+            >
+              <div className="flex shrink-0 items-center justify-between border-b border-white/7 px-4 pb-3.5 pt-4 text-[13px] font-semibold text-white/90">
+                <div className="flex flex-col gap-px">
+                  <span>Meeting chat</span>
+                  <small className="text-[11px] font-medium text-white/45">{participantCount === 1 ? 'Just you' : `${participantCount} participants`}</small>
+                </div>
+                <button type="button" className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full border border-white/10 bg-white/6 text-base leading-none text-white/60 transition hover:border-white/16 hover:bg-white/12 hover:text-white" onClick={() => setChatOpen(false)} aria-label="Close chat">
+                  ✕
+                </button>
+              </div>
+              <div className="flex flex-1 flex-col gap-2.5 overflow-auto px-3 py-3 pb-2.5 [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-white/20">
                 {chatHasMore && (
                   <button
                     type="button"
-                    className="chat-load-older"
+                    className="self-center cursor-pointer rounded-xl border border-white/10 bg-white/6 px-2.5 py-1.5 text-xs text-white/80 disabled:cursor-not-allowed disabled:opacity-50"
                     onClick={loadOlderChat}
                     disabled={chatLoadingMore}
                   >
@@ -1861,17 +2872,23 @@ export function MeetingPage() {
                   </button>
                 )}
                 {chatMessages.length === 0 ? (
-                  <p className="chat-empty-state">No messages yet</p>
+                  <p className="m-auto text-[13px] text-white/40">No messages yet</p>
                 ) : (
                   chatMessages.map(m => {
                     const mine = m.senderId === mySocketIdRef.current || (m.senderUserId != null && m.senderUserId === myUserIdRef.current)
                     return (
-                      <div key={m.id} className={`chat-message ${mine ? 'chat-message--mine' : ''}`}>
-                        <div className="chat-message-meta">
+                      <div
+                        key={m.id}
+                        className={cx(
+                          'max-w-[88%] rounded-xl border px-2.5 py-2 text-white/90',
+                          mine ? 'ml-auto border-amber-500/35 bg-amber-500/20' : 'border-white/8 bg-white/6',
+                        )}
+                      >
+                        <div className="mb-1 flex items-center justify-between gap-2.5 text-[11px] text-white/72">
                           <span>{mine ? 'You' : (m.senderName || `Peer ${shortId(m.senderId)}`)}</span>
                           <time>{formatChatTime(m.createdAt)}</time>
                         </div>
-                        <p>{m.text}</p>
+                        <p className="m-0 whitespace-pre-wrap wrap-break-word text-[13px] leading-snug">{m.text}</p>
                       </div>
                     )
                   })
@@ -1879,7 +2896,7 @@ export function MeetingPage() {
                 <div ref={chatBottomRef} />
               </div>
               <form
-                className="chat-input-row"
+                className="flex gap-2 border-t border-white/7 bg-white/2 px-3 pb-3 pt-2.5"
                 onSubmit={e => {
                   e.preventDefault()
                   sendChatMessage()
@@ -1887,49 +2904,52 @@ export function MeetingPage() {
               >
                 <input
                   type="text"
+                  className="min-w-0 flex-1 rounded-xl border border-white/10 bg-white/5 px-2.5 py-2 text-[13px] text-white/90 outline-none placeholder:text-white/30 focus:border-amber-500/45 focus:bg-white/8"
                   value={chatDraft}
                   onChange={e => setChatDraft(e.target.value)}
                   placeholder="Send a message"
                   maxLength={500}
                 />
-                <button type="submit" disabled={chatDraft.trim().length === 0}>Send</button>
+                <button type="submit" className="cursor-pointer rounded-xl border-0 bg-amber-500 px-3 text-[13px] font-semibold text-neutral-900 hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-45" disabled={chatDraft.trim().length === 0}>Send</button>
               </form>
             </aside>
           )}
 
           {/* Incoming control request dialog (browser fallback — shown when companion is not running) */}
           {incomingControlReq && (
-            <div className="control-request-dialog">
-              <p className="control-request-title">
+            <div className="absolute bottom-[90px] left-1/2 z-40 w-[min(360px,calc(100vw-32px))] -translate-x-1/2 rounded-[14px] border border-white/14 bg-[#161618]/97 p-4 shadow-2xl backdrop-blur-md">
+              <p className="mb-2 flex items-center gap-2 text-[13px] font-bold text-white">
                 <RemoteConnectionIcon size={16} />
                 Remote control request
               </p>
-              <p className="control-request-body">
+              <p className="mb-3.5 text-[13px] leading-snug text-white/70">
                 <strong>{incomingControlReq.fromName}</strong> wants to control your computer.
-                {!companionAvailable && <span className="control-request-warn"> Download the Companion app for OS-level control.</span>}
+                {!companionAvailable && <span className="text-amber-300"> Download the Companion app for OS-level control.</span>}
               </p>
-              <div className="control-request-actions">
-                <button className="control-req-allow" onClick={() => respondControl(incomingControlReq.from, true)}>Allow</button>
-                <button className="control-req-deny" onClick={() => respondControl(incomingControlReq.from, false)}>Deny</button>
+              <div className="flex gap-2">
+                <button type="button" className="flex-1 cursor-pointer rounded-lg border-0 bg-blue-600 py-2 text-[13px] font-semibold text-white hover:bg-blue-700 disabled:opacity-50" onClick={() => respondControl(incomingControlReq.from, true)} disabled={!companionAvailable} title={!companionAvailable ? 'Companion app required to allow control' : undefined}>Allow</button>
+                <button type="button" className="flex-1 cursor-pointer rounded-lg border border-white/15 bg-white/7 py-2 text-[13px] font-semibold text-white/75 hover:bg-white/12" onClick={() => respondControl(incomingControlReq.from, false)}>Deny</button>
               </div>
             </div>
           )}
 
           {isHostInCall && hostJoinRequests.length > 0 && (
-            <div className="control-request-dialog" style={{ bottom: incomingControlReq ? 248 : 90 }}>
-              <p className="control-request-title">Join request</p>
-              <p className="control-request-body">
+            <div className="absolute left-1/2 z-40 w-[min(360px,calc(100vw-32px))] -translate-x-1/2 rounded-[14px] border border-white/14 bg-[#161618]/97 p-4 shadow-2xl backdrop-blur-md" style={{ bottom: incomingControlReq ? 248 : 90 }}>
+              <p className="mb-2 text-[13px] font-bold text-white">Join request</p>
+              <p className="mb-3.5 text-[13px] leading-snug text-white/70">
                 <strong>{hostJoinRequests[0]?.name ?? 'Someone'}</strong> wants to join this meeting.
               </p>
-              <div className="control-request-actions">
+              <div className="flex gap-2">
                 <button
-                  className="control-req-allow"
+                  type="button"
+                  className="flex-1 cursor-pointer rounded-lg border-0 bg-blue-600 py-2 text-[13px] font-semibold text-white hover:bg-blue-700"
                   onClick={() => hostJoinRequests[0] && respondJoinRequest(hostJoinRequests[0].requestId, true)}
                 >
                   Allow
                 </button>
                 <button
-                  className="control-req-deny"
+                  type="button"
+                  className="flex-1 cursor-pointer rounded-lg border border-white/15 bg-white/7 py-2 text-[13px] font-semibold text-white/75 hover:bg-white/12"
                   onClick={() => hostJoinRequests[0] && respondJoinRequest(hostJoinRequests[0].requestId, false)}
                 >
                   Deny
@@ -1940,19 +2960,27 @@ export function MeetingPage() {
 
           {/* Active control banner */}
           {(controllingPeer || controlledBy) && (
-            <div className="control-banner">
+            <div className="absolute top-[58px] left-1/2 z-30 flex max-w-[calc(100vw-24px)] -translate-x-1/2 flex-wrap items-center justify-center gap-2.5 rounded-full border border-sky-400/30 bg-blue-600/90 px-4 py-1.5 text-center text-xs font-semibold text-white shadow-lg backdrop-blur-sm max-[480px]:rounded-2xl max-[480px]:px-3 max-[480px]:py-2 max-[480px]:whitespace-normal">
               {controllingPeer
-                ? <>You are controlling a peer's computer — <button onClick={releaseControl}>Stop</button></>
-                : <>Your computer is being remotely controlled</>
-              }
+                ? (
+                  <>
+                    You are controlling a peer&apos;s computer —{' '}
+                    <button type="button" className="rounded-full border border-white/35 bg-white/15 px-2.5 py-0.5 text-[11px] font-bold text-white hover:bg-white/28" onClick={releaseControl}>Stop</button>
+                  </>
+                  )
+                : <>Your computer is being remotely controlled</>}
             </div>
           )}
 
           {/* Bottom controls */}
-          <div className="call-bottom-bar">
+          <div className="absolute bottom-0 left-0 right-0 z-20 flex flex-wrap items-center justify-center gap-3 bg-linear-to-t from-black/65 to-transparent px-5 pt-5 pb-7 max-sm:gap-2 max-sm:px-2.5 max-sm:pb-[max(1.125rem,env(safe-area-inset-bottom,0px))]">
             <button
+              type="button"
               onClick={toggleMic}
-              className={`ctrl-btn ctrl-btn--lg ${micEnabled ? 'ctrl-btn--active' : 'ctrl-btn--danger'}`}
+              className={cx(
+                'flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border-0 transition active:scale-95',
+                micEnabled ? 'bg-[#3c4043] hover:bg-[#4a4d50]' : 'bg-red-500 hover:bg-[#d33828]',
+              )}
               title="Mute/Unmute"
             >
               {micEnabled ? (
@@ -1966,8 +2994,12 @@ export function MeetingPage() {
               )}
             </button>
             <button
+              type="button"
               onClick={toggleCam}
-              className={`ctrl-btn ctrl-btn--lg ${camEnabled ? 'ctrl-btn--active' : 'ctrl-btn--danger'}`}
+              className={cx(
+                'flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border-0 transition active:scale-95',
+                camEnabled ? 'bg-[#3c4043] hover:bg-[#4a4d50]' : 'bg-red-500 hover:bg-[#d33828]',
+              )}
               title="Toggle camera"
             >
               {camEnabled ? (
@@ -1981,8 +3013,29 @@ export function MeetingPage() {
               )}
             </button>
             <button
+              type="button"
+              className={cx(
+                'flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border text-white transition active:scale-95',
+                callSettingsOpen
+                  ? 'border-sky-400/40 bg-blue-600/85 hover:bg-blue-600'
+                  : 'border-white/18 bg-[#3c4043]/90 hover:border-white/28 hover:bg-[#505458]',
+              )}
+              onClick={() => setCallSettingsOpen(v => !v)}
+              title={callSettingsOpen ? 'Close settings' : 'Call settings'}
+              aria-label={callSettingsOpen ? 'Close settings' : 'Open call settings'}
+              aria-expanded={callSettingsOpen}
+            >
+              <svg viewBox="0 0 24 24" fill="currentColor" width="22" height="22" aria-hidden>
+                <path d="M19.14 12.94c.04-.31.06-.63.06-.94 0-.31-.02-.63-.06-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z" />
+              </svg>
+            </button>
+            <button
+              type="button"
               onClick={() => void toggleScreenShare()}
-              className={`ctrl-btn ctrl-btn--lg ${screenSharing ? 'ctrl-btn--danger' : 'ctrl-btn--active'}`}
+              className={cx(
+                'flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border-0 transition active:scale-95',
+                screenSharing ? 'bg-red-500 hover:bg-[#d33828]' : 'bg-[#3c4043] hover:bg-[#4a4d50]',
+              )}
               title={screenSharing ? 'Stop sharing' : 'Share screen'}
             >
               {screenSharing ? (
@@ -1998,7 +3051,10 @@ export function MeetingPage() {
             <button
               type="button"
               onClick={whiteboardOpen ? (whiteboardIsOwner ? closeWhiteboard : undefined) : openWhiteboard}
-              className={`ctrl-btn ctrl-btn--lg ${whiteboardOpen ? 'ctrl-btn--danger' : 'ctrl-btn--active'}`}
+              className={cx(
+                'flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border-0 transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-45',
+                whiteboardOpen ? 'bg-red-500 hover:bg-[#d33828]' : 'bg-[#3c4043] hover:bg-[#4a4d50]',
+              )}
               title={whiteboardOpen ? (whiteboardIsOwner ? 'Close whiteboard' : 'Whiteboard is active') : 'Open whiteboard'}
               disabled={whiteboardOpen && !whiteboardIsOwner}
             >
@@ -2010,8 +3066,12 @@ export function MeetingPage() {
             </button>
             {(screenSharingPeers.size > 0 || controllingPeer) && (
               <button
+                type="button"
                 onClick={() => controllingPeer ? releaseControl() : requestControl([...screenSharingPeers][0]!)}
-                className={`ctrl-btn ctrl-btn--lg ${controllingPeer ? 'ctrl-btn--danger' : 'ctrl-btn--active'}`}
+                className={cx(
+                  'flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border-0 transition active:scale-95',
+                  controllingPeer ? 'bg-red-500 hover:bg-[#d33828]' : 'bg-[#3c4043] hover:bg-[#4a4d50]',
+                )}
                 title={controllingPeer ? 'Stop controlling' : 'Request control of shared screen'}
               >
                 <svg viewBox="0 0 24 24" fill="white" width="22" height="22">
@@ -2021,7 +3081,12 @@ export function MeetingPage() {
             )}
             <button
               type="button"
-              className={`chat-toggle-btn${chatOpen ? ' chat-toggle-btn--active' : ''}`}
+              className={cx(
+                'relative inline-flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border text-white transition',
+                chatOpen
+                  ? 'border-sky-400/40 bg-blue-600/85 hover:bg-blue-600'
+                  : 'border-white/18 bg-[#3c4043]/90 hover:border-white/28 hover:bg-[#505458]',
+              )}
               onClick={() => setChatOpen(prev => !prev)}
               aria-label={chatOpen ? 'Hide chat' : 'Show chat'}
               aria-pressed={chatOpen}
@@ -2029,9 +3094,35 @@ export function MeetingPage() {
               <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20">
                 <path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z" />
               </svg>
-              {chatUnread > 0 && <span className="chat-unread-badge">{chatUnread > 99 ? '99+' : chatUnread}</span>}
+              {chatUnread > 0 && (
+                <span className="absolute -top-0.5 -right-0.5 inline-flex min-h-[18px] min-w-[18px] items-center justify-center rounded-full bg-[#ea4335] px-1 text-[10px] text-white">
+                  {chatUnread > 99 ? '99+' : chatUnread}
+                </span>
+              )}
             </button>
-            <button onClick={leave} className="ctrl-btn ctrl-btn--leave ctrl-btn--lg" title="Leave call">
+            {/* Camera switcher button */}
+            {camEnabled && (
+              <button
+                type="button"
+                onClick={() => { setShowCameraPanel(p => !p); void enumerateLocalCameras() }}
+                className={cx(
+                  'relative flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border-0 transition active:scale-95',
+                  showCameraPanel ? 'bg-amber-500 hover:bg-amber-400' : 'bg-[#3c4043] hover:bg-[#4a4d50]',
+                )}
+                title="Switch camera / add camera source"
+              >
+                <svg viewBox="0 0 24 24" fill="white" width="22" height="22">
+                  <path d="M20 5h-3.17L15 3H9L7.17 5H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 14H4V7h4.05l.59-.65L9.88 5h4.24l1.24 1.35.59.65H20v12zM12 8c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zm0 8c-1.65 0-3-1.35-3-3s1.35-3 3-3 3 1.35 3 3-1.35 3-3 3z"/>
+                  <circle cx="18" cy="9" r="1.5" fill="white"/>
+                </svg>
+                {remoteCameras.size > 0 && (
+                  <span className="absolute -top-0.5 -right-0.5 inline-flex h-4 w-4 items-center justify-center rounded-full bg-amber-400 text-[9px] font-bold text-black">
+                    {remoteCameras.size + 1}
+                  </span>
+                )}
+              </button>
+            )}
+            <button type="button" onClick={leave} className="flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border-0 bg-red-500 transition hover:bg-[#d33828] active:scale-95" title="Leave call">
               <svg viewBox="0 0 24 24" fill="white" width="24" height="24">
                 <path d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z" />
               </svg>
@@ -2040,16 +3131,136 @@ export function MeetingPage() {
         </div>
       )}
 
+      {/* Camera switcher panel */}
+      {callView === 'call' && showCameraPanel && camEnabled && (
+        <div className="fixed bottom-[88px] left-1/2 z-[110] w-[min(340px,calc(100vw-24px))] -translate-x-1/2 overflow-hidden rounded-2xl border border-white/10 bg-[#1c1c1e]/97 shadow-2xl backdrop-blur-xl sm:bottom-24">
+          <div className="flex items-center justify-between border-b border-white/8 px-4 py-3">
+            <p className="text-[13px] font-semibold text-white/90">Camera Sources</p>
+            <button type="button" onClick={() => setShowCameraPanel(false)} className="flex h-6 w-6 items-center justify-center rounded-full bg-white/8 text-xs text-white/60 hover:bg-white/14">✕</button>
+          </div>
+          <div className="max-h-72 overflow-y-auto px-3 py-2.5 flex flex-col gap-1.5">
+            {/* Local cameras */}
+            {localCameraDevices.map((cam, i) => {
+              const sid = `local:${cam.deviceId}`
+              const isActive = activeCameraId === sid || (activeCameraId === null && i === 0)
+              return (
+                <button
+                  key={cam.deviceId}
+                  type="button"
+                  onClick={() => void switchCamera(sid)}
+                  className={cx(
+                    'flex w-full items-center gap-3 rounded-xl border px-3 py-2.5 text-left text-[13px] transition',
+                    isActive
+                      ? 'border-amber-500/40 bg-amber-500/12 text-white'
+                      : 'border-white/8 bg-white/4 text-white/70 hover:border-white/14 hover:bg-white/8',
+                  )}
+                >
+                  <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16" className="shrink-0">
+                    <path d="M12 15.2A3.2 3.2 0 0 1 8.8 12 3.2 3.2 0 0 1 12 8.8a3.2 3.2 0 0 1 3.2 3.2 3.2 3.2 0 0 1-3.2 3.2M12 7a5 5 0 0 0-5 5 5 5 0 0 0 5 5 5 5 0 0 0 5-5 5 5 0 0 0-5-5m0-3.5c-3.86 0-7 3.14-7 7s3.14 7 7 7 7-3.14 7-7-3.14-7-7-7z" />
+                  </svg>
+                  <span className="min-w-0 flex-1 truncate">{cam.label || `Camera ${i + 1}`}</span>
+                  {isActive && <span className="shrink-0 rounded-full bg-amber-500/25 px-1.5 py-0.5 text-[10px] font-semibold text-amber-400">Active</span>}
+                </button>
+              )
+            })}
+            {/* Remote camera sources */}
+            {[...remoteCameras.entries()].map(([cameraId, { label, ready }]) => {
+              const sid = `remote:${cameraId}`
+              const isActive = activeCameraId === sid
+              return (
+                <button
+                  key={cameraId}
+                  type="button"
+                  onClick={() => void switchCamera(sid)}
+                  className={cx(
+                    'flex w-full items-center gap-3 rounded-xl border px-3 py-2.5 text-left text-[13px] transition',
+                    isActive
+                      ? 'border-amber-500/40 bg-amber-500/12 text-white'
+                      : 'border-white/8 bg-white/4 text-white/70 hover:border-white/14 hover:bg-white/8',
+                  )}
+                >
+                  {/* Live thumbnail preview */}
+                  <RemoteCameraThumb cameraId={cameraId} streamsRef={remoteCameraStreamsRef} ready={ready} />
+                  <span className="min-w-0 flex-1 truncate">{label}</span>
+                  {ready
+                    ? <span className="shrink-0 h-1.5 w-1.5 rounded-full bg-green-400" />
+                    : <span className="shrink-0 text-[10px] text-white/40 italic">connecting…</span>
+                  }
+                  {isActive && <span className="shrink-0 rounded-full bg-amber-500/25 px-1.5 py-0.5 text-[10px] font-semibold text-amber-400">Active</span>}
+                </button>
+              )
+            })}
+          </div>
+          {isHostInCall && (
+            <div className="border-t border-white/8 px-3 py-3">
+              <button
+                type="button"
+                onClick={() => void generateCameraToken()}
+                className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/6 py-2.5 text-[13px] font-medium text-white/80 transition hover:border-amber-500/30 hover:bg-amber-500/10 hover:text-white"
+              >
+                <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
+                  <path d="M19 3H5c-1.11 0-2 .89-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2m-7 3a3 3 0 0 1 3 3 3 3 0 0 1-3 3 3 3 0 0 1-3-3 3 3 0 0 1 3-3m6 13H6v-1c0-2 4-3.1 6-3.1s6 1.1 6 3.1v1z"/>
+                </svg>
+                Add camera source (phone / device)
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Camera share URL modal */}
+      {callView === 'call' && cameraShareUrl && (
+        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setCameraShareUrl(null)}>
+          <div className="w-full max-w-sm rounded-2xl border border-white/10 bg-[#1c1c1e] p-5 shadow-2xl" onClick={e => e.stopPropagation()}>
+            <div className="mb-4 flex items-center justify-between">
+              <p className="font-semibold text-white">Connect Camera Source</p>
+              <button type="button" onClick={() => setCameraShareUrl(null)} className="flex h-7 w-7 items-center justify-center rounded-full bg-white/8 text-xs text-white/60 hover:bg-white/14">✕</button>
+            </div>
+
+            {/* QR code — client-generated (Google Chart QR API is discontinued) */}
+            <div className="mb-4 flex justify-center">
+              <div className="rounded-xl bg-white p-3">
+                <QRCodeSVG
+                  value={cameraShareUrl}
+                  size={180}
+                  level="M"
+                  className="block h-[180px] w-[180px]"
+                  aria-label="QR code"
+                />
+              </div>
+            </div>
+
+            <p className="mb-3 text-center text-[13px] text-white/55">Scan with your phone camera to connect as a live camera source</p>
+
+            <div className="mb-3 flex gap-2">
+              <input
+                readOnly
+                value={cameraShareUrl}
+                className="min-w-0 flex-1 rounded-xl border border-white/10 bg-white/5 px-3 py-2 font-mono text-xs text-white/70 outline-none"
+              />
+              <button
+                type="button"
+                onClick={() => { void navigator.clipboard.writeText(cameraShareUrl); showToast('Copied!') }}
+                className="shrink-0 rounded-xl border border-white/10 bg-white/8 px-3 py-2 text-xs font-semibold text-white hover:bg-white/14"
+              >
+                Copy
+              </button>
+            </div>
+            <p className="text-center text-[11px] text-white/30">Link expires in 1 hour · keep the camera page open to stay connected</p>
+          </div>
+        </div>
+      )}
+
       {/* Toast */}
       {toast && (
-        <div className="toast">
+        <div className="fixed top-5 left-1/2 z-50 max-w-[calc(100vw-24px)] -translate-x-1/2 rounded-lg bg-[#3c4043] px-[18px] py-2.5 text-center text-[13px] whitespace-nowrap text-[#e8eaed] shadow-xl max-[480px]:whitespace-normal max-[480px]:px-3.5 max-[480px]:text-xs">
           <span>{toast}</span>
         </div>
       )}
 
       {/* Debug log (Shift+D) */}
       {showDebug && (
-        <pre className="debug-log" aria-live="polite">
+        <pre className="fixed bottom-[100px] left-3 right-3 z-40 max-h-[140px] overflow-auto rounded-[10px] bg-black/85 p-2.5 font-mono text-[11px] whitespace-pre-wrap text-emerald-400" aria-live="polite">
           {debugLog}
         </pre>
       )}

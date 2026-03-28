@@ -1,6 +1,10 @@
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
@@ -9,8 +13,20 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [react(), tailwindcss()],
+    resolve: {
+      alias: [
+        {
+          find: /^@mediapipe\/selfie_segmentation$/,
+          replacement: path.resolve(__dirname, 'src/shims/mediapipe-selfie-segmentation.ts'),
+        },
+        { find: 'buffer', replacement: path.resolve(__dirname, 'node_modules/buffer') },
+      ],
+    },
+    optimizeDeps: {
+      include: ['buffer', 'nsfwjs', '@tensorflow/tfjs', '@tensorflow-models/body-segmentation'],
+    },
     server: {
-      allowedHosts: ['3468-2400-1a00-4b20-1fc2-18cb-f6da-2f0c-b76a.ngrok-free.app'],
+      allowedHosts: ['d56a-2400-1a00-4b20-1fc2-148c-720-8ff9-b25b.ngrok-free.app'],
       proxy: {
         '/api': {
           target: proxyTarget,

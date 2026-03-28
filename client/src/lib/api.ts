@@ -1,4 +1,4 @@
-import type { ApiError, AuthResponse, MeetingResponse } from './types'
+import type { ApiError, AuthResponse, MeetingRecordingItem, MeetingResponse } from './types'
 import { getToken } from './auth'
 
 function apiBase(): string {
@@ -89,12 +89,101 @@ export async function createMeeting(input: { title?: string }): Promise<MeetingR
   })
 }
 
+export type PresignRecordingResponse = {
+  uploadUrl: string
+  key: string
+  contentType: string
+  headers: Record<string, string>
+}
+
+export async function presignMeetingRecording(
+  meetingCode: string,
+  contentType?: string,
+): Promise<PresignRecordingResponse> {
+  return await requestJson<PresignRecordingResponse>(
+    `/api/meetings/${encodeURIComponent(meetingCode)}/recordings/presign`,
+    {
+      method: 'POST',
+      auth: true,
+      body: JSON.stringify({ contentType: contentType ?? 'video/webm' }),
+    },
+  )
+}
+
+export async function uploadRecordingToPresignedUrl(
+  uploadUrl: string,
+  blob: Blob,
+  headers: Record<string, string>,
+): Promise<void> {
+  const h = new Headers()
+  for (const [k, v] of Object.entries(headers)) {
+    h.set(k, v)
+  }
+  const res = await fetch(uploadUrl, { method: 'PUT', body: blob, headers: h })
+  if (!res.ok) {
+    throw new HttpError(res.status, { error: `Upload failed (${res.status})` })
+  }
+}
+
+/** Uploads recording bytes through the API (server → R2). Avoids browser CORS and custom-domain S3 issues. */
+export async function uploadMeetingRecordingViaApi(
+  meetingCode: string,
+  blob: Blob,
+): Promise<{ key: string; contentType: string }> {
+  const url = `${apiBase()}/api/meetings/${encodeURIComponent(meetingCode)}/recordings/upload`
+  const token = getToken()
+  if (!token) {
+    throw new HttpError(401, { error: 'Not signed in' })
+  }
+  const rawType = blob.type && blob.type.length > 0 ? blob.type : 'video/webm'
+  const ct = rawType.split(';')[0]!.trim()
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': ct,
+      Accept: 'application/json',
+    },
+    body: blob,
+    credentials: 'include',
+  })
+  if (!res.ok) {
+    const body = await readJsonOrText(res)
+    throw new HttpError(res.status, body)
+  }
+  return (await readJsonOrText(res)) as { key: string; contentType: string }
+}
+
+export async function completeMeetingRecording(
+  meetingCode: string,
+  body: { key: string; sizeBytes: number; durationSec: number; mimeType?: string },
+): Promise<{ recording: MeetingRecordingItem }> {
+  return await requestJson<{ recording: MeetingRecordingItem }>(
+    `/api/meetings/${encodeURIComponent(meetingCode)}/recordings/complete`,
+    {
+      method: 'POST',
+      auth: true,
+      body: JSON.stringify(body),
+    },
+  )
+}
+
+export async function listMyRecordings(): Promise<{ recordings: MeetingRecordingItem[] }> {
+  return await requestJson<{ recordings: MeetingRecordingItem[] }>('/api/recordings', {
+    auth: true,
+  })
+}
+
 export function errorMessage(err: unknown): string {
   if (err instanceof HttpError) {
     const body = err.body
     if (typeof body === 'object' && body !== null && 'error' in body) {
-      const maybe = (body as ApiError).error
-      if (typeof maybe === 'string' && maybe.length > 0) return maybe
+      const rec = body as ApiError
+      const maybe = rec.error
+      const detail = typeof rec.detail === 'string' && rec.detail.length > 0 ? rec.detail : null
+      if (typeof maybe === 'string' && maybe.length > 0) {
+        return detail ? `${maybe} — ${detail}` : maybe
+      }
     }
     return `Request failed (${err.status}).`
   }

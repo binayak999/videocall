@@ -15,8 +15,9 @@ model User {
   provider  String
   createdAt DateTime @default(now())
 
-  hostedMeetings Meeting[]     @relation("MeetingHost")
+  hostedMeetings Meeting[]           @relation("MeetingHost")
   participants   Participant[]
+  recordings     MeetingRecording[]
 }
 
 model Meeting {
@@ -30,6 +31,23 @@ model Meeting {
 
   participants Participant[]
   chatMessages ChatMessage[]
+  recordings   MeetingRecording[]
+}
+
+model MeetingRecording {
+  id          String   @id @default(cuid())
+  meetingId   String
+  meeting     Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  hostId      String
+  host        User     @relation(fields: [hostId], references: [id])
+  r2Key       String   @unique
+  mimeType    String   @default("video/webm")
+  durationSec Int?
+  sizeBytes   Int?
+  createdAt   DateTime @default(now())
+
+  @@index([hostId, createdAt])
+  @@index([meetingId])
 }
 
 model Participant {

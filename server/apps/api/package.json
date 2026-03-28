@@ -10,6 +10,8 @@
     "start": "node -r dotenv/config dist/index.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1019.0",
+    "@aws-sdk/s3-request-presigner": "^3.1019.0",
     "@bandr/db": "*",
     "bcrypt": "^5.1.1",
     "cors": "^2.8.5",

@@ -1,9 +1,37 @@
-import { useState } from 'react'
+import { useEffect, useState, type MouseEvent, type ReactNode } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { createMeeting, errorMessage, getMeeting } from '../lib/api'
+import { RecordingVideoPlayer } from '../components/RecordingVideoPlayer'
+import { createMeeting, errorMessage, getMeeting, listMyRecordings } from '../lib/api'
+import type { MeetingRecordingItem } from '../lib/types'
 import { useAuthToken } from '../lib/useAuthToken'
 import { clearToken } from '../lib/auth'
 import heroImg from '../assets/hero.png'
+
+function useLgUp() {
+  const [lg, setLg] = useState(false)
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 1024px)')
+    const sync = () => setLg(mq.matches)
+    sync()
+    mq.addEventListener('change', sync)
+    return () => mq.removeEventListener('change', sync)
+  }, [])
+  return lg
+}
+
+function formatBytes(n: number | null) {
+  if (n == null || n < 0) return '—'
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function formatDur(sec: number | null) {
+  if (sec == null || sec < 0) return '—'
+  const m = Math.floor(sec / 60)
+  const s = sec % 60
+  return `${m}:${s.toString().padStart(2, '0')}`
+}
 
 export function HomePage() {
   const navigate = useNavigate()
@@ -17,9 +45,14 @@ export function HomePage() {
   const [createBusy, setCreateBusy] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
   const [tab, setTab] = useState<'join' | 'create'>('create')
+  const [sidebarKey, setSidebarKey] = useState<'home' | 'join' | 'create' | 'recordings'>('create')
+  const [recordings, setRecordings] = useState<MeetingRecordingItem[]>([])
+  const [recordingsBusy, setRecordingsBusy] = useState(false)
+  const [recordingsErr, setRecordingsErr] = useState<string | null>(null)
   const [leftHovered, setLeftHovered] = useState(false)
   const [rightHovered, setRightHovered] = useState(false)
   const [selectedFeature, setSelectedFeature] = useState<string | null>(null)
+  const lgUp = useLgUp()
 
   const onJoin = async () => {
     const trimmed = code.trim()
@@ -28,7 +61,9 @@ export function HomePage() {
     setJoinError(null)
     try {
       await getMeeting(trimmed)
-      navigate(`/m/${encodeURIComponent(trimmed)}`)
+      navigate(`/m/${encodeURIComponent(trimmed)}`, {
+        state: selectedFeature ? { meetingFocus: selectedFeature } : undefined,
+      })
     } catch (err: unknown) {
       setJoinError(errorMessage(err))
     } finally {
@@ -41,7 +76,9 @@ export function HomePage() {
     setCreateError(null)
     try {
       const r = await createMeeting({ title: title.trim() || undefined })
-      navigate(`/m/${encodeURIComponent(r.meeting.code)}`)
+      navigate(`/m/${encodeURIComponent(r.meeting.code)}`, {
+        state: selectedFeature ? { meetingFocus: selectedFeature } : undefined,
+      })
     } catch (err: unknown) {
       setCreateError(errorMessage(err))
     } finally {
@@ -49,10 +86,40 @@ export function HomePage() {
     }
   }
 
-  const navItems = [
+  const showRecordingsPanel = sidebarKey === 'recordings'
+
+  useEffect(() => {
+    if (!authed && sidebarKey === 'recordings') setSidebarKey('create')
+  }, [authed, sidebarKey])
+
+  useEffect(() => {
+    if (!showRecordingsPanel || !authed) return
+    let cancelled = false
+    void (async () => {
+      setRecordingsBusy(true)
+      setRecordingsErr(null)
+      try {
+        const r = await listMyRecordings()
+        if (!cancelled) setRecordings(r.recordings)
+      } catch (e: unknown) {
+        if (!cancelled) setRecordingsErr(errorMessage(e))
+      } finally {
+        if (!cancelled) setRecordingsBusy(false)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [showRecordingsPanel, authed])
+
+  const navItems: Array<{
+    label: string
+    key: 'home' | 'join' | 'create' | 'recordings' | 'login' | 'register'
+    icon: ReactNode
+  }> = [
     {
       label: 'Home',
-      active: true,
+      key: 'home',
       icon: (
         <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
           <path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z" />
@@ -61,6 +128,7 @@ export function HomePage() {
     },
     {
       label: 'Join Meeting',
+      key: 'join',
       icon: (
         <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
           <path d="M17 12h-5v5h5v-5zM16 1v2H8V1H6v2H5c-1.11 0-1.99.9-1.99 2L3 19c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2h-1V1h-2zm3 18H5V8h14v11z" />
@@ -69,30 +137,48 @@ export function HomePage() {
     },
     {
       label: 'Create Meeting',
+      key: 'create',
       icon: (
         <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
           <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z" />
         </svg>
       ),
     },
-    ...(!authed ? [
-      {
-        label: 'Login',
-        icon: (
-          <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
-            <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" />
-          </svg>
-        ),
-      },
-      {
-        label: 'Register',
-        icon: (
-          <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
-            <path d="M15 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm-9-2V7H4v3H1v2h3v3h2v-3h3v-2H6zm9 4c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" />
-          </svg>
-        ),
-      },
-    ] : []),
+    ...(authed
+      ? [
+          {
+            label: 'My Recordings',
+            key: 'recordings' as const,
+            icon: (
+              <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
+                <path d="M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z" />
+              </svg>
+            ),
+          },
+        ]
+      : []),
+    ...(!authed
+      ? [
+          {
+            label: 'Login',
+            key: 'login' as const,
+            icon: (
+              <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
+                <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" />
+              </svg>
+            ),
+          },
+          {
+            label: 'Register',
+            key: 'register' as const,
+            icon: (
+              <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
+                <path d="M15 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm-9-2V7H4v3H1v2h3v3h2v-3h3v-2H6zm9 4c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z" />
+              </svg>
+            ),
+          },
+        ]
+      : []),
   ]
 
   const features = [
@@ -134,8 +220,27 @@ export function HomePage() {
     },
   ]
 
+  const leftPanelStyle = lgUp
+    ? {
+        height: '60%' as const,
+        transform: `perspective(900px) rotateY(${leftHovered ? 0 : 14}deg)`,
+        transition: 'transform 0.35s ease',
+      }
+    : { transition: 'transform 0.35s ease' as const }
+
+  const rightPanelStyle = lgUp
+    ? {
+        height: '60%' as const,
+        transform: `perspective(900px) rotateY(${rightHovered ? 0 : -14}deg)`,
+        transition: 'transform 0.35s ease',
+      }
+    : { transition: 'transform 0.35s ease' as const }
+
   return (
-    <div className="fixed inset-0 overflow-hidden" style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+    <div
+      className="fixed inset-0 flex flex-col overflow-hidden"
+      style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}
+    >
 
       {/* ── BACKGROUND IMAGE ── */}
       <img
@@ -147,8 +252,8 @@ export function HomePage() {
       />
 
       {/* ── HEADER ── */}
-      <div className="relative z-20 flex items-center justify-between px-10 py-4">
-        <img src="/nexivo_logo.svg" alt="Nexivo" className="h-14 w-auto" draggable={false} />
+      <div className="relative z-20 flex shrink-0 items-center justify-between px-4 py-3 sm:px-8 sm:py-4 lg:px-10">
+        <img src="/nexivo_logo.svg" alt="Nexivo" className="h-10 w-auto sm:h-14" draggable={false} />
         <div className="flex items-center gap-2">
           {authed ? (
             <span className="rounded-full border border-white/20 bg-black/30 px-3 py-1 text-xs text-white/60 backdrop-blur-sm">
@@ -162,13 +267,13 @@ export function HomePage() {
         </div>
       </div>
 
-      {/* ── THREE-PANEL LAYOUT ── */}
-      <div className="relative z-10 flex h-[calc(100vh-68px)] items-center justify-center gap-6 px-4 pb-4">
+      {/* ── THREE-PANEL LAYOUT (stacked + scrollable below lg) ── */}
+      <div className="relative z-10 flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-3 pb-4 pt-1 sm:px-4 lg:flex-row lg:items-center lg:justify-center lg:gap-6 lg:overflow-hidden lg:pt-0 max-w-7xl mx-auto">
 
         {/* ── LEFT: Navigation ── */}
         <div
-          className="flex w-64 flex-shrink-0 flex-col rounded-[22px] bg-[#1c1c1e]/90 backdrop-blur-xl p-5 shadow-none"
-          style={{ height: '60%', transform: `perspective(900px) rotateY(${leftHovered ? 0 : 14}deg)`, transition: 'transform 0.35s ease' }}
+          className="flex w-full shrink-0 flex-col rounded-[22px] bg-[#1c1c1e]/90 p-5 shadow-none backdrop-blur-xl max-lg:max-h-[min(38vh,300px)] max-lg:overflow-y-auto lg:h-[60%] lg:w-64 lg:shrink-0"
+          style={leftPanelStyle}
           onMouseEnter={() => setLeftHovered(true)}
           onMouseLeave={() => setLeftHovered(false)}
         >
@@ -176,12 +281,39 @@ export function HomePage() {
             Navigation
           </p>
           <div className="flex flex-col gap-0.5">
-            {navItems.map(({ label, icon, active }) => {
-              const to = label === 'Home' ? '/' : label === 'Join Meeting' ? '/' : label === 'Create Meeting' ? '/' : label === 'Login' ? '/login' : '/register'
-              const handleClick = label === 'Join Meeting' ? () => setTab('join') : label === 'Create Meeting' ? () => setTab('create') : undefined
+            {navItems.map(({ label, key: navKey, icon }) => {
+              const active = sidebarKey === navKey
+              const to =
+                navKey === 'login'
+                  ? '/login'
+                  : navKey === 'register'
+                    ? '/register'
+                    : '/'
+              const handleClick =
+                navKey === 'home'
+                  ? () => {
+                      setSidebarKey('home')
+                      setTab('join')
+                    }
+                  : navKey === 'join'
+                    ? () => {
+                        setSidebarKey('join')
+                        setTab('join')
+                      }
+                    : navKey === 'create'
+                      ? () => {
+                          setSidebarKey('create')
+                          setTab('create')
+                        }
+                      : navKey === 'recordings'
+                        ? (e: MouseEvent) => {
+                            e.preventDefault()
+                            setSidebarKey('recordings')
+                          }
+                        : undefined
               return (
                 <Link
-                  key={label}
+                  key={navKey}
                   to={to}
                   onClick={handleClick}
                   className={`flex cursor-pointer items-center gap-3 rounded-xl px-3 py-2.5 transition ${
@@ -216,49 +348,47 @@ export function HomePage() {
 
         {/* ── CENTER: Main ── */}
         <div
-          className="flex flex-shrink-0 flex-col rounded-[22px] bg-[#1c1c1e]/90 backdrop-blur-xl shadow-none overflow-hidden"
-          style={{ width: '680px', height: '72%', zIndex: 10 }}
+          className="z-10 flex min-h-[min(52vh,440px)] w-full max-w-[680px] flex-1 flex-col overflow-hidden rounded-[22px] bg-[#1c1c1e]/90 shadow-none backdrop-blur-xl lg:h-[72%] lg:min-h-0 lg:shrink-0 lg:w-[680px] lg:max-w-none"
         >
 
-          {/* feature highlight */}
           {selectedFeature && (() => {
-            const f = features.find(x => x.label === selectedFeature)!
+            const f = features.find(x => x.label === selectedFeature)
+            if (!f) return null
             return (
               <div
-                className="flex flex-1 flex-col items-center justify-center gap-4 px-8 py-6 transition-all"
-                style={{ background: `linear-gradient(135deg, ${f.color}12 0%, ${f.color}06 100%)` }}
+                className="flex shrink-0 items-center gap-3 border-b border-white/[0.06] px-5 py-3"
+                style={{ background: `linear-gradient(90deg, ${f.color}14 0%, transparent 100%)` }}
               >
                 <div
-                  className="flex h-20 w-20 items-center justify-center rounded-3xl"
-                  style={{ backgroundColor: `${f.color}25` }}
+                  className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl"
+                  style={{ backgroundColor: `${f.color}28` }}
                 >
-                  <svg viewBox="0 0 24 24" fill={f.color} width="36" height="36">{f.icon}</svg>
+                  <svg viewBox="0 0 24 24" fill={f.color} width="18" height="18">{f.icon}</svg>
                 </div>
-                <div className="text-center">
-                  <p className="text-2xl font-bold tracking-tight" style={{ color: f.color }}>{f.label}</p>
-                  <p className="mt-1.5 text-sm text-white/50">{f.detail}</p>
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-semibold text-white/90">Starting with {f.label}</p>
+                  <p className="text-[0.65rem] text-white/45">Opens when you join the call.</p>
                 </div>
-                <span className="rounded-full border px-4 py-1 text-xs font-semibold uppercase tracking-wider" style={{ borderColor: `${f.color}40`, color: f.color, backgroundColor: `${f.color}10` }}>
-                  Coming soon
-                </span>
                 <button
                   type="button"
                   onClick={() => setSelectedFeature(null)}
-                  className="mt-2 text-xs text-white/30 hover:text-white/60 transition"
+                  className="shrink-0 rounded-lg px-2 py-1 text-[0.65rem] font-medium text-white/40 transition hover:bg-white/[0.06] hover:text-white/70"
                 >
-                  ← Back
+                  Clear
                 </button>
               </div>
             )
           })()}
 
-          {/* tabs — hidden when feature selected */}
-          {!selectedFeature && <div className="flex items-center gap-2 px-5 pt-4 pb-3">
+          <div className="flex flex-wrap items-center gap-2 px-5 pt-4 pb-3">
             <button
               type="button"
-              onClick={() => setTab('join')}
+              onClick={() => {
+                setSidebarKey('join')
+                setTab('join')
+              }}
               className={`rounded-full px-4 py-1.5 text-sm font-semibold transition ${
-                tab === 'join'
+                !showRecordingsPanel && tab === 'join'
                   ? 'bg-[#f59e0b] text-black'
                   : 'text-white/50 hover:text-white/70'
               }`}
@@ -267,20 +397,87 @@ export function HomePage() {
             </button>
             <button
               type="button"
-              onClick={() => setTab('create')}
+              onClick={() => {
+                setSidebarKey('create')
+                setTab('create')
+              }}
               className={`rounded-full px-4 py-1.5 text-sm font-semibold transition ${
-                tab === 'create'
+                !showRecordingsPanel && tab === 'create'
                   ? 'bg-[#f59e0b] text-black'
                   : 'text-white/50 hover:text-white/70'
               }`}
             >
               Create
             </button>
-          </div>}
+            {authed && (
+              <button
+                type="button"
+                onClick={() => setSidebarKey('recordings')}
+                className={`rounded-full px-4 py-1.5 text-sm font-semibold transition ${
+                  showRecordingsPanel
+                    ? 'bg-[#f59e0b] text-black'
+                    : 'text-white/50 hover:text-white/70'
+                }`}
+              >
+                Recordings
+              </button>
+            )}
+          </div>
 
-          {/* content */}
-          {!selectedFeature && <div className="flex flex-1 flex-col px-5 pb-4 overflow-hidden min-h-0">
-            {tab === 'join' ? (
+          <div className="flex flex-1 flex-col px-5 pb-4 overflow-hidden min-h-0">
+            {showRecordingsPanel ? (
+              <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-hidden">
+                <div className="shrink-0">
+                  <h2 className="text-xl font-bold tracking-tight text-white/90">My recordings</h2>
+                  <p className="text-sm text-white/80">Meetings you hosted and saved after recording.</p>
+                </div>
+
+                <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto overscroll-contain [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                  {recordingsBusy && (
+                    <p className="text-sm text-white/55">Loading…</p>
+                  )}
+                  {recordingsErr && <p className="text-sm text-red-400">{recordingsErr}</p>}
+                  {!recordingsBusy && !recordingsErr && recordings.length === 0 && (
+                    <p className="rounded-xl border border-white/[0.08] bg-white/[0.04] px-4 py-8 text-center text-sm leading-relaxed text-white/60">
+                      No recordings yet. While hosting, use Start recording in settings, then stop and upload.
+                    </p>
+                  )}
+                  <div className="grid grid-cols-2 gap-3 pb-1">
+                    {recordings.map(rec => (
+                      <article
+                        key={rec.id}
+                        className="flex min-w-0 flex-col overflow-hidden rounded-xl border border-white/[0.08] bg-white/[0.04] shadow-sm transition hover:border-white/15 hover:bg-white/[0.06]"
+                      >
+                        <div className="relative aspect-video bg-black">
+                          <RecordingVideoPlayer variant="tile" src={rec.playbackUrl} theme="nexivo" className="h-full min-h-[120px]" />
+                        </div>
+                        <div className="flex min-h-0 flex-1 flex-col border-t border-white/[0.06] p-2.5">
+                          <h3 className="line-clamp-2 text-xs font-semibold leading-snug text-white/90">
+                            {rec.meetingTitle?.trim() || `Meeting ${rec.meetingCode}`}
+                          </h3>
+                          <p className="mt-1 truncate font-mono text-[0.6rem] text-white/40">{rec.meetingCode}</p>
+                          <p className="mt-1 line-clamp-2 text-[0.6rem] leading-relaxed text-white/40">
+                            {new Date(rec.createdAt).toLocaleString()}
+                            {' · '}
+                            {formatDur(rec.durationSec)}
+                            {' · '}
+                            {formatBytes(rec.sizeBytes)}
+                          </p>
+                          <a
+                            href={rec.playbackUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="mt-auto pt-2 text-[0.6rem] font-semibold text-[#fbbf24] underline underline-offset-2"
+                          >
+                            Open
+                          </a>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            ) : tab === 'join' ? (
               <div className="flex flex-1 flex-col gap-2 min-h-0">
                 <p className="text-xl font-bold tracking-tight text-white/90">Join a meeting</p>
                 <p className="text-sm text-white/80">Enter the code shared by your host.</p>
@@ -290,20 +487,20 @@ export function HomePage() {
                   <img src={heroImg} alt="" aria-hidden draggable={false} className="h-full w-auto max-w-full select-none object-contain opacity-40 p-4" />
                 </div>
 
-                <div className="flex gap-2 mt-1">
+                <div className="mt-1 flex flex-col gap-2 sm:flex-row">
                   <input
                     value={code}
                     onChange={e => setCode(e.target.value)}
                     onKeyDown={e => { if (e.key === 'Enter') void onJoin() }}
                     placeholder="Meeting code"
                     autoComplete="off"
-                    className="flex-1 rounded-xl border border-white/[0.08] bg-white/[0.06] px-4 py-2.5 text-sm text-white/90 placeholder-white/20 outline-none transition focus:border-[#f59e0b]/50 focus:bg-white/[0.09]"
+                    className="min-w-0 flex-1 rounded-xl border border-white/[0.08] bg-white/[0.06] px-4 py-2.5 text-sm text-white/90 placeholder-white/20 outline-none transition focus:border-[#f59e0b]/50 focus:bg-white/[0.09]"
                   />
                   <button
                     type="button"
                     onClick={() => void onJoin()}
                     disabled={joinBusy || !code.trim()}
-                    className="rounded-xl bg-[#f59e0b] px-5 py-2.5 text-sm font-semibold text-black transition hover:bg-[#fbbf24] disabled:opacity-30"
+                    className="shrink-0 rounded-xl bg-[#f59e0b] px-5 py-2.5 text-sm font-semibold text-black transition hover:bg-[#fbbf24] disabled:opacity-30 sm:w-auto"
                   >
                     {joinBusy ? '…' : 'Join'}
                   </button>
@@ -350,13 +547,13 @@ export function HomePage() {
                 )}
               </div>
             )}
-          </div>}
+          </div>
         </div>
 
         {/* ── RIGHT: Features ── */}
         <div
-          className="flex w-64 flex-shrink-0 flex-col rounded-[22px] bg-[#1c1c1e]/90 backdrop-blur-xl p-5 shadow-none"
-          style={{ height: '60%', transform: `perspective(900px) rotateY(${rightHovered ? 0 : -14}deg)`, transition: 'transform 0.35s ease' }}
+          className="flex w-full shrink-0 flex-col rounded-[22px] bg-[#1c1c1e]/90 p-5 shadow-none backdrop-blur-xl max-lg:max-h-[min(42vh,340px)] max-lg:overflow-y-auto lg:h-[60%] lg:w-64 lg:shrink-0"
+          style={rightPanelStyle}
           onMouseEnter={() => setRightHovered(true)}
           onMouseLeave={() => setRightHovered(false)}
         >

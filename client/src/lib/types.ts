@@ -1,5 +1,6 @@
 export type ApiError = {
   error: string
+  detail?: string
 }
 
 export type User = {
@@ -26,5 +27,17 @@ export type AuthResponse = {
 
 export type MeetingResponse = {
   meeting: Meeting
+}
+
+export type MeetingRecordingItem = {
+  id: string
+  meetingId: string
+  meetingCode: string
+  meetingTitle: string | null
+  mimeType: string
+  durationSec: number | null
+  sizeBytes: number | null
+  createdAt: string
+  playbackUrl: string
 }
 
