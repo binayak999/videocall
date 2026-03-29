@@ -15,6 +15,7 @@ import { authMiddleware } from "./middleware/auth";
 import { meetingRecordingUploadHandler } from "./routes/meetingRecordingUpload";
 import { meetingsRouter } from "./routes/meetings";
 import { recordingsListRouter } from "./routes/recordings";
+import { translateRouter } from "./routes/translate";
 
 /**
  * Resolve `apps/api/public` whether we run from `src/` (ts-node) or `dist/` (node),
@@ -286,6 +287,7 @@ app.get("/api/openapi.json", (req, res) => {
 
 app.use("/api/auth", authRouter);
 app.use("/api/meetings", meetingsRouter);
+app.use("/api/translate", translateRouter);
 app.use("/api/recordings", recordingsListRouter);
 
 app.use(

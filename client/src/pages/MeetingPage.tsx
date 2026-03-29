@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { QRCodeSVG } from 'qrcode.react'
-import { Link, useLocation, useParams } from 'react-router-dom'
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { io, type Socket } from 'socket.io-client'
 import {
   completeMeetingRecording,
   errorMessage,
+  fetchMeetingCaptions,
+  fetchMeetingPolls,
   getMeeting,
   uploadMeetingRecordingViaApi,
 } from '../lib/api'
@@ -12,8 +14,22 @@ import { getToken } from '../lib/auth'
 import { getIceServers } from '../lib/ice'
 import { startCameraBackgroundPipeline, type CameraBackgroundPipeline } from '../lib/cameraBackgroundPipeline'
 import { HostMeetingRecorder } from '../lib/hostMeetingRecorder'
+import {
+  playMeetingNotificationSound,
+  primeMeetingNotificationAudio,
+} from '../lib/meetingNotificationSounds'
+import { HostAgendaPanel } from '../components/HostAgendaPanel'
+import { MeetingAttentionWarningModal } from '../components/MeetingAttentionWarningModal'
+import { MeetingVoteOverlay, type MeetingVoteChoice } from '../components/MeetingVoteOverlay'
+import { useVoteGestureRecognition } from '../lib/useVoteGestureRecognition'
+import { ShellBackgroundLayer } from '../components/ShellBackgroundLayer'
+import { MeetingNotesPanel } from '../components/MeetingNotesPanel'
+import { MeetingSpeechLanguageSelect } from '../components/MeetingSpeechLanguageSelect'
+import { captionLinesFromHistory, mergeCaptionMessage, type CaptionLine } from '../lib/meetingCaptions'
+import { useMeetingSpeechLanguage } from '../lib/meetingLanguages'
+import { useMeetingCaptionRecognition } from '../lib/useMeetingCaptionRecognition'
 import { classifyCameraFrame, preloadModerationModel } from '../lib/videoContentModeration'
-import type { Meeting } from '../lib/types'
+import type { Meeting, MeetingPollSaved } from '../lib/types'
 
 type CallView = 'detail' | 'lobby' | 'call'
 
@@ -40,6 +56,25 @@ interface ChatMessage {
 interface ParticipantRosterEntry {
   userName: string
   userId: string
+  userEmail?: string
+}
+
+/** Mirrors signaling `buildAttentionRoster` rows (keyed by userId in client state). */
+interface AttentionRosterRow {
+  userId: string
+  userName: string
+  hasSignal: boolean
+  tabVisible: boolean
+  lastAt: number
+  stale: boolean
+  needsAttention: boolean
+}
+
+function attentionStatusTooltip(row: AttentionRosterRow | null): string {
+  if (!row || !row.hasSignal) return 'No tab visibility signal yet (just joined or still connecting)'
+  if (row.stale) return 'No recent update — tab may be in the background'
+  if (!row.tabVisible) return 'Meeting tab is hidden or not focused'
+  return 'Meeting tab appears visible'
 }
 
 const DEFAULT_STUN_SERVERS: RTCIceServer[] = [
@@ -119,6 +154,84 @@ function getUserIdFromToken(token: string): string {
   }
 }
 
+function getJwtProfile(token: string): { userId: string; email: string; name: string } {
+  try {
+    const payload = token.split('.')[1]
+    if (!payload) return { userId: '', email: '', name: '' }
+    const json = JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/'))) as {
+      sub?: unknown
+      userId?: unknown
+      email?: unknown
+      name?: unknown
+    }
+    const userId =
+      typeof json.sub === 'string' ? json.sub : typeof json.userId === 'string' ? json.userId : ''
+    return {
+      userId,
+      email: typeof json.email === 'string' ? json.email : '',
+      name: typeof json.name === 'string' ? json.name : '',
+    }
+  } catch {
+    return { userId: '', email: '', name: '' }
+  }
+}
+
+function initialsFromName(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean)
+  if (parts.length === 0) return '?'
+  if (parts.length === 1) {
+    const w = parts[0]!
+    return w.length >= 2 ? w.slice(0, 2).toUpperCase() : w.toUpperCase()
+  }
+  const a = parts[0]![0] ?? ''
+  const b = parts[parts.length - 1]![0] ?? ''
+  return `${a}${b}`.toUpperCase()
+}
+
+function VideoOffParticipantCard({
+  name,
+  email,
+  compact,
+}: {
+  name: string
+  email: string
+  compact?: boolean
+}) {
+  const initials = initialsFromName(name || '?')
+  const mail = email.trim()
+  return (
+    <div
+      className={cx(
+        'absolute inset-0 z-[1] flex flex-col items-center justify-center bg-[#1a1b1d]/95 px-2',
+        compact && 'px-1',
+      )}
+    >
+      <div
+        className={cx(
+          'flex shrink-0 items-center justify-center rounded-full border border-white/20 bg-linear-to-br from-amber-500/40 via-amber-600/25 to-sky-600/30 font-semibold text-white shadow-lg ring-1 ring-white/10',
+          compact ? 'h-11 w-11 text-xs' : 'h-16 w-16 text-base sm:h-[4.5rem] sm:w-[4.5rem] sm:text-lg',
+        )}
+      >
+        {initials}
+      </div>
+      {!compact && (
+        <p className="mt-2.5 max-w-[95%] truncate text-center text-[13px] font-medium text-white/90">{name || 'Guest'}</p>
+      )}
+      {mail.length > 0 && (
+        <p
+          className={cx(
+            'max-w-[95%] truncate text-center font-normal text-white/50',
+            compact ? 'mt-1 text-[9px] leading-tight' : 'mt-1 text-[11px] sm:text-xs',
+          )}
+          title={mail}
+        >
+          {mail}
+        </p>
+      )}
+    </div>
+  )
+}
+
 function RemoteCameraThumb({
   cameraId,
   streamsRef,
@@ -152,7 +265,20 @@ function RemoteCameraThumb({
 export function MeetingPage() {
   const params = useParams()
   const location = useLocation()
+  const navigate = useNavigate()
   const code = (params.code ?? '').trim()
+  const [speechLang, setSpeechLang] = useMeetingSpeechLanguage(code)
+  const [captionLines, setCaptionLines] = useState<CaptionLine[]>([])
+  const captionOverlayRecordingRef = useRef<{ speakerName: string; text: string } | null>(null)
+  const latestCaptionLine = captionLines.length > 0 ? captionLines[captionLines.length - 1]! : null
+  captionOverlayRecordingRef.current =
+    latestCaptionLine && (latestCaptionLine.text.trim().length > 0 || latestCaptionLine.speakerName.trim().length > 0)
+      ? { speakerName: latestCaptionLine.speakerName, text: latestCaptionLine.text }
+      : null
+  const [liveCaptionsEnabled, setLiveCaptionsEnabled] = useState(false)
+  const liveCaptionsEnabledRef = useRef(false)
+  liveCaptionsEnabledRef.current = liveCaptionsEnabled
+  const [captionExportBusy, setCaptionExportBusy] = useState(false)
 
   // meeting detail
   const [busy, setBusy] = useState(true)
@@ -178,13 +304,20 @@ export function MeetingPage() {
   const [presenterPage, setPresenterPage] = useState(0)
   const [screenSharing, setScreenSharing] = useState(false)
   const [screenSharingPeers, setScreenSharingPeers] = useState<Set<string>>(new Set())
+  const [peerShowVideoFallback, setPeerShowVideoFallback] = useState<Record<string, boolean>>({})
+  const screenSharingPeersRef = useRef<Set<string>>(new Set())
+  const syncPeerCameraOverlayRef = useRef<(remoteId: string) => void>(() => {})
   const [companionAvailable, setCompanionAvailable] = useState(false)
   const [controllingPeer, setControllingPeer] = useState<string | null>(null)
   const [controlledBy, setControlledBy] = useState<string | null>(null)
   const [incomingControlReq, setIncomingControlReq] = useState<{ from: string; fromName: string } | null>(null)
   const [chatOpen, setChatOpen] = useState(false)
+  const [notesOpen, setNotesOpen] = useState(false)
+  const [agendaOpen, setAgendaOpen] = useState(false)
   const [callSettingsOpen, setCallSettingsOpen] = useState(false)
+  const [callSettingsTab, setCallSettingsTab] = useState<'features' | 'settings'>('features')
   const [recordingActive, setRecordingActive] = useState(false)
+  const [roomRecordingActive, setRoomRecordingActive] = useState(false)
   const [recordingBusy, setRecordingBusy] = useState(false)
   const [chatDraft, setChatDraft] = useState('')
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
@@ -192,7 +325,13 @@ export function MeetingPage() {
   const [chatHasMore, setChatHasMore] = useState(false)
   const [chatLoadingMore, setChatLoadingMore] = useState(false)
   const [hostJoinRequests, setHostJoinRequests] = useState<{ requestId: string; name: string }[]>([])
+  const [hostLiveCollabRequests, setHostLiveCollabRequests] = useState<
+    { requestId: string; name: string; userId: string }[]
+  >([])
+  const [hostMutedPeerIds, setHostMutedPeerIds] = useState<Record<string, boolean>>({})
   const [isHostInCall, setIsHostInCall] = useState(false)
+  const [liveStreamPublic, setLiveStreamPublic] = useState(false)
+  const [livePublicViewerCount, setLivePublicViewerCount] = useState(0)
   const [hostPeerId, setHostPeerId] = useState<string | null>(null)
   const [participantRoster, setParticipantRoster] = useState<Record<string, ParticipantRosterEntry>>({})
   const [callLocalSocketId, setCallLocalSocketId] = useState<string | null>(null)
@@ -203,6 +342,28 @@ export function MeetingPage() {
   const [whiteboardEditors, setWhiteboardEditors] = useState<string[]>([])
   const [whiteboardRevokeUserId, setWhiteboardRevokeUserId] = useState('')
   const [incomingWhiteboardReq, setIncomingWhiteboardReq] = useState<{ from: string; fromName: string } | null>(null)
+  const [voteSession, setVoteSession] = useState<{
+    sessionId: string
+    title: string
+    anonymous: boolean
+  } | null>(null)
+  const [voteUp, setVoteUp] = useState(0)
+  const [voteDown, setVoteDown] = useState(0)
+  const [voteBreakdown, setVoteBreakdown] = useState<
+    { peerId: string; userName: string; choice: MeetingVoteChoice }[] | null
+  >(null)
+  const [myVote, setMyVote] = useState<MeetingVoteChoice | null>(null)
+  const [voteTitleDraft, setVoteTitleDraft] = useState('')
+  const [voteAnonymousDraft, setVoteAnonymousDraft] = useState(true)
+  const [savedPolls, setSavedPolls] = useState<MeetingPollSaved[] | null>(null)
+  const [savedPollsBusy, setSavedPollsBusy] = useState(false)
+  const [savedPollsErr, setSavedPollsErr] = useState<string | null>(null)
+  const [attentionRoster, setAttentionRoster] = useState<Record<string, AttentionRosterRow>>({})
+  const [attentionWarning, setAttentionWarning] = useState<{ fromName: string; message: string } | null>(null)
+  const [attentionWarnCompose, setAttentionWarnCompose] = useState<{ userId: string; name: string } | null>(null)
+  const [attentionWarnDraft, setAttentionWarnDraft] = useState('')
+  const activeVoteSessionIdRef = useRef<string | null>(null)
+  const attentionBadPrevRef = useRef<Set<string>>(new Set())
   const [cameraBgMode, setCameraBgMode] = useState<CameraBackgroundUiMode>('none')
   const [localCameraDevices, setLocalCameraDevices] = useState<MediaDeviceInfo[]>([])
   const [remoteCameras, setRemoteCameras] = useState<Map<string, { label: string; ready: boolean }>>(new Map())
@@ -213,9 +374,37 @@ export function MeetingPage() {
 
   // refs
   const socketRef = useRef<Socket | null>(null)
+  const getSignalingSocket = useCallback(() => socketRef.current, [])
+
+  useMeetingCaptionRecognition({
+    enabled: liveCaptionsEnabled,
+    micEnabled,
+    speechLang,
+    inCall: callView === 'call',
+    localSocketId: callLocalSocketId,
+    getSocket: getSignalingSocket,
+  })
   const localStreamRef = useRef<MediaStream | null>(null)
+  const getLocalCameraStream = useCallback(() => localStreamRef.current, [])
+  const submitMeetingVote = useCallback((choice: MeetingVoteChoice) => {
+    const sid = activeVoteSessionIdRef.current
+    if (!sid) return
+    socketRef.current?.emit('meeting:vote-submit', { sessionId: sid, choice })
+    setMyVote(choice)
+  }, [])
+  const { status: voteGestureStatus } = useVoteGestureRecognition({
+    enabled: callView === 'call' && voteSession !== null && camEnabled,
+    getStream: getLocalCameraStream,
+    onGesture: submitMeetingVote,
+  })
   const peersRef = useRef<Map<string, PeerState>>(new Map())
   const preConnectIceRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map())
+  const isHostInCallRef = useRef(false)
+  const liveStreamPublicRef = useRef(false)
+  const liveViewerPeerIdsRef = useRef<Set<string>>(new Set())
+  const micLockedByHostRef = useRef(false)
+  const collabAutoConnectDoneRef = useRef(false)
+  const connectRef = useRef<(() => Promise<void>) | null>(null)
   const mySocketIdRef = useRef('')
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const timerSecondsRef = useRef(0)
@@ -257,6 +446,34 @@ export function MeetingPage() {
   const recordingRootRef = useRef<HTMLDivElement>(null)
   const hostRecorderRef = useRef<HostMeetingRecorder | null>(null)
   const recordingStartedAtRef = useRef(0)
+
+  const syncPeerCameraOverlay = useCallback((remoteId: string) => {
+    setPeerShowVideoFallback(prev => {
+      if (screenSharingPeersRef.current.has(remoteId)) {
+        if (prev[remoteId] === false) return prev
+        return { ...prev, [remoteId]: false }
+      }
+      const stream = peerStreamRefs.current.get(remoteId)
+      const hasVideo =
+        stream?.getVideoTracks().some(
+          t => t.kind === 'video' && t.readyState === 'live' && t.enabled && !t.muted,
+        ) ?? false
+      const next = !hasVideo
+      if (prev[remoteId] === next) return prev
+      return { ...prev, [remoteId]: next }
+    })
+  }, [])
+
+  useEffect(() => {
+    syncPeerCameraOverlayRef.current = syncPeerCameraOverlay
+  }, [syncPeerCameraOverlay])
+
+  useEffect(() => {
+    screenSharingPeersRef.current = new Set(screenSharingPeers)
+    for (const id of peerIds) {
+      syncPeerCameraOverlay(id)
+    }
+  }, [screenSharingPeers, peerIds, syncPeerCameraOverlay])
 
   // fetch meeting detail
   useEffect(() => {
@@ -498,6 +715,67 @@ export function MeetingPage() {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
     toastTimerRef.current = setTimeout(() => setToast(null), duration)
   }, [])
+
+  useEffect(() => {
+    isHostInCallRef.current = isHostInCall
+  }, [isHostInCall])
+
+  useEffect(() => {
+    liveStreamPublicRef.current = liveStreamPublic
+  }, [liveStreamPublic])
+
+  useEffect(() => {
+    collabAutoConnectDoneRef.current = false
+  }, [code])
+
+  useEffect(() => {
+    const st = location.state as { afterCollabApprove?: boolean } | null
+    if (!st?.afterCollabApprove || collabAutoConnectDoneRef.current) return
+    if (!getToken()) return
+    collabAutoConnectDoneRef.current = true
+    navigate(location.pathname, { replace: true, state: {} })
+    queueMicrotask(() => {
+      void connectRef.current?.()
+    })
+  }, [location.state, location.pathname, navigate, code])
+
+  useEffect(() => {
+    if (callView !== 'call') return
+    const tick = () => {
+      const s = socketRef.current
+      if (!s?.connected) return
+      const attentive = !document.hidden && document.visibilityState === 'visible'
+      s.emit('meeting:attention-report', { attentive })
+    }
+    tick()
+    const onVis = () => tick()
+    document.addEventListener('visibilitychange', onVis)
+    const id = window.setInterval(tick, 20_000)
+    return () => {
+      document.removeEventListener('visibilitychange', onVis)
+      window.clearInterval(id)
+    }
+  }, [callView, callLocalSocketId])
+
+  useEffect(() => {
+    if (!isHostInCall || callView !== 'call') {
+      attentionBadPrevRef.current = new Set()
+      return
+    }
+    const bad = new Set<string>()
+    for (const row of Object.values(attentionRoster)) {
+      if (row.needsAttention) bad.add(row.userId)
+    }
+    const prev = attentionBadPrevRef.current
+    const selfId = myUserIdRef.current
+    for (const uid of bad) {
+      if (!prev.has(uid) && uid !== selfId) {
+        const name = attentionRoster[uid]?.userName ?? 'Someone'
+        showToast(`${name} may not be focused on the meeting`, 5000)
+      }
+    }
+    attentionBadPrevRef.current = bad
+  }, [attentionRoster, isHostInCall, callView, showToast])
 
   const pushChatMessage = useCallback((message: Omit<ChatMessage, 'id'> & { id?: string }) => {
     const { senderId, text, createdAt, senderName, senderUserId } = message
@@ -750,7 +1028,7 @@ export function MeetingPage() {
     }
   }
 
-  function ensurePeerState(remoteId: string): PeerState {
+  function ensurePeerState(remoteId: string, opts?: { omitFromCallGrid?: boolean }): PeerState {
     const existing = peersRef.current.get(remoteId)
     if (existing) return existing
 
@@ -773,6 +1051,13 @@ export function MeetingPage() {
     pc.ontrack = ev => {
       const s = ev.streams[0] ?? new MediaStream([ev.track])
       peerStreamRefs.current.set(remoteId, s)
+      const runSync = () => syncPeerCameraOverlayRef.current(remoteId)
+      runSync()
+      if (ev.track.kind === 'video') {
+        ev.track.addEventListener('ended', runSync)
+        ev.track.addEventListener('mute', runSync)
+        ev.track.addEventListener('unmute', runSync)
+      }
       const videoEl = peerVideoRefs.current.get(remoteId)
       if (videoEl) {
         videoEl.srcObject = s
@@ -819,7 +1104,9 @@ export function MeetingPage() {
     const early = preConnectIceRef.current.get(remoteId)
     if (early) { for (const c of early) pendingIce.push(c); preConnectIceRef.current.delete(remoteId) }
 
-    setPeerIds(prev => [...prev, remoteId])
+    if (!opts?.omitFromCallGrid) {
+      setPeerIds(prev => (prev.includes(remoteId) ? prev : [...prev, remoteId]))
+    }
     return state
   }
 
@@ -832,6 +1119,12 @@ export function MeetingPage() {
     peerVideoRefs.current.delete(remoteId)
     peerVideoCallbackRefs.current.delete(remoteId)
     peerStreamRefs.current.delete(remoteId)
+    setPeerShowVideoFallback(prev => {
+      if (!(remoteId in prev)) return prev
+      const next = { ...prev }
+      delete next[remoteId]
+      return next
+    })
     setPeerIds(prev => prev.filter(id => id !== remoteId))
   }
 
@@ -846,6 +1139,7 @@ export function MeetingPage() {
     peerStreamRefs.current.clear()
     setPeerIds([])
     setParticipantRoster({})
+    setPeerShowVideoFallback({})
   }
 
   function getPeerVideoRef(remoteId: string) {
@@ -860,6 +1154,7 @@ export function MeetingPage() {
           el.srcObject = stream
           void el.play().catch(() => {})
         }
+        queueMicrotask(() => syncPeerCameraOverlayRef.current(remoteId))
       } else {
         peerVideoRefs.current.delete(remoteId)
       }
@@ -869,9 +1164,9 @@ export function MeetingPage() {
     return callback
   }
 
-  async function createAndSendOffer(remoteId: string) {
+  async function createAndSendOffer(remoteId: string, opts?: { omitFromCallGrid?: boolean }) {
     await ensureStream()
-    const state = ensurePeerState(remoteId)
+    const state = ensurePeerState(remoteId, opts)
     const offer = await state.pc.createOffer()
     await state.pc.setLocalDescription(offer)
     const sdp = state.pc.localDescription?.toJSON()
@@ -898,6 +1193,7 @@ export function MeetingPage() {
     }
     socket.on('connect', () => {
       mySocketIdRef.current = socket.id ?? ''
+      setCallLocalSocketId(socket.id ?? null)
       appendLog('connected', mySocketIdRef.current)
     })
     socket.on('connect_error', (err: Error) => {
@@ -912,19 +1208,49 @@ export function MeetingPage() {
     })
     socket.on('meeting:peer-joined', (payload: unknown) => {
       if (!payload || typeof payload !== 'object') return
-      const p = payload as { peerId?: unknown; userName?: unknown; userId?: unknown }
+      const p = payload as { peerId?: unknown; userName?: unknown; userId?: unknown; userEmail?: unknown }
       const peerId = p.peerId
       if (typeof peerId !== 'string' || peerId === mySocketIdRef.current) return
       const userName = typeof p.userName === 'string' ? p.userName : 'Guest'
       const userId = typeof p.userId === 'string' ? p.userId : ''
-      setParticipantRoster(prev => ({ ...prev, [peerId]: { userName, userId } }))
+      const userEmail = typeof p.userEmail === 'string' ? p.userEmail : undefined
+      setParticipantRoster(prev => ({
+        ...prev,
+        [peerId]: { userName, userId, ...(userEmail ? { userEmail } : {}) },
+      }))
       appendLog('peer-joined', shortId(peerId))
+      playMeetingNotificationSound('join')
       showToast(`${userName} joined the call`)
       if (shouldInitiateOffer(peerId)) void createAndSendOffer(peerId).catch(e => appendLog('offer error', String(e)))
       // Re-announce screen share so the newly joined peer learns the current state
       if (screenSharingRef.current) {
         socket.emit('meeting:screenshare', { sharing: true })
       }
+    })
+    socket.on('meeting:live-viewer-joined', (payload: unknown) => {
+      if (!payload || typeof payload !== 'object') return
+      const p = payload as { peerId?: unknown }
+      if (typeof p.peerId !== 'string') return
+      if (!isHostInCallRef.current) return
+      const peerId = p.peerId
+      liveViewerPeerIdsRef.current.add(peerId)
+      void createAndSendOffer(peerId, { omitFromCallGrid: true }).catch(e =>
+        appendLog('live viewer offer error', String(e)),
+      )
+    })
+    socket.on('meeting:live-state', (payload: unknown) => {
+      if (!payload || typeof payload !== 'object') return
+      const live = (payload as { live?: unknown }).live === true
+      if (isHostInCallRef.current) {
+        setLiveStreamPublic(live)
+        if (!live) setLivePublicViewerCount(0)
+      }
+    })
+    socket.on('meeting:live-viewer-count', (payload: unknown) => {
+      if (!isHostInCallRef.current) return
+      if (!payload || typeof payload !== 'object') return
+      const c = (payload as { count?: unknown }).count
+      setLivePublicViewerCount(typeof c === 'number' && Number.isFinite(c) ? Math.max(0, Math.floor(c)) : 0)
     })
     socket.on('meeting:join-request', (payload: unknown) => {
       if (!payload || typeof payload !== 'object') return
@@ -935,6 +1261,7 @@ export function MeetingPage() {
         if (prev.some(r => r.requestId === requestId)) return prev
         return [...prev, { requestId, name: typeof p.name === 'string' ? p.name : 'Someone' }]
       })
+      playMeetingNotificationSound('joinRequest')
       showToast('Join request received')
     })
     socket.on('meeting:join-approved', (payload: unknown) => {
@@ -956,6 +1283,12 @@ export function MeetingPage() {
       setHostPeerId(p.hostPeerId)
       const iAmHost = p.hostUserId === myUserIdRef.current
       setIsHostInCall(iAmHost)
+      if (!iAmHost) {
+        setAttentionRoster({})
+        attentionBadPrevRef.current = new Set()
+        setLiveStreamPublic(false)
+        setLivePublicViewerCount(0)
+      }
       const newHostUserId = p.hostUserId
       setMeeting(prev => (prev ? { ...prev, hostId: newHostUserId } : prev))
       showToast(iAmHost ? 'You are now the host' : 'Host changed')
@@ -989,6 +1322,7 @@ export function MeetingPage() {
             peerStreamRefs.current.set(from, fresh)
             videoEl.srcObject = fresh
             void videoEl.play().catch(() => {})
+            queueMicrotask(() => syncPeerCameraOverlayRef.current(from))
           }
         }
       } catch (e) { appendLog('offer handler error', String(e)) }
@@ -1104,19 +1438,34 @@ export function MeetingPage() {
           ? (payload as { peerId: unknown }).peerId
           : undefined
       if (typeof peerId === 'string') {
+        const wasLiveViewerOnly = liveViewerPeerIdsRef.current.has(peerId)
+        liveViewerPeerIdsRef.current.delete(peerId)
         appendLog('peer-left', shortId(peerId))
         removePeer(peerId)
+        setHostMutedPeerIds(prev => {
+          if (!(peerId in prev)) return prev
+          const next = { ...prev }
+          delete next[peerId]
+          return next
+        })
         setParticipantRoster(prev => {
           const next = { ...prev }
           delete next[peerId]
           return next
         })
-        setScreenSharingPeers(prev => { const s = new Set(prev); s.delete(peerId); return s })
-        showToast('A participant left')
+        setScreenSharingPeers(prev => {
+          const wasSharing = prev.has(peerId)
+          const s = new Set(prev)
+          s.delete(peerId)
+          if (wasSharing) playMeetingNotificationSound('screenShareEnd')
+          return s
+        })
+        if (!wasLiveViewerOnly) showToast('A participant left')
       } else {
         appendLog('peer-left (full reset)')
         resetAllPeers()
         setParticipantRoster({})
+        setHostMutedPeerIds({})
         setScreenSharingPeers(new Set())
       }
     })
@@ -1177,6 +1526,9 @@ export function MeetingPage() {
       if (!payload || typeof payload !== 'object') return
       const { peerId, sharing } = payload as { peerId?: unknown; sharing?: unknown }
       if (typeof peerId !== 'string' || typeof sharing !== 'boolean') return
+      if (peerId !== mySocketIdRef.current) {
+        playMeetingNotificationSound(sharing ? 'screenShare' : 'screenShareEnd')
+      }
       setScreenSharingPeers(prev => {
         const s = new Set(prev)
         if (sharing) s.add(peerId)
@@ -1184,20 +1536,36 @@ export function MeetingPage() {
         return s
       })
     })
+    socket.on('meeting:recording-state', (payload: unknown) => {
+      if (!payload || typeof payload !== 'object') return
+      const p = payload as { active?: unknown; by?: unknown }
+      if (typeof p.active !== 'boolean') return
+      setRoomRecordingActive(p.active)
+      playMeetingNotificationSound(p.active ? 'recordingStart' : 'recordingStop')
+      const by = typeof p.by === 'string' ? p.by : ''
+      if (by !== mySocketIdRef.current) {
+        showToast(p.active ? 'This meeting is being recorded' : 'Recording stopped')
+      }
+    })
     socket.on('meeting:chat', (payload: unknown) => {
       if (!payload || typeof payload !== 'object') return
       const { id, senderId, senderUserId, senderName, text, createdAt } =
         payload as { id?: unknown; senderId?: unknown; senderUserId?: unknown; senderName?: unknown; text?: unknown; createdAt?: unknown }
       if (typeof senderId !== 'string' || typeof text !== 'string') return
       const stamp = typeof createdAt === 'string' ? createdAt : new Date().toISOString()
+      const suid = typeof senderUserId === 'string' ? senderUserId : undefined
+      const mine =
+        senderId === mySocketIdRef.current ||
+        (suid != null && suid.length > 0 && suid === myUserIdRef.current)
       pushChatMessage({
         id: typeof id === 'string' ? id : undefined,
         senderId,
-        senderUserId: typeof senderUserId === 'string' ? senderUserId : undefined,
+        senderUserId: suid,
         senderName: typeof senderName === 'string' ? senderName : undefined,
         text,
         createdAt: stamp,
       })
+      if (!mine) playMeetingNotificationSound('chat')
     })
     socket.on('meeting:whiteboard-state', (payload: unknown) => {
       if (!payload || typeof payload !== 'object') return
@@ -1272,6 +1640,147 @@ export function MeetingPage() {
       if (!ctx) return
       ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight)
     })
+
+    socket.on('meeting:vote-started', (payload: unknown) => {
+      if (!payload || typeof payload !== 'object') return
+      const p = payload as { sessionId?: unknown; title?: unknown; anonymous?: unknown }
+      if (typeof p.sessionId !== 'string' || typeof p.title !== 'string' || typeof p.anonymous !== 'boolean') return
+      activeVoteSessionIdRef.current = p.sessionId
+      setVoteSession({ sessionId: p.sessionId, title: p.title, anonymous: p.anonymous })
+      setVoteUp(0)
+      setVoteDown(0)
+      setVoteBreakdown(null)
+      setMyVote(null)
+      playMeetingNotificationSound('voteStart')
+      showToast('The host started a vote — tap 👍 or 👎')
+    })
+    socket.on('meeting:vote-update', (payload: unknown) => {
+      if (!payload || typeof payload !== 'object') return
+      const p = payload as {
+        sessionId?: unknown
+        up?: unknown
+        down?: unknown
+        breakdown?: unknown
+      }
+      if (typeof p.sessionId !== 'string' || typeof p.up !== 'number' || typeof p.down !== 'number') return
+      if (activeVoteSessionIdRef.current !== p.sessionId) return
+      setVoteUp(p.up)
+      setVoteDown(p.down)
+      if (Array.isArray(p.breakdown)) {
+        const rows = p.breakdown.flatMap((item: unknown) => {
+          if (!item || typeof item !== 'object') return []
+          const r = item as { peerId?: unknown; userName?: unknown; choice?: unknown }
+          if (
+            typeof r.peerId !== 'string' ||
+            typeof r.userName !== 'string' ||
+            (r.choice !== 'up' && r.choice !== 'down')
+          ) {
+            return []
+          }
+          return [{ peerId: r.peerId, userName: r.userName, choice: r.choice as MeetingVoteChoice }]
+        })
+        setVoteBreakdown(rows.length > 0 ? rows : null)
+        const self = rows.find(r => r.peerId === mySocketIdRef.current)
+        setMyVote(self ? self.choice : null)
+      } else {
+        setVoteBreakdown(null)
+      }
+    })
+    socket.on('meeting:vote-ended', (payload: unknown) => {
+      activeVoteSessionIdRef.current = null
+      const p =
+        payload && typeof payload === 'object'
+          ? (payload as { title?: unknown; up?: unknown; down?: unknown; reason?: unknown })
+          : {}
+      const title = typeof p.title === 'string' ? p.title : 'Vote'
+      const up = typeof p.up === 'number' ? p.up : 0
+      const down = typeof p.down === 'number' ? p.down : 0
+      const reason = typeof p.reason === 'string' ? p.reason : ''
+      setVoteSession(null)
+      setVoteUp(0)
+      setVoteDown(0)
+      setVoteBreakdown(null)
+      setMyVote(null)
+      if (reason === 'host-left') {
+        showToast('Vote ended — host left the call')
+      } else {
+        showToast(`Vote closed: "${title}" — 👍 ${up} · 👎 ${down}`)
+      }
+      playMeetingNotificationSound('voteEnd')
+    })
+
+    socket.on('meeting:attention-sync', (payload: unknown) => {
+      if (!payload || typeof payload !== 'object') return
+      const p = payload as { roster?: unknown }
+      if (!Array.isArray(p.roster)) return
+      const next: Record<string, AttentionRosterRow> = {}
+      for (const item of p.roster) {
+        if (!item || typeof item !== 'object') continue
+        const r = item as Record<string, unknown>
+        if (typeof r.userId !== 'string') continue
+        if (typeof r.userName !== 'string') continue
+        if (typeof r.hasSignal !== 'boolean') continue
+        if (typeof r.tabVisible !== 'boolean') continue
+        if (typeof r.lastAt !== 'number') continue
+        if (typeof r.stale !== 'boolean') continue
+        if (typeof r.needsAttention !== 'boolean') continue
+        next[r.userId] = {
+          userId: r.userId,
+          userName: r.userName,
+          hasSignal: r.hasSignal,
+          tabVisible: r.tabVisible,
+          lastAt: r.lastAt,
+          stale: r.stale,
+          needsAttention: r.needsAttention,
+        }
+      }
+      setAttentionRoster(next)
+    })
+
+    socket.on('meeting:attention-warning', (payload: unknown) => {
+      if (!payload || typeof payload !== 'object') return
+      const w = payload as { fromName?: unknown; message?: unknown }
+      const fromName = typeof w.fromName === 'string' ? w.fromName : 'Host'
+      const message = typeof w.message === 'string' ? w.message : ''
+      void primeMeetingNotificationAudio()
+      playMeetingNotificationSound('attentionWarning')
+      setAttentionWarning({ fromName, message })
+    })
+
+    socket.on('meeting:caption', (payload: unknown) => {
+      if (!liveCaptionsEnabledRef.current) return
+      if (!payload || typeof payload !== 'object') return
+      const p = payload as {
+        speakerUserId?: unknown
+        speakerName?: unknown
+        text?: unknown
+        interim?: unknown
+        id?: unknown
+        createdAt?: unknown
+      }
+      if (
+        typeof p.speakerUserId !== 'string' ||
+        typeof p.speakerName !== 'string' ||
+        typeof p.text !== 'string' ||
+        typeof p.interim !== 'boolean'
+      ) {
+        return
+      }
+      const speakerUserId = p.speakerUserId
+      const speakerName = p.speakerName
+      const capText = p.text
+      const interim = p.interim
+      setCaptionLines(prev =>
+        mergeCaptionMessage(prev, {
+          speakerUserId,
+          speakerName,
+          text: capText,
+          interim,
+          id: typeof p.id === 'string' ? p.id : undefined,
+          createdAt: typeof p.createdAt === 'string' ? p.createdAt : undefined,
+        }),
+      )
+    })
   }
 
   function finalizeJoin(a: Record<string, unknown>) {
@@ -1313,6 +1822,37 @@ export function MeetingPage() {
     }
     setActiveMeetingCode(code)
     setChatMessages(history)
+    const capHist = Array.isArray(a.captionHistory)
+      ? (a.captionHistory as unknown[]).flatMap(item => {
+          if (!item || typeof item !== 'object') return []
+          const row = item as {
+            id?: unknown
+            speakerUserId?: unknown
+            speakerName?: unknown
+            text?: unknown
+            createdAt?: unknown
+          }
+          if (
+            typeof row.id !== 'string' ||
+            typeof row.speakerUserId !== 'string' ||
+            typeof row.speakerName !== 'string' ||
+            typeof row.text !== 'string' ||
+            typeof row.createdAt !== 'string'
+          ) {
+            return []
+          }
+          return [
+            {
+              id: row.id,
+              speakerUserId: row.speakerUserId,
+              speakerName: row.speakerName,
+              text: row.text,
+              createdAt: row.createdAt,
+            },
+          ]
+        })
+      : []
+    setCaptionLines(liveCaptionsEnabledRef.current ? captionLinesFromHistory(capHist) : [])
     setChatHasMore(a.chatHasMore === true)
     setChatUnread(0)
     setChatDraft('')
@@ -1324,18 +1864,26 @@ export function MeetingPage() {
       if (Array.isArray(roster)) {
         for (const row of roster) {
           if (!row || typeof row !== 'object') continue
-          const r = row as { peerId?: unknown; userId?: unknown; userName?: unknown }
+          const r = row as { peerId?: unknown; userId?: unknown; userName?: unknown; userEmail?: unknown }
           if (typeof r.peerId !== 'string') continue
+          const userEmail = typeof r.userEmail === 'string' ? r.userEmail : undefined
           nextRoster[r.peerId] = {
             userId: typeof r.userId === 'string' ? r.userId : '',
             userName: typeof r.userName === 'string' ? r.userName : 'Guest',
+            ...(userEmail ? { userEmail } : {}),
           }
         }
       }
       const sid = mySocketIdRef.current
       if (sid) {
         const selfName = typeof a.selfName === 'string' ? a.selfName : 'You'
-        nextRoster[sid] = { userName: selfName, userId: myUserIdRef.current }
+        const selfEmailRaw = typeof a.selfEmail === 'string' ? a.selfEmail : ''
+        const selfEmail = selfEmailRaw.trim() || getJwtProfile(getToken() ?? '').email
+        nextRoster[sid] = {
+          userName: selfName,
+          userId: myUserIdRef.current,
+          ...(selfEmail ? { userEmail: selfEmail } : {}),
+        }
       }
       setParticipantRoster(nextRoster)
     }
@@ -1354,6 +1902,52 @@ export function MeetingPage() {
           ) ?? '')
         : '',
     )
+    setRoomRecordingActive(a.meetingRecordingActive === true)
+    {
+      const av = a.activeVote
+      if (av && typeof av === 'object' && av !== null) {
+        const o = av as Record<string, unknown>
+        if (
+          typeof o.sessionId === 'string' &&
+          typeof o.title === 'string' &&
+          typeof o.anonymous === 'boolean'
+        ) {
+          activeVoteSessionIdRef.current = o.sessionId
+          setVoteSession({ sessionId: o.sessionId, title: o.title, anonymous: o.anonymous })
+        } else {
+          activeVoteSessionIdRef.current = null
+          setVoteSession(null)
+        }
+      } else {
+        activeVoteSessionIdRef.current = null
+        setVoteSession(null)
+      }
+      setVoteUp(typeof a.voteUp === 'number' ? a.voteUp : 0)
+      setVoteDown(typeof a.voteDown === 'number' ? a.voteDown : 0)
+      const bd = a.voteBreakdown
+      if (Array.isArray(bd)) {
+        const rows = bd.flatMap((item: unknown) => {
+          if (!item || typeof item !== 'object') return []
+          const r = item as { peerId?: unknown; userName?: unknown; choice?: unknown }
+          if (
+            typeof r.peerId !== 'string' ||
+            typeof r.userName !== 'string' ||
+            (r.choice !== 'up' && r.choice !== 'down')
+          ) {
+            return []
+          }
+          return [{ peerId: r.peerId, userName: r.userName, choice: r.choice as MeetingVoteChoice }]
+        })
+        setVoteBreakdown(rows.length > 0 ? rows : null)
+      } else {
+        setVoteBreakdown(null)
+      }
+      const mv = a.myVote
+      setMyVote(mv === 'up' || mv === 'down' ? mv : null)
+    }
+    primeMeetingNotificationAudio()
+    // peer-joined only fires for *others* when someone new arrives — play when you enter too
+    playMeetingNotificationSound('join')
     setCallView('call')
     startTimer()
     startNetworkStats()
@@ -1367,6 +1961,8 @@ export function MeetingPage() {
       setChatOpen(true)
     } else if (focus === 'Screen Share') {
       queueMicrotask(() => { void toggleScreenShare() })
+    } else if (focus === 'Note Taker') {
+      setNotesOpen(true)
     }
   }
 
@@ -1375,12 +1971,51 @@ export function MeetingPage() {
     setHostJoinRequests(prev => prev.filter(r => r.requestId !== requestId))
   }
 
+  function respondLiveCollabRequest(requestId: string, accepted: boolean) {
+    socketRef.current?.emit('live:collab-decision', { requestId, accepted })
+    setHostLiveCollabRequests(prev => prev.filter(r => r.requestId !== requestId))
+  }
+
   function transferHost(toPeerId: string) {
     if (!isHostInCall) return
     socketRef.current?.emit('meeting:host-transfer', { to: toPeerId })
   }
 
+  function endMeetingVote() {
+    if (!isHostInCall) return
+    socketRef.current?.emit('meeting:vote-end')
+  }
+
+  function startMeetingVoteFromDraft() {
+    if (!isHostInCall) return
+    const t = voteTitleDraft.trim()
+    if (t.length === 0) {
+      showToast('Add a title or question for the vote first')
+      return
+    }
+    socketRef.current?.emit('meeting:vote-start', {
+      title: t.slice(0, 200),
+      anonymous: voteAnonymousDraft,
+    })
+    setCallSettingsOpen(false)
+  }
+
+  async function loadSavedPollsForMeeting() {
+    if (!code.trim() || !isHostInCall) return
+    setSavedPollsErr(null)
+    setSavedPollsBusy(true)
+    try {
+      const r = await fetchMeetingPolls(code)
+      setSavedPolls(r.polls)
+    } catch (e: unknown) {
+      setSavedPollsErr(errorMessage(e))
+    } finally {
+      setSavedPollsBusy(false)
+    }
+  }
+
   async function connect() {
+    micLockedByHostRef.current = false
     const token = getToken()
     if (!token) {
       setStatusLine('Not signed in \u2014 log in first.')
@@ -1434,11 +2069,17 @@ export function MeetingPage() {
     })
   }
 
-  function leave() {
+  function leave(notification?: string) {
     const hr = hostRecorderRef.current
     hostRecorderRef.current = null
+    const wasRecording = !!hr
     if (hr) void hr.stop().catch(() => {})
     setRecordingActive(false)
+    const sockEarly = socketRef.current
+    if (wasRecording && sockEarly?.connected) {
+      sockEarly.emit('meeting:recording-state', { active: false })
+    }
+    setRoomRecordingActive(false)
 
     const leavePipedRaw = teardownCameraBackgroundPipeline()
     if (leavePipedRaw && leavePipedRaw.readyState === 'live') leavePipedRaw.stop()
@@ -1449,6 +2090,12 @@ export function MeetingPage() {
     cameraBgImageElRef.current = null
 
     const socket = socketRef.current
+    if (liveStreamPublicRef.current && socket?.connected && isHostInCallRef.current) {
+      socket.emit('meeting:live-stream', { live: false })
+    }
+    liveViewerPeerIdsRef.current = new Set()
+    setLiveStreamPublic(false)
+    setLivePublicViewerCount(0)
     socket?.emit('meeting:leave')
     if (controllingPeerRef.current) {
       socket?.emit('meeting:control-release', { to: controllingPeerRef.current })
@@ -1472,14 +2119,22 @@ export function MeetingPage() {
     stopTimer()
     stopNetworkStats()
     setChatMessages([])
+    setCaptionLines([])
     setChatHasMore(false)
     setChatUnread(0)
     setChatOpen(false)
+    setNotesOpen(false)
+    setAgendaOpen(false)
     setCallSettingsOpen(false)
     setChatDraft('')
     setIsHostInCall(false)
     setHostPeerId(null)
     setParticipantRoster({})
+    setAttentionRoster({})
+    setAttentionWarning(null)
+    setAttentionWarnCompose(null)
+    setAttentionWarnDraft('')
+    attentionBadPrevRef.current = new Set()
     setCallLocalSocketId(null)
     setHostJoinRequests([])
     setWhiteboardOpen(false)
@@ -1493,7 +2148,10 @@ export function MeetingPage() {
     setPipCamOff(true)
     setHasWeakNetwork(false)
     setCallView('lobby')
-    showToast('You left the call')
+    setHostLiveCollabRequests([])
+    setHostMutedPeerIds({})
+    micLockedByHostRef.current = false
+    showToast(notification ?? 'You left the call')
   }
 
   function collectRecordingAudioStreams(): MediaStream[] {
@@ -1525,10 +2183,16 @@ export function MeetingPage() {
     }
     const rec = new HostMeetingRecorder()
     try {
-      rec.start(root, collectRecordingAudioStreams())
+      rec.start(root, collectRecordingAudioStreams(), {
+        getCaptionOverlay: () => {
+          if (!liveCaptionsEnabledRef.current) return null
+          return captionOverlayRecordingRef.current
+        },
+      })
       hostRecorderRef.current = rec
       recordingStartedAtRef.current = Date.now()
       setRecordingActive(true)
+      socketRef.current?.emit('meeting:recording-state', { active: true })
       showToast('Recording…')
     } catch (e: unknown) {
       showToast(errorMessage(e))
@@ -1543,9 +2207,19 @@ export function MeetingPage() {
       return
     }
     setRecordingBusy(true)
+    let blob: Blob
     try {
-      const blob = await rec.stop()
+      blob = await rec.stop()
+    } catch (e: unknown) {
       setRecordingActive(false)
+      socketRef.current?.emit('meeting:recording-state', { active: false })
+      showToast(errorMessage(e))
+      setRecordingBusy(false)
+      return
+    }
+    setRecordingActive(false)
+    socketRef.current?.emit('meeting:recording-state', { active: false })
+    try {
       if (blob.size < 2048) {
         showToast('Recording was empty')
         return
@@ -1580,6 +2254,34 @@ export function MeetingPage() {
     }
     socketRef.current.emit('meeting:chat', { text })
     setChatDraft('')
+  }
+
+  async function downloadSavedCaptions() {
+    const meetingCode = activeMeetingCode.trim() || code.trim()
+    if (!meetingCode) {
+      showToast('No meeting code')
+      return
+    }
+    setCaptionExportBusy(true)
+    try {
+      const { captions } = await fetchMeetingCaptions(meetingCode)
+      const body =
+        captions.length === 0
+          ? '(No saved lines yet. Turn on Live captions (CC) in call settings so speech is transcribed; final phrases are stored after each pause while participants have CC on.)\n'
+          : captions.map(c => `[${c.createdAt}] ${c.speakerName}: ${c.text}`).join('\n')
+      const blob = new Blob([body], { type: 'text/plain;charset=utf-8' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `meeting-${meetingCode}-transcript.txt`
+      a.click()
+      URL.revokeObjectURL(url)
+      showToast('Transcript downloaded')
+    } catch (e: unknown) {
+      showToast(errorMessage(e))
+    } finally {
+      setCaptionExportBusy(false)
+    }
   }
 
   function whiteboardPointFromEvent(e: React.PointerEvent<HTMLCanvasElement>) {
@@ -1706,6 +2408,10 @@ export function MeetingPage() {
 
   async function toggleMic() {
     const next = !micEnabled
+    if (next && micLockedByHostRef.current) {
+      showToast('The host has muted your microphone')
+      return
+    }
     const localStream = localStreamRef.current ?? await ensureStream()
 
     if (!next) {
@@ -1993,7 +2699,10 @@ export function MeetingPage() {
     }
     setPipCamOff(!cameraTrack)
     setScreenSharing(false)
-    if (!opts?.silent) showToast('Screen sharing stopped')
+    if (!opts?.silent) {
+      playMeetingNotificationSound('screenShareEnd')
+      showToast('Screen sharing stopped')
+    }
   }
 
   async function toggleScreenShare() {
@@ -2027,6 +2736,7 @@ export function MeetingPage() {
         localPipRef.current.srcObject = pipStream
       }
       setScreenSharing(true)
+      playMeetingNotificationSound('screenShare')
       showToast('Screen sharing started')
       screenTrack.onended = () => { void stopScreenShare() }
     } catch (e) {
@@ -2133,11 +2843,32 @@ export function MeetingPage() {
       )
   }, [participantRoster, callLocalSocketId])
 
+  const myRosterUserId = callLocalSocketId ? participantRoster[callLocalSocketId]?.userId : undefined
+  const myAttentionRow = myRosterUserId ? attentionRoster[myRosterUserId] : null
+
   function rosterLabel(peerId: string) {
     const e = participantRoster[peerId]
     if (e?.userName) return e.userName
     return `Peer ${shortId(peerId)}`
   }
+
+  function rosterEntryEmail(peerId: string): string {
+    const ro = participantRoster[peerId]
+    const fromRoster = ro?.userEmail?.trim()
+    if (fromRoster) return fromRoster
+    if (peerId === (callLocalSocketId ?? '')) {
+      return getJwtProfile(getToken() ?? '').email.trim()
+    }
+    return ''
+  }
+
+  const youEmailLine = callLocalSocketId ? rosterEntryEmail(callLocalSocketId) : ''
+
+  function showPeerVideoFallbackForPeer(peerId: string): boolean {
+    if (screenSharingPeers.has(peerId)) return false
+    return peerShowVideoFallback[peerId] !== false
+  }
+
   const isSoloInCall = peerIds.length === 0
   const remotePresenterId = peerIds.find(id => screenSharingPeers.has(id)) ?? null
   const presenterIsLocal = !remotePresenterId && screenSharing
@@ -2165,6 +2896,8 @@ export function MeetingPage() {
     stripTileCount <= 4 ? { gridTemplateColumns: 'repeat(2,1fr)', gridTemplateRows: 'repeat(2,1fr)' } :
     { gridTemplateColumns: 'repeat(3,1fr)', gridTemplateRows: `repeat(${Math.ceil(stripTileCount / 3)},1fr)` }
 
+  connectRef.current = connect
+
   return (
     <>
       {/* ── Meeting detail ── */}
@@ -2174,7 +2907,7 @@ export function MeetingPage() {
           style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}
         >
         {/* background */}
-        <img src="/image.png" alt="" aria-hidden draggable={false} className="pointer-events-none absolute inset-0 h-full w-full select-none object-cover" />
+        <ShellBackgroundLayer />
 
         {/* header */}
         <div className="relative z-20 flex items-center justify-between gap-3 px-4 py-3 sm:px-8 sm:py-4 lg:px-10">
@@ -2259,13 +2992,7 @@ export function MeetingPage() {
           className="meeting-route-root fixed inset-0 z-100 flex flex-col overflow-hidden"
           style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}
         >
-          <img
-            src="/image.png"
-            alt=""
-            aria-hidden
-            draggable={false}
-            className="pointer-events-none absolute inset-0 h-full w-full select-none object-cover"
-          />
+          <ShellBackgroundLayer />
 
           <div className="relative z-20 flex items-center justify-between gap-3 px-4 py-3 sm:px-8 sm:py-4 lg:px-10">
             <Link to="/">
@@ -2296,13 +3023,10 @@ export function MeetingPage() {
                     className="absolute h-full w-full -scale-x-100 object-cover"
                   />
                   {previewCamOff && (
-                    <div className="absolute inset-0 flex items-center justify-center bg-[#1c1c1e]/90">
-                      <div className="flex h-[72px] w-[72px] items-center justify-center rounded-full bg-white/10">
-                        <svg viewBox="0 0 24 24" fill="#9ca3af" width="40" height="40">
-                          <path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z" />
-                        </svg>
-                      </div>
-                    </div>
+                    <VideoOffParticipantCard
+                      name={getJwtProfile(getToken() ?? '').name || 'You'}
+                      email={getJwtProfile(getToken() ?? '').email}
+                    />
                   )}
                   <div className="absolute bottom-4 left-1/2 flex -translate-x-1/2 gap-2">
                     <button
@@ -2340,8 +3064,13 @@ export function MeetingPage() {
                           <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z" />
                         </svg>
                       ) : (
-                        <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20">
-                          <path d="M21 6.5l-4-4-9.86 9.86-2.09-2.09L4 11.36l2.11 2.11L3 16.5V21h4.5l3.03-3.03 2.11 2.11 1.09-1.09-2.09-2.09L21 6.5zM7.04 19H5v-2.04l9.86-9.86 2.04 2.04L7.04 19z" />
+                        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden>
+                          <path
+                            fill="currentColor"
+                            fillOpacity={0.45}
+                            d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"
+                          />
+                          <path fill="none" stroke="currentColor" strokeWidth="2.25" strokeLinecap="round" d="M4.5 4.5l15 15" />
                         </svg>
                       )}
                     </button>
@@ -2420,7 +3149,10 @@ export function MeetingPage() {
                     autoPlay
                     style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: screenSharingPeers.has(id) ? 'none' : 'scaleX(-1)' }}
                   />
-                  <div className="absolute bottom-2.5 left-3 max-w-[calc(100%-16px)] truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">{rosterLabel(id)}</div>
+                  {showPeerVideoFallbackForPeer(id) && (
+                    <VideoOffParticipantCard name={rosterLabel(id)} email={rosterEntryEmail(id)} />
+                  )}
+                  <div className="absolute bottom-2.5 left-3 z-[2] max-w-[calc(100%-16px)] truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">{rosterLabel(id)}</div>
                   {screenSharingPeers.has(id) && !controllingPeer && !controlledBy && (
                     <button
                       type="button"
@@ -2507,11 +3239,17 @@ export function MeetingPage() {
                     {!presenterIsLocal && (
                       <div className="group relative min-h-0 min-w-0 overflow-hidden rounded-[10px] bg-[#2d2e30]">
                         <video ref={localStripRef} playsInline autoPlay muted style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: 'scaleX(-1)' }} />
-                        <div className="absolute bottom-2.5 left-3 rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">You</div>
+                        <div className="absolute bottom-2.5 left-3 z-[2] rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">You</div>
                         {pipCamOff && (
-                          <div className="absolute inset-0 flex items-center justify-center bg-[#2d2e30]">
-                            <svg viewBox="0 0 24 24" fill="#9aa0a6" width="28" height="28"><path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z" /></svg>
-                          </div>
+                          <VideoOffParticipantCard
+                            compact
+                            name={
+                              participantRoster[callLocalSocketId ?? '']?.userName
+                              || getJwtProfile(getToken() ?? '').name
+                              || 'You'
+                            }
+                            email={rosterEntryEmail(callLocalSocketId ?? '')}
+                          />
                         )}
                       </div>
                     )}
@@ -2523,7 +3261,14 @@ export function MeetingPage() {
                           autoPlay
                           style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: 'scaleX(-1)' }}
                         />
-                        <div className="absolute bottom-2.5 left-3 max-w-[calc(100%-16px)] truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">{rosterLabel(id)}</div>
+                        {showPeerVideoFallbackForPeer(id) && (
+                          <VideoOffParticipantCard
+                            compact
+                            name={rosterLabel(id)}
+                            email={rosterEntryEmail(id)}
+                          />
+                        )}
+                        <div className="absolute bottom-2.5 left-3 z-[2] max-w-[calc(100%-16px)] truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">{rosterLabel(id)}</div>
                       </div>
                     ))}
                   </div>
@@ -2566,11 +3311,15 @@ export function MeetingPage() {
           >
             <video ref={localPipRef} playsInline autoPlay muted className={screenSharing ? 'block h-full w-full object-cover' : 'block h-full w-full -scale-x-100 object-cover'} />
             {pipCamOff && (
-              <div className="absolute inset-0 flex items-center justify-center bg-[#2d2e30]">
-                <svg viewBox="0 0 24 24" fill="#9aa0a6" width="28" height="28">
-                  <path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z" />
-                </svg>
-              </div>
+              <VideoOffParticipantCard
+                compact
+                name={
+                  participantRoster[callLocalSocketId ?? '']?.userName
+                  || getJwtProfile(getToken() ?? '').name
+                  || 'You'
+                }
+                email={rosterEntryEmail(callLocalSocketId ?? '')}
+              />
             )}
             <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between bg-linear-to-t from-black/65 to-transparent px-2.5 py-1.5 text-xs text-white">
               <span>You</span>
@@ -2588,8 +3337,18 @@ export function MeetingPage() {
             <div className="pointer-events-auto flex flex-wrap items-center gap-3 max-sm:gap-y-1.5">
               <span className="text-base font-semibold max-sm:text-sm">Meet</span>
               <span className="text-[13px] text-[#9aa0a6] tabular-nums">{timerDisplay}</span>
-              {recordingActive && (
+              {(recordingActive || roomRecordingActive) && (
                 <span className="rounded-full bg-red-600/90 px-2 py-0.5 text-[11px] font-bold tracking-wide text-white">REC</span>
+              )}
+              {isHostInCall && liveStreamPublic && (
+                <span
+                  className="rounded-full bg-sky-500/20 px-2 py-0.5 text-[11px] font-semibold text-sky-200"
+                  title="People on the public watch link (/watch/…), not counting meeting participants"
+                >
+                  {livePublicViewerCount === 0
+                    ? 'Live · 0 watching'
+                    : `${livePublicViewerCount} watching live`}
+                </span>
               )}
             </div>
             <div className="pointer-events-auto flex flex-wrap items-center gap-2.5 max-sm:gap-y-1.5">
@@ -2598,42 +3357,160 @@ export function MeetingPage() {
                   {participantCount === 1 ? '1 in call' : `${participantCount} in call`}
                   <span className="text-white/40"> · People</span>
                 </summary>
-                <div className="absolute right-0 top-[calc(100%+6px)] z-50 w-[min(calc(100vw-24px),280px)] rounded-xl border border-white/10 bg-[#1c1c1e]/98 py-2 shadow-2xl backdrop-blur-xl">
+                <div className="absolute right-0 top-[calc(100%+6px)] z-50 w-[min(calc(100vw-24px),400px)] rounded-xl border border-white/10 bg-[#1c1c1e]/98 py-2 shadow-2xl backdrop-blur-xl">
                   <p className="px-3 pb-2 text-[0.65rem] font-bold uppercase tracking-wider text-white/35">In this meeting</p>
-                  <ul className="max-h-[min(50vh,320px)] overflow-y-auto px-1">
+                  {isHostInCall && (
+                    <p className="px-3 pb-2 text-[11px] leading-snug text-white/40">
+                      Dots show whether each person’s meeting tab looks visible (browser only). Nudge sends a private full-screen alert on their device. Remove ends their call; Mute forces their mic off until you unmute them.
+                    </p>
+                  )}
+                  <ul className="max-h-[min(50vh,360px)] overflow-y-auto px-1">
                     {callLocalSocketId && (
-                      <li className="flex flex-wrap items-center gap-x-2 gap-y-1 px-2 py-2 text-left text-sm text-white/90">
-                        <span className="min-w-0 truncate font-medium">
-                          {participantRoster[callLocalSocketId]?.userName ?? 'You'}
-                          <span className="font-normal text-white/40"> (you)</span>
-                        </span>
-                        {hostPeerId === callLocalSocketId && (
-                          <span className="rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-300">Host</span>
-                        )}
+                      <li className="px-2 py-2.5 text-left">
+                        <div className="flex gap-2.5">
+                          {isHostInCall && (
+                            <span
+                              className={cx(
+                                'mt-1.5 inline-block h-2 w-2 shrink-0 rounded-full',
+                                !myAttentionRow || !myAttentionRow.hasSignal
+                                  ? 'bg-white/30'
+                                  : myAttentionRow.needsAttention
+                                    ? 'bg-amber-400'
+                                    : 'bg-emerald-400',
+                              )}
+                              title={attentionStatusTooltip(myAttentionRow)}
+                            />
+                          )}
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                              <span
+                                className="text-[13px] font-medium leading-snug break-words text-white/90 [overflow-wrap:anywhere]"
+                                title={participantRoster[callLocalSocketId]?.userName ?? 'You'}
+                              >
+                                {participantRoster[callLocalSocketId]?.userName ?? 'You'}
+                                <span className="font-normal text-white/40"> (you)</span>
+                              </span>
+                              {hostPeerId === callLocalSocketId && (
+                                <span className="inline-flex shrink-0 rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
+                                  Host
+                                </span>
+                              )}
+                            </div>
+                            {youEmailLine ? (
+                              <p className="mt-0.5 break-all text-[11px] leading-snug text-white/38">{youEmailLine}</p>
+                            ) : null}
+                          </div>
+                        </div>
                       </li>
                     )}
-                    {rosterRemoteIdsSorted.map(id => (
-                      <li
-                        key={id}
-                        className="flex items-center justify-between gap-2 border-t border-white/8 px-2 py-2 text-left text-sm"
-                      >
-                        <span className="min-w-0 flex-1 truncate text-white/90">
-                          {rosterLabel(id)}
-                          {hostPeerId === id && (
-                            <span className="ml-2 inline-flex shrink-0 rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-300">Host</span>
-                          )}
-                        </span>
-                        {isHostInCall && id !== hostPeerId && (
-                          <button
-                            type="button"
-                            className="shrink-0 rounded-lg border border-white/15 bg-white/8 px-2 py-1 text-[11px] font-semibold text-white/90 hover:bg-amber-500/20 hover:text-amber-200"
-                            onClick={() => transferHost(id)}
-                          >
-                            Make host
-                          </button>
-                        )}
-                      </li>
-                    ))}
+                    {rosterRemoteIdsSorted.map(id => {
+                      const remoteUserId = participantRoster[id]?.userId
+                      const attRow = remoteUserId ? attentionRoster[remoteUserId] : null
+                      const displayName = rosterLabel(id)
+                      const emailLine = rosterEntryEmail(id)
+                      return (
+                        <li key={id} className="border-t border-white/8 px-2 py-2.5 text-left">
+                          <div className="flex gap-2.5">
+                            {isHostInCall && (
+                              <span
+                                className={cx(
+                                  'mt-1.5 inline-block h-2 w-2 shrink-0 rounded-full',
+                                  !attRow || !attRow.hasSignal
+                                    ? 'bg-white/30'
+                                    : attRow.needsAttention
+                                      ? 'bg-amber-400'
+                                      : 'bg-emerald-400',
+                                )}
+                                title={attentionStatusTooltip(attRow)}
+                              />
+                            )}
+                            <div className="min-w-0 flex-1 space-y-2">
+                              <div>
+                                <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                                  <span
+                                    className="text-[13px] font-medium leading-snug break-words text-white/90 [overflow-wrap:anywhere]"
+                                    title={displayName}
+                                  >
+                                    {displayName}
+                                  </span>
+                                  {hostPeerId === id && (
+                                    <span className="inline-flex shrink-0 rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
+                                      Host
+                                    </span>
+                                  )}
+                                </div>
+                                {emailLine ? (
+                                  <p className="mt-0.5 break-all text-[11px] leading-snug text-white/38">{emailLine}</p>
+                                ) : null}
+                              </div>
+                              {isHostInCall && id !== hostPeerId && (
+                                <div className="flex flex-wrap gap-1.5">
+                                  <button
+                                    type="button"
+                                    className="rounded-lg border border-white/15 bg-white/8 px-2.5 py-1.5 text-[11px] font-semibold text-white/90 hover:bg-amber-500/20 hover:text-amber-200"
+                                    onClick={() => transferHost(id)}
+                                  >
+                                    Make host
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="rounded-lg border border-red-500/35 bg-red-600/22 px-2.5 py-1.5 text-[11px] font-semibold text-red-100 hover:bg-red-600/38"
+                                    onClick={() => {
+                                      socketRef.current?.emit('meeting:host-remove-peer', { peerId: id })
+                                      showToast(`Removing ${displayName} from the call`)
+                                    }}
+                                  >
+                                    Remove
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="rounded-lg border border-white/15 bg-white/8 px-2.5 py-1.5 text-[11px] font-semibold text-white/90 hover:bg-white/14"
+                                    onClick={() => {
+                                      const nextMuted = !hostMutedPeerIds[id]
+                                      socketRef.current?.emit('meeting:host-mute-peer', {
+                                        peerId: id,
+                                        muted: nextMuted,
+                                      })
+                                      setHostMutedPeerIds(prev => ({ ...prev, [id]: nextMuted }))
+                                      showToast(nextMuted ? `Muted ${displayName}` : `Unmuted ${displayName}`)
+                                    }}
+                                  >
+                                    {hostMutedPeerIds[id] ? 'Unmute' : 'Mute mic'}
+                                  </button>
+                                  {remoteUserId ? (
+                                    <>
+                                      <button
+                                        type="button"
+                                        className="rounded-lg border border-amber-500/35 bg-amber-600/25 px-2.5 py-1.5 text-[11px] font-semibold text-amber-100 hover:bg-amber-600/40"
+                                        onClick={() => {
+                                          socketRef.current?.emit('meeting:attention-warn', {
+                                            userId: remoteUserId,
+                                            message: '',
+                                          })
+                                          showToast('Attention nudge sent')
+                                        }}
+                                      >
+                                        Nudge
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="rounded-lg border border-white/15 bg-white/8 px-2.5 py-1.5 text-[11px] font-semibold text-white/90 hover:bg-white/14"
+                                        onClick={() => {
+                                          setAttentionWarnCompose({ userId: remoteUserId, name: displayName })
+                                          setAttentionWarnDraft('')
+                                        }}
+                                      >
+                                        Message…
+                                      </button>
+                                    </>
+                                  ) : null}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </li>
+                      )
+                    })}
                   </ul>
                 </div>
               </details>
@@ -2753,7 +3630,7 @@ export function MeetingPage() {
               aria-label="Call settings"
             >
               <div className="flex shrink-0 items-center justify-between border-b border-white/7 px-4 pb-3.5 pt-4 text-[13px] font-semibold text-white/90">
-                <span>Call settings</span>
+                <span>Meeting</span>
                 <button
                   type="button"
                   className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full border border-white/10 bg-white/6 text-base leading-none text-white/60 transition hover:border-white/16 hover:bg-white/12 hover:text-white"
@@ -2763,87 +3640,502 @@ export function MeetingPage() {
                   ✕
                 </button>
               </div>
-              <div className="flex flex-1 flex-col gap-4 overflow-auto px-4 py-4 [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-white/20">
-                <div>
-                  <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Camera background</p>
-                  <input
-                    ref={cameraBgFileInputRef}
-                    type="file"
-                    accept="image/*"
-                    className="sr-only"
-                    onChange={handleCameraBackgroundFile}
-                    aria-hidden
-                    tabIndex={-1}
-                  />
-                  <label htmlFor="meeting-camera-bg-mode-panel" className="sr-only">
-                    Camera background
-                  </label>
-                  <select
-                    id="meeting-camera-bg-mode-panel"
-                    value={cameraBgMode}
-                    onChange={e => {
-                      const v = e.target.value as CameraBackgroundUiMode
-                      setCameraBgMode(v)
-                      void reapplyCameraBackgroundWithMode(v)
-                    }}
-                    className="w-full cursor-pointer rounded-xl border border-white/10 bg-white/5 px-3 py-2.5 text-[13px] font-medium text-white outline-none focus:border-amber-500/45 focus:bg-white/8"
-                  >
-                    <option value="none">None</option>
-                    <option value="blur-low">Blur – Soft</option>
-                    <option value="blur-high">Blur – Strong</option>
-                    <option value="image">Image</option>
-                  </select>
-                  {cameraBgMode === 'image' && (
-                    <button
-                      type="button"
-                      onClick={() => cameraBgFileInputRef.current?.click()}
-                      className="mt-2.5 w-full cursor-pointer rounded-xl border border-white/12 bg-white/8 py-2.5 text-[13px] font-semibold text-white/90 transition hover:border-amber-500/35 hover:bg-white/12"
-                    >
-                      Upload background image
-                    </button>
+              <div
+                role="tablist"
+                aria-label="Meeting settings sections"
+                className="flex shrink-0 gap-1 border-b border-white/10 px-3 py-2"
+              >
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={callSettingsTab === 'features'}
+                  className={cx(
+                    'flex-1 rounded-lg px-2 py-2 text-[11px] font-bold uppercase tracking-wider transition',
+                    callSettingsTab === 'features'
+                      ? 'bg-white/12 text-white'
+                      : 'text-white/45 hover:bg-white/6 hover:text-white/75',
                   )}
-                </div>
-                {isHostInCall && (
-                  <div className="border-t border-white/10 pt-4">
-                    <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Recording</p>
-                    <p className="mb-3 text-[12px] leading-snug text-white/45">
-                      Records what is on screen (tiles + your preview) and mixes participant audio. Stopping uploads the file for you as host.
-                    </p>
-                    {recordingActive ? (
-                      <button
-                        type="button"
-                        disabled={recordingBusy}
-                        onClick={() => void stopHostRecordingAndUpload()}
-                        className="w-full cursor-pointer rounded-xl border-0 bg-red-600 py-2.5 text-[13px] font-semibold text-white hover:bg-red-500 disabled:cursor-not-allowed disabled:opacity-45"
-                      >
-                        {recordingBusy ? 'Saving…' : 'Stop and upload'}
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        disabled={recordingBusy}
-                        onClick={startHostRecording}
-                        className="w-full cursor-pointer rounded-xl border border-white/12 bg-white/8 py-2.5 text-[13px] font-semibold text-white/90 hover:border-amber-500/35 hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-45"
-                      >
-                        Start recording
-                      </button>
-                    )}
-                    {recordingActive && !recordingBusy && (
-                      <p className="mt-2 flex items-center gap-2 text-[12px] font-medium text-red-400">
-                        <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-red-500" aria-hidden />
-                        Recording
+                  onClick={() => setCallSettingsTab('features')}
+                >
+                  Features
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={callSettingsTab === 'settings'}
+                  className={cx(
+                    'flex-1 rounded-lg px-2 py-2 text-[11px] font-bold uppercase tracking-wider transition',
+                    callSettingsTab === 'settings'
+                      ? 'bg-white/12 text-white'
+                      : 'text-white/45 hover:bg-white/6 hover:text-white/75',
+                  )}
+                  onClick={() => setCallSettingsTab('settings')}
+                >
+                  Settings
+                </button>
+              </div>
+              <div className="flex flex-1 flex-col gap-4 overflow-auto px-4 py-4 [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-white/20">
+                {callSettingsTab === 'features' && (
+                  <div role="tabpanel" className="flex flex-col gap-4" aria-label="Features">
+                    <div>
+                      <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Notes board</p>
+                      <p className="mb-2.5 text-[12px] leading-snug text-white/45">
+                        Scratchpad for this meeting — stored on this device. Use the same speech language as in Settings for dictation-related features.
                       </p>
+                      <button
+                        type="button"
+                        className={cx(
+                          'w-full cursor-pointer rounded-xl border py-2.5 text-[13px] font-semibold transition',
+                          notesOpen
+                            ? 'border-sky-400/45 bg-blue-600/40 text-white'
+                            : 'border-white/12 bg-white/8 text-white/90 hover:border-sky-500/35 hover:bg-white/12',
+                        )}
+                        onClick={() => {
+                          setAgendaOpen(false)
+                          setCallSettingsOpen(false)
+                          setNotesOpen(prev => !prev)
+                        }}
+                      >
+                        {notesOpen ? 'Close notes board' : 'Open notes board'}
+                      </button>
+                    </div>
+                    {isHostInCall && (
+                      <div className="border-t border-white/10 pt-4">
+                        <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Public live stream</p>
+                        <p className="mb-2.5 text-[12px] leading-snug text-white/45">
+                          Share a public watch link: anyone can view without an account (like TikTok Live). They only need to log in if they want to comment, react, vote, or ask to join the broadcast — you approve each collaboration request. Chat is filtered; your outgoing camera is checked locally for unsafe content.
+                        </p>
+                        <button
+                          type="button"
+                          className={cx(
+                            'mb-2 w-full cursor-pointer rounded-xl border py-2.5 text-[13px] font-semibold transition',
+                            liveStreamPublic
+                              ? 'border-red-500/40 bg-red-600/28 text-white hover:bg-red-600/40'
+                              : 'border-emerald-500/40 bg-emerald-600/25 text-white hover:bg-emerald-600/38',
+                          )}
+                          onClick={() => {
+                            const next = !liveStreamPublic
+                            setLiveStreamPublic(next)
+                            if (!next) setLivePublicViewerCount(0)
+                            socketRef.current?.emit('meeting:live-stream', { live: next })
+                            showToast(next ? 'Public stream is on' : 'Public stream is off')
+                          }}
+                        >
+                          {liveStreamPublic ? 'Stop public stream' : 'Start public stream'}
+                        </button>
+                        <button
+                          type="button"
+                          className="w-full cursor-pointer rounded-xl border border-white/12 bg-white/8 py-2.5 text-[13px] font-semibold text-white/90 transition hover:border-sky-500/35 hover:bg-white/12"
+                          onClick={() => {
+                            const url = `${window.location.origin}/watch/${encodeURIComponent(code)}`
+                            void navigator.clipboard.writeText(url).then(
+                              () => showToast('Watch link copied'),
+                              () => showToast(url),
+                            )
+                          }}
+                        >
+                          Copy watch link
+                        </button>
+                      </div>
                     )}
-                    <Link
-                      to="/recordings"
-                      className="mt-3 block text-center text-[12px] font-medium text-amber-400/90 no-underline hover:text-amber-300"
-                    >
-                      My recordings
-                    </Link>
+                    {isHostInCall && (
+                      <div className="border-t border-white/10 pt-4">
+                        <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Live vote</p>
+                        <p className="mb-2.5 text-[12px] leading-snug text-white/45">
+                          Run a quick 👍 / 👎 poll. Participants tap the bar at the bottom or hold a thumbs-up / thumbs-down to the camera (with video on). You choose the title and whether results show names or only totals.
+                        </p>
+                        {voteSession ? (
+                          <>
+                            <p className="mb-2 truncate text-[12px] font-medium text-amber-300/90" title={voteSession.title}>
+                              Active: {voteSession.title}
+                            </p>
+                            <button
+                              type="button"
+                              className="w-full cursor-pointer rounded-xl border border-red-500/40 bg-red-600/28 py-2.5 text-[13px] font-semibold text-white transition hover:bg-red-600/40"
+                              onClick={() => {
+                                endMeetingVote()
+                                setCallSettingsOpen(false)
+                              }}
+                            >
+                              End vote
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <label className="mb-1 block text-[0.65rem] font-bold uppercase tracking-wider text-white/35">
+                              Vote title or question
+                            </label>
+                            <input
+                              type="text"
+                              className="mb-2.5 w-full rounded-xl border border-white/10 bg-white/5 px-2.5 py-2 text-[13px] text-white/90 outline-none placeholder:text-white/28 focus:border-amber-500/45"
+                              placeholder="e.g. Approve the new timeline?"
+                              maxLength={200}
+                              value={voteTitleDraft}
+                              onChange={e => setVoteTitleDraft(e.target.value)}
+                              aria-label="Vote title or question"
+                            />
+                            <label className="mb-3 flex cursor-pointer items-start gap-2.5 text-[13px] text-white/80">
+                              <input
+                                type="checkbox"
+                                className="mt-0.5 h-4 w-4 shrink-0 rounded border-white/20 accent-amber-500"
+                                checked={voteAnonymousDraft}
+                                onChange={e => setVoteAnonymousDraft(e.target.checked)}
+                              />
+                              <span>Anonymous (hide who voted; show counts only)</span>
+                            </label>
+                            <button
+                              type="button"
+                              className="w-full cursor-pointer rounded-xl border border-amber-500/40 bg-amber-600/30 py-2.5 text-[13px] font-semibold text-white transition hover:border-amber-400/55 hover:bg-amber-600/42"
+                              onClick={startMeetingVoteFromDraft}
+                            >
+                              Start vote
+                            </button>
+                          </>
+                        )}
+                        <div className="mt-3 border-t border-white/8 pt-3">
+                          <p className="mb-2 text-[11px] leading-snug text-white/48">
+                            Votes are stored in the database for this meeting (host can review below).
+                          </p>
+                          <button
+                            type="button"
+                            disabled={savedPollsBusy || !code.trim()}
+                            onClick={() => void loadSavedPollsForMeeting()}
+                            className="w-full cursor-pointer rounded-xl border border-white/12 bg-white/6 py-2 text-[12px] font-semibold text-white/88 transition hover:border-white/18 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-45"
+                          >
+                            {savedPollsBusy ? 'Loading…' : 'Refresh saved polls'}
+                          </button>
+                          {savedPollsErr && (
+                            <p className="mt-2 text-[12px] text-red-400/90">{savedPollsErr}</p>
+                          )}
+                          {savedPolls && savedPolls.length === 0 && (
+                            <p className="mt-2 text-[12px] text-white/40">No saved polls yet.</p>
+                          )}
+                          {savedPolls && savedPolls.length > 0 && (
+                            <ul className="mt-2 max-h-36 space-y-2 overflow-y-auto text-[12px] [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-white/15">
+                              {savedPolls.map(p => (
+                                <li
+                                  key={p.id}
+                                  className="rounded-lg border border-white/10 bg-white/4 px-2.5 py-2 text-white/85"
+                                >
+                                  <div className="font-semibold text-white/92">{p.title}</div>
+                                  <div className="mt-0.5 text-white/50">
+                                    👍 {p.upCount} · 👎 {p.downCount}
+                                    {p.active ? ' · Active' : ''}
+                                    {' · '}
+                                    {formatDate(p.createdAt)}
+                                  </div>
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    {isHostInCall && (
+                      <div className="border-t border-white/10 pt-4">
+                        <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Attention</p>
+                        <p className="mb-2.5 text-[12px] leading-snug text-white/45">
+                          Open People in the call bar to see who likely has this meeting tab visible. Amber means hidden, stale, or quiet. Use Nudge or Message… to show them a private full-screen prompt. This uses tab visibility only — not eye tracking.
+                        </p>
+                      </div>
+                    )}
+                    {isHostInCall && (
+                      <div className="border-t border-white/10 pt-4">
+                        <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Agenda &amp; AI check</p>
+                        <p className="mb-2.5 text-[12px] leading-snug text-white/45">
+                          Host-only: paste your agenda and run an AI check against the meeting transcript saved for this room.
+                        </p>
+                        <button
+                          type="button"
+                          className={cx(
+                            'w-full cursor-pointer rounded-xl border py-2.5 text-[13px] font-semibold transition',
+                            agendaOpen
+                              ? 'border-amber-400/50 bg-amber-600/35 text-white'
+                              : 'border-white/12 bg-white/8 text-white/90 hover:border-amber-500/40 hover:bg-white/12',
+                          )}
+                          onClick={() => {
+                            setNotesOpen(false)
+                            setCallSettingsOpen(false)
+                            setAgendaOpen(prev => !prev)
+                          }}
+                        >
+                          {agendaOpen ? 'Close agenda & AI' : 'Open agenda & AI check'}
+                        </button>
+                      </div>
+                    )}
+                    <div className="border-t border-white/10 pt-4">
+                      <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Whiteboard</p>
+                      <p className="mb-2.5 text-[12px] leading-snug text-white/45">
+                        Shared drawing canvas for everyone in the call. Whoever opens it becomes the board owner and can close it or let others collaborate from the board toolbar.
+                      </p>
+                      <button
+                        type="button"
+                        disabled={whiteboardOpen && !whiteboardIsOwner}
+                        className={cx(
+                          'w-full cursor-pointer rounded-xl border py-2.5 text-[13px] font-semibold transition disabled:cursor-not-allowed disabled:opacity-45',
+                          whiteboardOpen
+                            ? 'border-red-500/40 bg-red-600/30 text-white hover:bg-red-600/45'
+                            : 'border-white/12 bg-white/8 text-white/90 hover:border-white/20 hover:bg-white/12',
+                        )}
+                        onClick={() => {
+                          if (whiteboardOpen && whiteboardIsOwner) {
+                            closeWhiteboard()
+                          } else if (!whiteboardOpen) {
+                            openWhiteboard()
+                          }
+                          setCallSettingsOpen(false)
+                        }}
+                      >
+                        {whiteboardOpen
+                          ? whiteboardIsOwner
+                            ? 'Close whiteboard'
+                            : 'Whiteboard active (host can close)'
+                          : 'Open whiteboard'}
+                      </button>
+                    </div>
+                    <div className="border-t border-white/10 pt-4">
+                      <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Live captions</p>
+                      <p className="mb-2.5 text-[12px] leading-snug text-white/45">
+                        When this is on, subtitles appear on screen for you, your speech is sent for others to see (with their own setting on), and each finished phrase is saved to the meeting. Host screen recordings include subtitles only while this stays on. Works best in Chrome or Edge.
+                      </p>
+                      <label className="flex cursor-pointer items-start gap-2.5 text-[13px] text-white/85">
+                        <input
+                          type="checkbox"
+                          className="mt-0.5 h-4 w-4 shrink-0 rounded border-white/20 accent-amber-500"
+                          checked={liveCaptionsEnabled}
+                          onChange={e => setLiveCaptionsEnabled(e.target.checked)}
+                        />
+                        <span>Live captions (CC) — show, share, and save</span>
+                      </label>
+                      {isHostInCall && (
+                        <button
+                          type="button"
+                          disabled={captionExportBusy || !code.trim()}
+                          onClick={() => void downloadSavedCaptions()}
+                          className="mt-3 w-full cursor-pointer rounded-xl border border-white/12 bg-white/8 py-2.5 text-[13px] font-semibold text-white/90 transition hover:border-sky-500/35 hover:bg-white/12 disabled:opacity-45"
+                        >
+                          {captionExportBusy ? 'Preparing…' : 'Download saved transcript (.txt)'}
+                        </button>
+                      )}
+                    </div>
+                    {isHostInCall && (
+                      <div className="border-t border-white/10 pt-4">
+                        <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Recording</p>
+                        <p className="mb-3 text-[12px] leading-snug text-white/45">
+                          Records what is on screen (tiles + your preview) and mixes participant audio. Live subtitles are burned into the video only while Live captions (CC) is enabled above. Stopping uploads the file for you as host.
+                        </p>
+                        {recordingActive ? (
+                          <button
+                            type="button"
+                            disabled={recordingBusy}
+                            onClick={() => void stopHostRecordingAndUpload()}
+                            className="w-full cursor-pointer rounded-xl border-0 bg-red-600 py-2.5 text-[13px] font-semibold text-white hover:bg-red-500 disabled:cursor-not-allowed disabled:opacity-45"
+                          >
+                            {recordingBusy ? 'Saving…' : 'Stop and upload'}
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            disabled={recordingBusy}
+                            onClick={startHostRecording}
+                            className="w-full cursor-pointer rounded-xl border border-white/12 bg-white/8 py-2.5 text-[13px] font-semibold text-white/90 hover:border-amber-500/35 hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-45"
+                          >
+                            Start recording
+                          </button>
+                        )}
+                        {recordingActive && !recordingBusy && (
+                          <p className="mt-2 flex items-center gap-2 text-[12px] font-medium text-red-400">
+                            <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-red-500" aria-hidden />
+                            Recording
+                          </p>
+                        )}
+                        <Link
+                          to="/recordings"
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="mt-3 block text-center text-[12px] font-medium text-amber-400/90 no-underline hover:text-amber-300"
+                        >
+                          My recordings
+                        </Link>
+                      </div>
+                    )}
+                    {!isHostInCall && roomRecordingActive && (
+                      <div className="border-t border-white/10 pt-4">
+                        <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Recording</p>
+                        <p className="flex items-center gap-2 text-[12px] font-medium text-red-400">
+                          <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-red-500" aria-hidden />
+                          The host is recording this meeting
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                )}
+                {callSettingsTab === 'settings' && (
+                  <div role="tabpanel" className="flex flex-col gap-4" aria-label="Settings">
+                    <div>
+                      <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Camera background</p>
+                      <input
+                        ref={cameraBgFileInputRef}
+                        type="file"
+                        accept="image/*"
+                        className="sr-only"
+                        onChange={handleCameraBackgroundFile}
+                        aria-hidden
+                        tabIndex={-1}
+                      />
+                      <label htmlFor="meeting-camera-bg-mode-panel" className="sr-only">
+                        Camera background
+                      </label>
+                      <select
+                        id="meeting-camera-bg-mode-panel"
+                        value={cameraBgMode}
+                        onChange={e => {
+                          const v = e.target.value as CameraBackgroundUiMode
+                          setCameraBgMode(v)
+                          void reapplyCameraBackgroundWithMode(v)
+                        }}
+                        className="w-full cursor-pointer rounded-xl border border-white/10 bg-white/5 px-3 py-2.5 text-[13px] font-medium text-white outline-none focus:border-amber-500/45 focus:bg-white/8"
+                      >
+                        <option value="none">None</option>
+                        <option value="blur-low">Blur – Soft</option>
+                        <option value="blur-high">Blur – Strong</option>
+                        <option value="image">Image</option>
+                      </select>
+                      {cameraBgMode === 'image' && (
+                        <button
+                          type="button"
+                          onClick={() => cameraBgFileInputRef.current?.click()}
+                          className="mt-2.5 w-full cursor-pointer rounded-xl border border-white/12 bg-white/8 py-2.5 text-[13px] font-semibold text-white/90 transition hover:border-amber-500/35 hover:bg-white/12"
+                        >
+                          Upload background image
+                        </button>
+                      )}
+                    </div>
+                    <div className="border-t border-white/10 pt-4">
+                      <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Voice &amp; translation</p>
+                      <p className="mb-2.5 text-[12px] leading-snug text-white/45">
+                        Language for mic capture in Notes and Agenda (this meeting, this device). You can translate text afterward in those panels.
+                      </p>
+                      <label htmlFor="call-settings-speech-lang" className="sr-only">
+                        Speech language for this meeting
+                      </label>
+                      <MeetingSpeechLanguageSelect
+                        id="call-settings-speech-lang"
+                        value={speechLang}
+                        onChange={setSpeechLang}
+                        className="w-full cursor-pointer rounded-xl border border-white/10 bg-white/5 px-3 py-2.5 text-[13px] font-medium text-white outline-none focus:border-amber-500/45 focus:bg-white/8"
+                      />
+                    </div>
+                    <div className="border-t border-white/10 pt-3">
+                      <Link
+                        to="/settings"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-[12px] font-medium text-amber-400/90 no-underline hover:text-amber-300"
+                      >
+                        App settings &amp; help — opens in new tab
+                      </Link>
+                    </div>
                   </div>
                 )}
               </div>
             </aside>
+          )}
+
+          <MeetingNotesPanel
+            meetingCode={code}
+            meetingTitle={meeting?.title ?? undefined}
+            open={notesOpen}
+            onClose={() => setNotesOpen(false)}
+            speechLang={speechLang}
+            onSpeechLangChange={setSpeechLang}
+          />
+
+          {isHostInCall && (
+            <HostAgendaPanel
+              meetingCode={code}
+              open={agendaOpen}
+              onClose={() => setAgendaOpen(false)}
+              speechLang={speechLang}
+              onSpeechLangChange={setSpeechLang}
+            />
+          )}
+
+          {callView === 'call' && voteSession && callLocalSocketId && (
+            <MeetingVoteOverlay
+              title={voteSession.title}
+              anonymous={voteSession.anonymous}
+              up={voteUp}
+              down={voteDown}
+              breakdown={voteBreakdown}
+              myVote={myVote}
+              localPeerId={callLocalSocketId}
+              isHost={isHostInCall}
+              onVote={submitMeetingVote}
+              onEndVote={endMeetingVote}
+              gestureStatus={voteGestureStatus}
+              cameraOn={camEnabled}
+            />
+          )}
+
+          {callView === 'call' && (
+            <MeetingAttentionWarningModal
+              open={attentionWarning !== null}
+              fromName={attentionWarning?.fromName ?? ''}
+              message={attentionWarning?.message ?? ''}
+              onDismiss={() => setAttentionWarning(null)}
+            />
+          )}
+
+          {callView === 'call' && attentionWarnCompose && (
+            <div
+              className="fixed inset-0 z-[101] flex items-center justify-center bg-black/65 p-4 backdrop-blur-sm"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="attention-compose-title"
+            >
+              <div className="w-full max-w-md rounded-2xl border border-white/12 bg-[#1c1c1e]/98 p-5 shadow-2xl">
+                <p id="attention-compose-title" className="text-sm font-semibold text-white">
+                  Message for {attentionWarnCompose.name}
+                </p>
+                <p className="mt-1 text-[12px] text-white/45">They’ll see this with a full-screen attention prompt.</p>
+                <textarea
+                  className="mt-3 min-h-[88px] w-full resize-y rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-[13px] text-white/90 outline-none placeholder:text-white/28 focus:border-amber-500/45"
+                  maxLength={400}
+                  value={attentionWarnDraft}
+                  onChange={e => setAttentionWarnDraft(e.target.value)}
+                  placeholder="Optional note…"
+                  aria-label="Attention message"
+                />
+                <div className="mt-4 flex flex-wrap justify-end gap-2">
+                  <button
+                    type="button"
+                    className="cursor-pointer rounded-xl border border-white/14 bg-white/8 px-4 py-2 text-[13px] font-semibold text-white/88 hover:bg-white/12"
+                    onClick={() => {
+                      setAttentionWarnCompose(null)
+                      setAttentionWarnDraft('')
+                    }}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    className="cursor-pointer rounded-xl border border-amber-500/40 bg-amber-600/35 px-4 py-2 text-[13px] font-semibold text-white hover:bg-amber-600/48"
+                    onClick={() => {
+                      socketRef.current?.emit('meeting:attention-warn', {
+                        userId: attentionWarnCompose.userId,
+                        message: attentionWarnDraft,
+                      })
+                      showToast('Attention message sent')
+                      setAttentionWarnCompose(null)
+                      setAttentionWarnDraft('')
+                    }}
+                  >
+                    Send
+                  </button>
+                </div>
+              </div>
+            </div>
           )}
 
           {chatOpen && (
@@ -2933,28 +4225,59 @@ export function MeetingPage() {
             </div>
           )}
 
-          {isHostInCall && hostJoinRequests.length > 0 && (
-            <div className="absolute left-1/2 z-40 w-[min(360px,calc(100vw-32px))] -translate-x-1/2 rounded-[14px] border border-white/14 bg-[#161618]/97 p-4 shadow-2xl backdrop-blur-md" style={{ bottom: incomingControlReq ? 248 : 90 }}>
-              <p className="mb-2 text-[13px] font-bold text-white">Join request</p>
-              <p className="mb-3.5 text-[13px] leading-snug text-white/70">
-                <strong>{hostJoinRequests[0]?.name ?? 'Someone'}</strong> wants to join this meeting.
-              </p>
-              <div className="flex gap-2">
-                <button
-                  type="button"
-                  className="flex-1 cursor-pointer rounded-lg border-0 bg-blue-600 py-2 text-[13px] font-semibold text-white hover:bg-blue-700"
-                  onClick={() => hostJoinRequests[0] && respondJoinRequest(hostJoinRequests[0].requestId, true)}
-                >
-                  Allow
-                </button>
-                <button
-                  type="button"
-                  className="flex-1 cursor-pointer rounded-lg border border-white/15 bg-white/7 py-2 text-[13px] font-semibold text-white/75 hover:bg-white/12"
-                  onClick={() => hostJoinRequests[0] && respondJoinRequest(hostJoinRequests[0].requestId, false)}
-                >
-                  Deny
-                </button>
-              </div>
+          {isHostInCall && (hostJoinRequests.length > 0 || hostLiveCollabRequests.length > 0) && (
+            <div
+              className="absolute left-1/2 z-40 flex w-[min(360px,calc(100vw-32px))] -translate-x-1/2 flex-col gap-3"
+              style={{ bottom: incomingControlReq ? 248 : 90 }}
+            >
+              {hostJoinRequests[0] && (
+                <div className="rounded-[14px] border border-white/14 bg-[#161618]/97 p-4 shadow-2xl backdrop-blur-md">
+                  <p className="mb-2 text-[13px] font-bold text-white">Join request</p>
+                  <p className="mb-3.5 text-[13px] leading-snug text-white/70">
+                    <strong>{hostJoinRequests[0].name}</strong> wants to join this meeting.
+                  </p>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      className="flex-1 cursor-pointer rounded-lg border-0 bg-blue-600 py-2 text-[13px] font-semibold text-white hover:bg-blue-700"
+                      onClick={() => respondJoinRequest(hostJoinRequests[0]!.requestId, true)}
+                    >
+                      Allow
+                    </button>
+                    <button
+                      type="button"
+                      className="flex-1 cursor-pointer rounded-lg border border-white/15 bg-white/7 py-2 text-[13px] font-semibold text-white/75 hover:bg-white/12"
+                      onClick={() => respondJoinRequest(hostJoinRequests[0]!.requestId, false)}
+                    >
+                      Deny
+                    </button>
+                  </div>
+                </div>
+              )}
+              {hostLiveCollabRequests[0] && (
+                <div className="rounded-[14px] border border-amber-500/25 bg-[#161618]/97 p-4 shadow-2xl backdrop-blur-md">
+                  <p className="mb-2 text-[13px] font-bold text-white">Broadcast collaboration</p>
+                  <p className="mb-3.5 text-[13px] leading-snug text-white/70">
+                    <strong>{hostLiveCollabRequests[0].name}</strong> asked to leave the watch page and join this call as a participant.
+                  </p>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      className="flex-1 cursor-pointer rounded-lg border-0 bg-blue-600 py-2 text-[13px] font-semibold text-white hover:bg-blue-700"
+                      onClick={() => respondLiveCollabRequest(hostLiveCollabRequests[0]!.requestId, true)}
+                    >
+                      Accept
+                    </button>
+                    <button
+                      type="button"
+                      className="flex-1 cursor-pointer rounded-lg border border-white/15 bg-white/7 py-2 text-[13px] font-semibold text-white/75 hover:bg-white/12"
+                      onClick={() => respondLiveCollabRequest(hostLiveCollabRequests[0]!.requestId, false)}
+                    >
+                      Decline
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -2969,6 +4292,62 @@ export function MeetingPage() {
                   </>
                   )
                 : <>Your computer is being remotely controlled</>}
+            </div>
+          )}
+
+          {/* Live captions — full-bleed subtitle strip over video, just above bottom controls (z above tiles & side panels) */}
+          {liveCaptionsEnabled && (
+            <div
+              className="pointer-events-none absolute inset-0 z-[22] flex flex-col justify-end bg-transparent"
+              aria-live="polite"
+              role="region"
+              aria-label="Live captions"
+            >
+              <div
+                className="w-full px-3 sm:px-5"
+                style={{
+                  paddingBottom: 'max(5.75rem, calc(4.5rem + env(safe-area-inset-bottom, 0px)))',
+                }}
+              >
+                <div
+                  className={cx(
+                    'mx-auto w-full max-w-[min(42rem,calc(100vw-1.5rem))] rounded-2xl px-4 py-3 sm:px-5 sm:py-3.5',
+                    'border border-white/25 bg-linear-to-br from-white/18 via-white/8 to-white/5',
+                    'shadow-[0_8px_32px_rgba(0,0,0,0.35),inset_0_1px_0_rgba(255,255,255,0.22)]',
+                    'backdrop-blur-2xl backdrop-saturate-150 ring-1 ring-white/15',
+                  )}
+                >
+                  {latestCaptionLine ? (
+                    <p
+                      key={latestCaptionLine.key}
+                      className={cx(
+                        'text-center text-[13px] leading-relaxed [text-shadow:0_1px_3px_rgba(0,0,0,0.45)] sm:text-[15px]',
+                        latestCaptionLine.final ? 'text-white' : 'text-white/75 italic',
+                      )}
+                    >
+                      <span className="font-semibold text-amber-200">{latestCaptionLine.speakerName}</span>
+                      <span className="text-white/50"> · </span>
+                      <span>{latestCaptionLine.text}</span>
+                    </p>
+                  ) : (
+                    <p className="text-center text-[12px] leading-relaxed text-white/70 sm:text-[13px]">
+                      {!micEnabled ? (
+                        <>
+                          <span className="font-semibold tracking-wide text-amber-200/95">CC</span>
+                          {' · '}
+                          Unmute your mic so your speech can appear here as subtitles.
+                        </>
+                      ) : (
+                        <>
+                          <span className="font-semibold tracking-wide text-amber-200/95">CC</span>
+                          {' · '}
+                          Speak — your words will show here for everyone (Chrome or Edge works best).
+                        </>
+                      )}
+                    </p>
+                  )}
+                </div>
+              </div>
             </div>
           )}
 
@@ -3007,8 +4386,13 @@ export function MeetingPage() {
                   <path d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z" />
                 </svg>
               ) : (
-                <svg viewBox="0 0 24 24" fill="white" width="24" height="24">
-                  <path d="M21 6.5l-4-4-9.86 9.86-2.09-2.09L4 11.36l2.11 2.11L3 16.5V21h4.5l3.03-3.03 2.11 2.11 1.09-1.09-2.09-2.09L21 6.5zM7.04 19H5v-2.04l9.86-9.86 2.04 2.04L7.04 19z" />
+                <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden>
+                  <path
+                    fill="white"
+                    fillOpacity={0.45}
+                    d="M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z"
+                  />
+                  <path fill="none" stroke="white" strokeWidth="2.25" strokeLinecap="round" d="M4.5 4.5l15 15" />
                 </svg>
               )}
             </button>
@@ -3047,22 +4431,6 @@ export function MeetingPage() {
                   <path d="M20 18c1.1 0 1.99-.9 1.99-2L22 6c0-1.1-.9-2-2-2H4c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2H0v2h24v-2h-4zM4 16V6h16v10.01L4 16zm9-6.87l3 3.87H8l3-3.87z"/>
                 </svg>
               )}
-            </button>
-            <button
-              type="button"
-              onClick={whiteboardOpen ? (whiteboardIsOwner ? closeWhiteboard : undefined) : openWhiteboard}
-              className={cx(
-                'flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border-0 transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-45',
-                whiteboardOpen ? 'bg-red-500 hover:bg-[#d33828]' : 'bg-[#3c4043] hover:bg-[#4a4d50]',
-              )}
-              title={whiteboardOpen ? (whiteboardIsOwner ? 'Close whiteboard' : 'Whiteboard is active') : 'Open whiteboard'}
-              disabled={whiteboardOpen && !whiteboardIsOwner}
-            >
-              <svg viewBox="0 0 24 24" fill="white" width="22" height="22">
-                <path d="M3 4.5C3 3.67 3.67 3 4.5 3h12c.83 0 1.5.67 1.5 1.5v9c0 .83-.67 1.5-1.5 1.5h-12C3.67 15 3 14.33 3 13.5v-9zm1.5 0v9h12v-9h-12z" />
-                <path d="M18.6 5.8l2.6-2.6 1.2 1.2-2.6 2.6-.7 3.3-3.3.7.7-3.3 2.1-2.1z" />
-                <path d="M6 18h12v2H6z" />
-              </svg>
             </button>
             {(screenSharingPeers.size > 0 || controllingPeer) && (
               <button
@@ -3122,9 +4490,12 @@ export function MeetingPage() {
                 )}
               </button>
             )}
-            <button type="button" onClick={leave} className="flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border-0 bg-red-500 transition hover:bg-[#d33828] active:scale-95" title="Leave call">
-              <svg viewBox="0 0 24 24" fill="white" width="24" height="24">
-                <path d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z" />
+            <button type="button" onClick={() => leave()} className="flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border-0 bg-red-500 transition hover:bg-[#d33828] active:scale-95" title="Leave call">
+              <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden className="origin-center rotate-[135deg]">
+                <path
+                  fill="white"
+                  d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z"
+                />
               </svg>
             </button>
           </div>
@@ -3133,7 +4504,7 @@ export function MeetingPage() {
 
       {/* Camera switcher panel */}
       {callView === 'call' && showCameraPanel && camEnabled && (
-        <div className="fixed bottom-[88px] left-1/2 z-[110] w-[min(340px,calc(100vw-24px))] -translate-x-1/2 overflow-hidden rounded-2xl border border-white/10 bg-[#1c1c1e]/97 shadow-2xl backdrop-blur-xl sm:bottom-24">
+        <div className="fixed bottom-[88px] left-1/2 z-110 w-[min(340px,calc(100vw-24px))] -translate-x-1/2 overflow-hidden rounded-2xl border border-white/10 bg-[#1c1c1e]/97 shadow-2xl backdrop-blur-xl sm:bottom-24">
           <div className="flex items-center justify-between border-b border-white/8 px-4 py-3">
             <p className="text-[13px] font-semibold text-white/90">Camera Sources</p>
             <button type="button" onClick={() => setShowCameraPanel(false)} className="flex h-6 w-6 items-center justify-center rounded-full bg-white/8 text-xs text-white/60 hover:bg-white/14">✕</button>
@@ -3191,26 +4562,24 @@ export function MeetingPage() {
               )
             })}
           </div>
-          {isHostInCall && (
-            <div className="border-t border-white/8 px-3 py-3">
-              <button
-                type="button"
-                onClick={() => void generateCameraToken()}
-                className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/6 py-2.5 text-[13px] font-medium text-white/80 transition hover:border-amber-500/30 hover:bg-amber-500/10 hover:text-white"
-              >
-                <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
-                  <path d="M19 3H5c-1.11 0-2 .89-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2m-7 3a3 3 0 0 1 3 3 3 3 0 0 1-3 3 3 3 0 0 1-3-3 3 3 0 0 1 3-3m6 13H6v-1c0-2 4-3.1 6-3.1s6 1.1 6 3.1v1z"/>
-                </svg>
-                Add camera source (phone / device)
-              </button>
-            </div>
-          )}
+          <div className="border-t border-white/8 px-3 py-3">
+            <button
+              type="button"
+              onClick={() => void generateCameraToken()}
+              className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/6 py-2.5 text-[13px] font-medium text-white/80 transition hover:border-amber-500/30 hover:bg-amber-500/10 hover:text-white"
+            >
+              <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
+                <path d="M19 3H5c-1.11 0-2 .89-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2m-7 3a3 3 0 0 1 3 3 3 3 0 0 1-3 3 3 3 0 0 1-3-3 3 3 0 0 1 3-3m6 13H6v-1c0-2 4-3.1 6-3.1s6 1.1 6 3.1v1z"/>
+              </svg>
+              Add camera source (phone / device)
+            </button>
+          </div>
         </div>
       )}
 
       {/* Camera share URL modal */}
       {callView === 'call' && cameraShareUrl && (
-        <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setCameraShareUrl(null)}>
+        <div className="fixed inset-0 z-120 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setCameraShareUrl(null)}>
           <div className="w-full max-w-sm rounded-2xl border border-white/10 bg-[#1c1c1e] p-5 shadow-2xl" onClick={e => e.stopPropagation()}>
             <div className="mb-4 flex items-center justify-between">
               <p className="font-semibold text-white">Connect Camera Source</p>

@@ -15,8 +15,12 @@ function getJwtSecret(): string {
   return secret;
 }
 
-function signToken(userId: string): string {
-  return jwt.sign({ sub: userId }, getJwtSecret(), { expiresIn: "7d" });
+function signToken(user: { id: string; email: string; name: string }): string {
+  return jwt.sign(
+    { sub: user.id, email: user.email, name: user.name },
+    getJwtSecret(),
+    { expiresIn: "7d" },
+  );
 }
 
 router.post("/register", async (req, res) => {
@@ -72,7 +76,7 @@ router.post("/register", async (req, res) => {
       },
     });
 
-    const token = signToken(user.id);
+    const token = signToken({ id: user.id, email: user.email, name: user.name });
     res.status(201).json({ token, user });
   } catch (err: unknown) {
     if (err instanceof Prisma.PrismaClientKnownRequestError) {
@@ -109,7 +113,11 @@ router.post("/login", async (req, res) => {
       return;
     }
 
-    const token = signToken(user.id);
+    const token = signToken({
+      id: user.id,
+      email: user.email,
+      name: user.name,
+    });
     res.json({
       token,
       user: {

@@ -8,7 +8,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
-  const proxyTarget = (env.VITE_API_PROXY_TARGET || 'https://localhost:4001').replace(/\/$/, '')
+  const proxyTarget = (env.VITE_API_PROXY_TARGET || 'http://localhost:4001').replace(/\/$/, '')
   const sigTarget = (env.VITE_SIGNALING_PROXY_TARGET || 'http://localhost:4002').replace(/\/$/, '')
 
   return {
@@ -23,7 +23,13 @@ export default defineConfig(({ mode }) => {
       ],
     },
     optimizeDeps: {
-      include: ['buffer', 'nsfwjs', '@tensorflow/tfjs', '@tensorflow-models/body-segmentation'],
+      include: [
+        'buffer',
+        'nsfwjs',
+        '@tensorflow/tfjs',
+        '@tensorflow-models/body-segmentation',
+        '@mediapipe/tasks-vision',
+      ],
     },
     server: {
       allowedHosts: ['d56a-2400-1a00-4b20-1fc2-148c-720-8ff9-b25b.ngrok-free.app'],

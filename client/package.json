@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@mediapipe/selfie_segmentation": "^0.1.1675465747",
+    "@mediapipe/tasks-vision": "^0.10.34",
     "@tailwindcss/vite": "^4.2.2",
     "@tensorflow-models/body-segmentation": "^1.0.2",
     "@tensorflow/tfjs": "^4.22.0",

@@ -31,7 +31,35 @@ model Meeting {
 
   participants Participant[]
   chatMessages ChatMessage[]
+  captions     MeetingCaption[]
   recordings   MeetingRecording[]
+  polls        MeetingPoll[]
+}
+
+model MeetingPoll {
+  id          String    @id @default(cuid())
+  meetingId   String
+  meeting     Meeting   @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  title       String
+  anonymous   Boolean
+  createdAt   DateTime  @default(now())
+  endedAt     DateTime?
+
+  votes MeetingPollVote[]
+
+  @@index([meetingId, createdAt])
+}
+
+model MeetingPollVote {
+  id          String      @id @default(cuid())
+  pollId      String
+  poll        MeetingPoll @relation(fields: [pollId], references: [id], onDelete: Cascade)
+  voterUserId String
+  voterName   String
+  choice      String
+  updatedAt   DateTime    @updatedAt
+
+  @@unique([pollId, voterUserId])
 }
 
 model MeetingRecording {
@@ -70,6 +98,18 @@ model ChatMessage {
   senderName   String
   text         String
   createdAt    DateTime @default(now())
+
+  @@index([meetingId, createdAt])
+}
+
+model MeetingCaption {
+  id            String   @id @default(cuid())
+  meetingId     String
+  meeting       Meeting  @relation(fields: [meetingId], references: [id], onDelete: Cascade)
+  speakerUserId String
+  speakerName   String
+  text          String
+  createdAt     DateTime @default(now())
 
   @@index([meetingId, createdAt])
 }

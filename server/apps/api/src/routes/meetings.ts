@@ -10,8 +10,12 @@ import {
   publicRecordingUrl,
 } from "../meetingRecordingR2";
 import { authMiddleware } from "../middleware/auth";
+import { isAgendaAiNotConfiguredError, runAgendaAiCheck } from "../agenda/agendaAiCheck";
 
 const router = Router();
+
+const AGENDA_MAX = 12_000
+const TRANSCRIPT_MAX = 48_000
 
 function meetingCodeParam(raw: string | string[] | undefined): string {
   if (typeof raw === "string") {
@@ -215,6 +219,189 @@ router.post("/:code/recordings/complete", authMiddleware, async (req, res) => {
         createdAt: rec.createdAt.toISOString(),
         playbackUrl,
       },
+    });
+  } catch (err: unknown) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.post("/:code/agenda/analyze", authMiddleware, async (req, res) => {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  const code = meetingCodeParam(req.params.code);
+  if (!code) {
+    res.status(400).json({ error: "Invalid code" });
+    return;
+  }
+
+  const body = req.body as { agenda?: unknown; transcript?: unknown };
+  const agenda = typeof body.agenda === "string" ? body.agenda.trim() : "";
+  const transcript = typeof body.transcript === "string" ? body.transcript.trim() : "";
+  if (agenda.length === 0) {
+    res.status(400).json({ error: "Agenda is required" });
+    return;
+  }
+  if (transcript.length === 0) {
+    res.status(400).json({ error: "Transcript is required" });
+    return;
+  }
+  if (agenda.length > AGENDA_MAX) {
+    res.status(400).json({ error: `Agenda too long (max ${AGENDA_MAX} characters)` });
+    return;
+  }
+  if (transcript.length > TRANSCRIPT_MAX) {
+    res.status(400).json({ error: `Transcript too long (max ${TRANSCRIPT_MAX} characters)` });
+    return;
+  }
+
+  try {
+    const meeting = await prisma.meeting.findUnique({
+      where: { code },
+      select: { id: true, hostId: true },
+    });
+    if (!meeting) {
+      res.status(404).json({ error: "Meeting not found" });
+      return;
+    }
+    if (meeting.hostId !== userId) {
+      res.status(403).json({ error: "Only the meeting host can analyze the agenda" });
+      return;
+    }
+
+    try {
+      const result = await runAgendaAiCheck(agenda, transcript);
+      res.json(result);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Agenda analysis failed";
+      if (isAgendaAiNotConfiguredError(e)) {
+        res.status(503).json({
+          error: "AI agenda check is not configured",
+          detail:
+            "Set HUGGINGFACE_API_TOKEN (Inference Providers, recommended) or OPENAI_API_KEY on the API server. See apps/api/.env.example.",
+        });
+        return;
+      }
+      console.error("agenda analyze:", e);
+      res.status(502).json({ error: "Agenda analysis failed", detail: msg });
+    }
+  } catch (err: unknown) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.get("/:code/captions", authMiddleware, async (req, res) => {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  const code = meetingCodeParam(req.params.code);
+  if (!code) {
+    res.status(400).json({ error: "Invalid code" });
+    return;
+  }
+
+  try {
+    const meeting = await prisma.meeting.findUnique({
+      where: { code },
+      select: { id: true, hostId: true },
+    });
+    if (!meeting) {
+      res.status(404).json({ error: "Meeting not found" });
+      return;
+    }
+    if (meeting.hostId !== userId) {
+      res.status(403).json({ error: "Only the meeting host can download captions" });
+      return;
+    }
+
+    const rows = await prisma.meetingCaption.findMany({
+      where: { meetingId: meeting.id },
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+      select: {
+        id: true,
+        speakerUserId: true,
+        speakerName: true,
+        text: true,
+        createdAt: true,
+      },
+    });
+
+    res.json({
+      captions: rows.map((r) => ({
+        id: r.id,
+        speakerUserId: r.speakerUserId,
+        speakerName: r.speakerName,
+        text: r.text,
+        createdAt: r.createdAt.toISOString(),
+      })),
+    });
+  } catch (err: unknown) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.get("/:code/polls", authMiddleware, async (req, res) => {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  const code = meetingCodeParam(req.params.code);
+  if (!code) {
+    res.status(400).json({ error: "Invalid code" });
+    return;
+  }
+
+  try {
+    const meeting = await prisma.meeting.findUnique({
+      where: { code },
+      select: { id: true, hostId: true },
+    });
+    if (!meeting) {
+      res.status(404).json({ error: "Meeting not found" });
+      return;
+    }
+    if (meeting.hostId !== userId) {
+      res.status(403).json({ error: "Only the meeting host can view saved polls" });
+      return;
+    }
+
+    const rows = await prisma.meetingPoll.findMany({
+      where: { meetingId: meeting.id },
+      orderBy: { createdAt: "desc" },
+      take: 80,
+      include: { votes: true },
+    });
+
+    res.json({
+      polls: rows.map((p) => {
+        const upCount = p.votes.filter((v) => v.choice === "up").length;
+        const downCount = p.votes.filter((v) => v.choice === "down").length;
+        return {
+          id: p.id,
+          title: p.title,
+          anonymous: p.anonymous,
+          createdAt: p.createdAt.toISOString(),
+          endedAt: p.endedAt ? p.endedAt.toISOString() : null,
+          active: p.endedAt === null,
+          upCount,
+          downCount,
+          votes: p.anonymous
+            ? undefined
+            : p.votes.map((v) => ({
+                voterName: v.voterName,
+                voterUserId: v.voterUserId,
+                choice: v.choice,
+              })),
+        };
+      }),
     });
   } catch (err: unknown) {
     console.error(err);

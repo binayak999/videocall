@@ -1,4 +1,11 @@
-import type { ApiError, AuthResponse, MeetingRecordingItem, MeetingResponse } from './types'
+import type {
+  AgendaCheckResult,
+  ApiError,
+  AuthResponse,
+  MeetingPollSaved,
+  MeetingRecordingItem,
+  MeetingResponse,
+} from './types'
 import { getToken } from './auth'
 
 function apiBase(): string {
@@ -77,8 +84,31 @@ export async function register(input: {
   })
 }
 
+export type MeetingCaptionRow = {
+  id: string
+  speakerUserId: string
+  speakerName: string
+  text: string
+  createdAt: string
+}
+
+export async function fetchMeetingCaptions(meetingCode: string): Promise<{ captions: MeetingCaptionRow[] }> {
+  return await requestJson<{ captions: MeetingCaptionRow[] }>(
+    `/api/meetings/${encodeURIComponent(meetingCode)}/captions`,
+    { auth: true },
+  )
+}
+
 export async function getMeeting(code: string): Promise<MeetingResponse> {
   return await requestJson<MeetingResponse>(`/api/meetings/${encodeURIComponent(code)}`)
+}
+
+/** Host-only: persisted thumbs up/down polls for this meeting. */
+export async function fetchMeetingPolls(meetingCode: string): Promise<{ polls: MeetingPollSaved[] }> {
+  return await requestJson<{ polls: MeetingPollSaved[] }>(
+    `/api/meetings/${encodeURIComponent(meetingCode)}/polls`,
+    { auth: true },
+  )
 }
 
 export async function createMeeting(input: { title?: string }): Promise<MeetingResponse> {
@@ -172,6 +202,34 @@ export async function listMyRecordings(): Promise<{ recordings: MeetingRecording
   return await requestJson<{ recordings: MeetingRecordingItem[] }>('/api/recordings', {
     auth: true,
   })
+}
+
+/** Authenticated; server uses same AI credentials as agenda (HF or OpenAI). */
+export async function translateText(body: {
+  text: string
+  targetLanguage: string
+  sourceLanguage?: string
+}): Promise<{ translated: string }> {
+  return await requestJson<{ translated: string }>('/api/translate', {
+    method: 'POST',
+    auth: true,
+    body: JSON.stringify(body),
+  })
+}
+
+/** Host only — server returns 403 for non-hosts. API needs HUGGINGFACE_API_TOKEN (preferred) or OPENAI_API_KEY. */
+export async function analyzeMeetingAgenda(
+  meetingCode: string,
+  body: { agenda: string; transcript: string },
+): Promise<AgendaCheckResult> {
+  return await requestJson<AgendaCheckResult>(
+    `/api/meetings/${encodeURIComponent(meetingCode)}/agenda/analyze`,
+    {
+      method: 'POST',
+      auth: true,
+      body: JSON.stringify(body),
+    },
+  )
 }
 
 export function errorMessage(err: unknown): string {

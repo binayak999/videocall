@@ -14,7 +14,19 @@ export class HostMeetingRecorder {
   private chunks: Blob[] = []
   private mimeType = 'video/webm'
 
-  start(container: HTMLElement, audioStreams: MediaStream[], options?: { frameRate?: number; maxWidth?: number }): void {
+  private getCaptionOverlay: (() => { speakerName: string; text: string } | null) | null = null
+
+  start(
+    container: HTMLElement,
+    audioStreams: MediaStream[],
+    options?: {
+      frameRate?: number
+      maxWidth?: number
+      /** When set, each frame can draw this text at the bottom (e.g. live CC). Return null to skip. */
+      getCaptionOverlay?: () => { speakerName: string; text: string } | null
+    },
+  ): void {
+    this.getCaptionOverlay = options?.getCaptionOverlay ?? null
     const frameRate = options?.frameRate ?? 12
     const maxW = options?.maxWidth ?? 1280
     const cw = Math.max(1, Math.min(container.clientWidth || 1280, maxW))
@@ -131,6 +143,39 @@ export class HostMeetingRecorder {
         }
         i++
       }
+
+      const cap = this.getCaptionOverlay?.() ?? null
+      const capText = cap?.text?.trim() ?? ''
+      const capName = cap?.speakerName?.trim() ?? ''
+      if (capText.length > 0 || capName.length > 0) {
+        const line =
+          capName.length > 0 && capText.length > 0
+            ? `${capName} · ${capText}`
+            : capName.length > 0
+              ? capName
+              : capText
+        const padX = 14
+        const barH = Math.max(36, Math.min(72, Math.round(h * 0.11)))
+        ctx.save()
+        ctx.fillStyle = 'rgba(0,0,0,0.58)'
+        ctx.fillRect(0, h - barH, w, barH)
+        const fontPx = Math.max(13, Math.min(20, Math.round(w / 48)))
+        ctx.font = `500 ${fontPx}px system-ui, -apple-system, sans-serif`
+        ctx.fillStyle = 'rgba(255,255,255,0.95)'
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'middle'
+        let drawLine = line.length > 240 ? `${line.slice(0, 237)}…` : line
+        const textMaxW = w - padX * 2
+        if (ctx.measureText(drawLine).width > textMaxW) {
+          const ell = '…'
+          while (drawLine.length > 4 && ctx.measureText(drawLine + ell).width > textMaxW) {
+            drawLine = drawLine.slice(0, -1)
+          }
+          drawLine += ell
+        }
+        ctx.fillText(drawLine, w / 2, h - barH / 2, textMaxW)
+        ctx.restore()
+      }
     }
     draw()
   }
@@ -158,6 +203,7 @@ export class HostMeetingRecorder {
     this.dest = null
     this.canvas = null
     this.ctx = null
+    this.getCaptionOverlay = null
 
     return new Blob(this.chunks, { type: this.mimeType })
   }

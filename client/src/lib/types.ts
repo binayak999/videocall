@@ -29,6 +29,18 @@ export type MeetingResponse = {
   meeting: Meeting
 }
 
+export type AgendaCheckItem = {
+  label: string
+  met: boolean
+  confidence: 'high' | 'medium' | 'low'
+  reason: string
+}
+
+export type AgendaCheckResult = {
+  summary: string
+  items: AgendaCheckItem[]
+}
+
 export type MeetingRecordingItem = {
   id: string
   meetingId: string
@@ -39,5 +51,17 @@ export type MeetingRecordingItem = {
   sizeBytes: number | null
   createdAt: string
   playbackUrl: string
+}
+
+export type MeetingPollSaved = {
+  id: string
+  title: string
+  anonymous: boolean
+  createdAt: string
+  endedAt: string | null
+  active: boolean
+  upCount: number
+  downCount: number
+  votes?: { voterName: string; voterUserId: string; choice: string }[]
 }
 

@@ -26,6 +26,8 @@ export type RecordingVideoPlayerProps = BaseProps & {
    * `inline` — full player in the card.
    */
   variant?: 'inline' | 'tile'
+  /** Smaller overlay controls (e.g. recording cards in a grid). */
+  compact?: boolean
 }
 
 function usePlayerFullscreen(wrapRef: RefObject<HTMLDivElement | null>) {
@@ -41,7 +43,7 @@ function usePlayerFullscreen(wrapRef: RefObject<HTMLDivElement | null>) {
   return isFs
 }
 
-function RecordingPlayerInline({ src, theme = 'nexivo', className }: BaseProps) {
+function RecordingPlayerInline({ src, theme = 'nexivo', className, compact }: BaseProps & { compact?: boolean }) {
   const wrapRef = useRef<HTMLDivElement>(null)
   const videoRef = useRef<HTMLVideoElement>(null)
   const [playing, setPlaying] = useState(false)
@@ -157,39 +159,45 @@ function RecordingPlayerInline({ src, theme = 'nexivo', className }: BaseProps) 
         src={src}
         playsInline
         preload="metadata"
-        className="h-full w-full scale-x-[-1] object-contain"
+        className={cx(
+          'h-full w-full scale-x-[-1] object-contain',
+          compact && 'cursor-pointer',
+        )}
         onClick={() => togglePlay()}
       />
 
-      <button
-        type="button"
-        aria-label={playing ? 'Pause' : 'Play'}
-        onClick={e => {
-          e.stopPropagation()
-          togglePlay()
-        }}
-        className={cx(
-          'absolute left-1/2 top-1/2 z-1 flex h-14 w-14 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border transition',
-          showChrome ? 'pointer-events-auto opacity-100' : 'pointer-events-none opacity-0',
-          nexivo
-            ? 'border-white/25 bg-black/55 text-[#fbbf24] backdrop-blur-sm hover:bg-black/70'
-            : 'border-(--border) bg-(--bg)/90 text-(--accent) shadow-md backdrop-blur-sm hover:bg-(--social-bg)',
-        )}
-      >
-        {playing ? (
-          <svg viewBox="0 0 24 24" fill="currentColor" width="28" height="28" aria-hidden>
-            <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" />
-          </svg>
-        ) : (
-          <svg viewBox="0 0 24 24" fill="currentColor" width="28" height="28" aria-hidden className="ml-0.5">
-            <path d="M8 5v14l11-7z" />
-          </svg>
-        )}
-      </button>
+      {!compact && (
+        <button
+          type="button"
+          aria-label={playing ? 'Pause' : 'Play'}
+          onClick={e => {
+            e.stopPropagation()
+            togglePlay()
+          }}
+          className={cx(
+            'absolute left-1/2 top-1/2 z-1 flex h-14 w-14 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border transition',
+            showChrome ? 'pointer-events-auto opacity-100' : 'pointer-events-none opacity-0',
+            nexivo
+              ? 'border-white/25 bg-black/55 text-[#fbbf24] backdrop-blur-sm hover:bg-black/70'
+              : 'border-(--border) bg-(--bg)/90 text-(--accent) shadow-md backdrop-blur-sm hover:bg-(--social-bg)',
+          )}
+        >
+          {playing ? (
+            <svg viewBox="0 0 24 24" fill="currentColor" width="28" height="28" aria-hidden>
+              <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" />
+            </svg>
+          ) : (
+            <svg viewBox="0 0 24 24" fill="currentColor" width="28" height="28" aria-hidden className="ml-0.5">
+              <path d="M8 5v14l11-7z" />
+            </svg>
+          )}
+        </button>
+      )}
 
       <div
         className={cx(
-          'absolute inset-x-0 bottom-0 z-2 bg-linear-to-t from-black/85 via-black/50 to-transparent px-2.5 pb-2 pt-8 transition-opacity duration-200',
+          'absolute inset-x-0 bottom-0 z-2 bg-linear-to-t from-black/85 via-black/50 to-transparent transition-opacity duration-200',
+          compact ? 'px-2 pb-1.5 pt-6' : 'px-2.5 pb-2 pt-8',
           showChrome ? 'opacity-100' : 'opacity-0 pointer-events-none',
         )}
       >
@@ -200,7 +208,8 @@ function RecordingPlayerInline({ src, theme = 'nexivo', className }: BaseProps) 
           aria-valuenow={Math.round(pct)}
           tabIndex={0}
           className={cx(
-            'group/track relative mb-2 h-1.5 w-full cursor-pointer rounded-full touch-none',
+            'group/track relative h-1.5 w-full cursor-pointer rounded-full touch-none',
+            compact ? 'mb-1' : 'mb-2',
             nexivo ? 'bg-white/20' : 'bg-(--border)',
           )}
           onPointerDown={e => {
@@ -242,22 +251,23 @@ function RecordingPlayerInline({ src, theme = 'nexivo', className }: BaseProps) 
           />
         </div>
 
-        <div className="relative flex items-center gap-1.5">
+        <div className={cx('relative flex items-center', compact ? 'gap-1' : 'gap-1.5')}>
           <button
             type="button"
             aria-label={playing ? 'Pause' : 'Play'}
             onClick={() => togglePlay()}
             className={cx(
-              'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition',
+              'flex shrink-0 items-center justify-center rounded-lg transition',
+              compact ? 'h-7 w-7' : 'h-8 w-8',
               nexivo ? 'text-white/85 hover:bg-white/12 hover:text-[#fbbf24]' : 'text-(--text-h) hover:bg-(--social-bg)',
             )}
           >
             {playing ? (
-              <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20">
+              <svg viewBox="0 0 24 24" fill="currentColor" width={compact ? 16 : 20} height={compact ? 16 : 20}>
                 <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" />
               </svg>
             ) : (
-              <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20" className="ml-px">
+              <svg viewBox="0 0 24 24" fill="currentColor" width={compact ? 16 : 20} height={compact ? 16 : 20} className="ml-px">
                 <path d="M8 5v14l11-7z" />
               </svg>
             )}
@@ -265,7 +275,8 @@ function RecordingPlayerInline({ src, theme = 'nexivo', className }: BaseProps) 
 
           <span
             className={cx(
-              'min-w-22 shrink-0 tabular-nums text-[0.65rem] font-medium',
+              'min-w-22 shrink-0 tabular-nums font-medium',
+              compact ? 'text-[0.6rem]' : 'text-[0.65rem]',
               nexivo ? 'text-white/70' : 'text-(--text)',
             )}
           >
@@ -279,16 +290,17 @@ function RecordingPlayerInline({ src, theme = 'nexivo', className }: BaseProps) 
             aria-label={muted ? 'Unmute' : 'Mute'}
             onClick={() => setMuted(m => !m)}
             className={cx(
-              'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition',
+              'flex shrink-0 items-center justify-center rounded-lg transition',
+              compact ? 'h-7 w-7' : 'h-8 w-8',
               nexivo ? 'text-white/85 hover:bg-white/12 hover:text-[#fbbf24]' : 'text-(--text-h) hover:bg-(--social-bg)',
             )}
           >
             {muted ? (
-              <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20">
+              <svg viewBox="0 0 24 24" fill="currentColor" width={compact ? 16 : 20} height={compact ? 16 : 20}>
                 <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z" />
               </svg>
             ) : (
-              <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20">
+              <svg viewBox="0 0 24 24" fill="currentColor" width={compact ? 16 : 20} height={compact ? 16 : 20}>
                 <path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" />
               </svg>
             )}
@@ -299,11 +311,12 @@ function RecordingPlayerInline({ src, theme = 'nexivo', className }: BaseProps) 
             aria-label="Fullscreen"
             onClick={() => void toggleFullscreen()}
             className={cx(
-              'flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition',
+              'flex shrink-0 items-center justify-center rounded-lg transition',
+              compact ? 'h-7 w-7' : 'h-8 w-8',
               nexivo ? 'text-white/85 hover:bg-white/12 hover:text-[#fbbf24]' : 'text-(--text-h) hover:bg-(--social-bg)',
             )}
           >
-            <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18">
+            <svg viewBox="0 0 24 24" fill="currentColor" width={compact ? 15 : 18} height={compact ? 15 : 18}>
               <path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z" />
             </svg>
           </button>
@@ -331,7 +344,7 @@ function RecordingTileOpenView({
       )}
       role="button"
       tabIndex={0}
-      aria-label="Play recording"
+      aria-label="Play recording in popup"
       onClick={() => onOpen()}
       onKeyDown={e => {
         if (e.key === 'Enter' || e.key === ' ') {
@@ -356,13 +369,13 @@ function RecordingTileOpenView({
       <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
         <span
           className={cx(
-            'flex h-12 w-12 items-center justify-center rounded-full border shadow-lg',
+            'flex h-14 w-14 items-center justify-center rounded-full border shadow-lg sm:h-16 sm:w-16',
             nexivo
-              ? 'border-white/30 bg-black/50 text-[#fbbf24] backdrop-blur-sm'
+              ? 'border-white/35 bg-black/55 text-[#fbbf24] backdrop-blur-md ring-2 ring-black/20'
               : 'border-(--border) bg-(--code-bg)/90 text-(--accent) backdrop-blur-sm',
           )}
         >
-          <svg viewBox="0 0 24 24" fill="currentColor" width="26" height="26" aria-hidden className="ml-0.5">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden className="ml-1 h-7 w-7 sm:ml-1.5 sm:h-8 sm:w-8">
             <path d="M8 5v14l11-7z" />
           </svg>
         </span>
@@ -376,6 +389,7 @@ export function RecordingVideoPlayer({
   theme = 'nexivo',
   className,
   variant = 'inline',
+  compact,
 }: RecordingVideoPlayerProps) {
   const [modalOpen, setModalOpen] = useState(false)
 
@@ -401,7 +415,10 @@ export function RecordingVideoPlayer({
         {modalOpen &&
           createPortal(
             <div
-              className="fixed inset-0 z-[200] flex items-center justify-center bg-black/80 p-3 backdrop-blur-md sm:p-6"
+              className={cx(
+                'fixed inset-0 z-200 flex items-center justify-center p-3 backdrop-blur-md sm:p-6',
+                nexivo ? 'bg-(--nexivo-dialog-scrim)' : 'bg-black/80',
+              )}
               role="dialog"
               aria-modal="true"
               aria-labelledby="recording-modal-title"
@@ -410,7 +427,9 @@ export function RecordingVideoPlayer({
               <div
                 className={cx(
                   'relative w-full max-w-5xl max-h-[min(92dvh,920px)] overflow-hidden rounded-2xl border shadow-2xl',
-                  nexivo ? 'border-white/15 bg-[#1c1c1e]' : 'border-(--border) bg-(--code-bg) shadow-(--shadow)',
+                  nexivo
+                    ? 'border-(--nexivo-border) bg-(--nexivo-panel-solid) backdrop-blur-xl'
+                    : 'border-(--border) bg-(--code-bg) shadow-(--shadow)',
                 )}
                 onClick={e => e.stopPropagation()}
               >
@@ -420,9 +439,9 @@ export function RecordingVideoPlayer({
                 <button
                   type="button"
                   className={cx(
-                    'absolute right-2 top-2 z-20 flex h-9 w-9 items-center justify-center rounded-full border text-lg font-light transition',
+                    'absolute right-2 top-2 z-20 flex h-9 w-9 items-center justify-center rounded-full border text-lg font-light leading-none transition',
                     nexivo
-                      ? 'border-white/20 bg-black/50 text-white hover:bg-black/70'
+                      ? 'border-(--nexivo-border-subtle) bg-(--nexivo-muted-surface) text-(--nexivo-text) hover:bg-(--nexivo-nav-hover)'
                       : 'border-(--border) bg-(--bg) text-(--text-h) hover:bg-(--social-bg)',
                   )}
                   aria-label="Close"
@@ -441,5 +460,5 @@ export function RecordingVideoPlayer({
     )
   }
 
-  return <RecordingPlayerInline src={src} theme={theme} className={className} />
+  return <RecordingPlayerInline src={src} theme={theme} className={className} compact={compact} />
 }
