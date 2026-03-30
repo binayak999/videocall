@@ -3335,6 +3335,7 @@ export function MeetingPage() {
 
   return (
     <>
+      <audio ref={remoteMicMonitorAudioRef} autoPlay playsInline className="hidden" />
       {/* ── Meeting detail ── */}
       {callView === 'detail' && (
         <div
@@ -4492,8 +4493,6 @@ export function MeetingPage() {
                           </option>
                         ))}
                       </select>
-                      <audio ref={remoteMicMonitorAudioRef} autoPlay playsInline className="hidden" />
-
                       <label className="mt-2 flex cursor-pointer items-center gap-2 text-[12px] font-medium text-white/70">
                         <input
                           type="checkbox"

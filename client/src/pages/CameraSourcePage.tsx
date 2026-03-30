@@ -16,7 +16,6 @@ export function CameraSourcePage() {
   const [speakerOutDeviceId, setSpeakerOutDeviceId] = useState<string | null>(null)
   const [speakerVolume, setSpeakerVolume] = useState(1)
   const [pttTalking, setPttTalking] = useState(false)
-  const [pttHearingHost, setPttHearingHost] = useState(false)
 
   const videoRef = useRef<HTMLVideoElement>(null)
   const audioRef = useRef<HTMLAudioElement>(null)
@@ -32,7 +31,7 @@ export function CameraSourcePage() {
     for (const t of s.getAudioTracks()) t.enabled = enabled
   }
 
-  function emitPtt(event: 'camera:ptt-mic' | 'camera:ptt-speaker', on: boolean) {
+  function emitPtt(event: 'camera:ptt-mic', on: boolean) {
     socketRef.current?.emit(event, { on })
   }
 
@@ -208,7 +207,6 @@ export function CameraSourcePage() {
     void connect()
     return () => {
       emitPtt('camera:ptt-mic', false)
-      emitPtt('camera:ptt-speaker', false)
       setOutgoingMicEnabled(false)
       socketRef.current?.disconnect()
       pcRef.current?.close()
@@ -288,7 +286,7 @@ export function CameraSourcePage() {
         <p className="text-[11px] leading-snug text-white/45">
           Hold a button to send audio. Release to stop.
         </p>
-        <div className="grid grid-cols-2 gap-2">
+        <div className="grid grid-cols-1 gap-2">
           <button
             type="button"
             onPointerDown={e => {
@@ -312,27 +310,6 @@ export function CameraSourcePage() {
             }`}
           >
             {pttTalking ? 'Talking…' : 'Hold to talk to host'}
-          </button>
-          <button
-            type="button"
-            onPointerDown={e => {
-              ;(e.currentTarget as HTMLButtonElement).setPointerCapture(e.pointerId)
-              setPttHearingHost(true)
-              emitPtt('camera:ptt-speaker', true)
-            }}
-            onPointerUp={() => {
-              setPttHearingHost(false)
-              emitPtt('camera:ptt-speaker', false)
-            }}
-            onPointerCancel={() => {
-              setPttHearingHost(false)
-              emitPtt('camera:ptt-speaker', false)
-            }}
-            className={`w-full select-none rounded-xl border px-3 py-3 text-[13px] font-semibold transition ${
-              pttHearingHost ? 'border-sky-300 bg-sky-300/15 text-sky-100' : 'border-white/12 bg-black/30 text-white/80 hover:border-white/18'
-            }`}
-          >
-            {pttHearingHost ? 'Receiving…' : 'Hold to hear host'}
           </button>
         </div>
       </div>
