@@ -48,6 +48,19 @@ export default defineConfig(({ mode }) => {
           target: sigTarget,
           changeOrigin: true,
           ws: true,
+          /** Dev-only: HMR / tab close often tears down the browser side first → EPIPE on the proxy pipe. Harmless. */
+          configure(proxy) {
+            proxy.on('error', (err: NodeJS.ErrnoException) => {
+              if (err.code === 'EPIPE' || err.code === 'ECONNRESET') return
+              console.error('[vite proxy]', err)
+            })
+            proxy.on('proxyReqWs', (_proxyReq, _req, socket) => {
+              socket.on('error', (err: NodeJS.ErrnoException) => {
+                if (err.code === 'EPIPE' || err.code === 'ECONNRESET') return
+                console.error('[vite proxy ws]', err)
+              })
+            })
+          },
         },
       },
     },

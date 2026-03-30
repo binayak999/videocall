@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { io, type Socket } from 'socket.io-client'
 import { errorMessage, getMeeting } from '../lib/api'
+import { defaultSignalingUrl } from '../lib/signalingUrl'
 import { getToken } from '../lib/auth'
 import { getIceServers, rtcConfiguration } from '../lib/ice'
 import { MeetingVoteOverlay, type MeetingVoteChoice } from '../components/MeetingVoteOverlay'
@@ -13,10 +14,6 @@ import {
   type CaptionLine,
 } from '../lib/meetingCaptions'
 import type { Meeting } from '../lib/types'
-
-function defaultSignalingUrl() {
-  return window.location.origin
-}
 
 interface ChatRow {
   id: string

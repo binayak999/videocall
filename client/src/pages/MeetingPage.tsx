@@ -11,19 +11,7 @@ import {
   uploadMeetingRecordingViaApi,
 } from '../lib/api'
 import { getToken } from '../lib/auth'
-import { getIceServers, rtcConfiguration } from '../lib/ice'
-import {
-  classifyMeetingQualityTier,
-  mungeOpusMaxAverageBitrate,
-  opusMaxAverageBitrateForTier,
-  parseMeetingConnectionStats,
-  preferVp9Vp8VideoCodecs,
-  MIN_AUDIO_BPS,
-  TIER_AUDIO_BPS,
-  TIER_VIDEO_BPS,
-  tierRank,
-  type MeetingQualityTier,
-} from '../lib/webrtcMeetingQuality'
+import { getIceServers } from '../lib/ice'
 import { startCameraBackgroundPipeline, type CameraBackgroundPipeline } from '../lib/cameraBackgroundPipeline'
 import { HostMeetingRecorder } from '../lib/hostMeetingRecorder'
 import {
@@ -135,9 +123,6 @@ function dedupeVideoInputsForUi(devices: MediaDeviceInfo[]): MediaDeviceInfo[] {
   })
   return merged
 }
-
-/** Slot id for your own camera in the call grid (not a socket id). */
-const TILE_LOCAL = 'local'
 
 function cx(...classes: Array<string | false | null | undefined>): string {
   return classes.filter(Boolean).join(' ')
@@ -343,8 +328,6 @@ export function MeetingPage() {
   const [camEnabled, setCamEnabled] = useState(false)
   const [statusLine, setStatusLine] = useState('')
   const [peerIds, setPeerIds] = useState<string[]>([])
-  /** Call grid order: `TILE_LOCAL` plus remote peer socket ids. */
-  const [tileOrder, setTileOrder] = useState<string[]>([TILE_LOCAL])
   const [activeMeetingCode, setActiveMeetingCode] = useState('')
   const [timerSeconds, setTimerSeconds] = useState(0)
   const [toast, setToast] = useState<string | null>(null)
@@ -354,8 +337,7 @@ export function MeetingPage() {
   const [pipCamOff, setPipCamOff] = useState(true)
   const [showDebug, setShowDebug] = useState(false)
   const [debugLog, setDebugLog] = useState('')
-  /** Per-peer uplink quality from getStats (good / fair / poor). */
-  const [peerNetworkQuality, setPeerNetworkQuality] = useState<Record<string, MeetingQualityTier>>({})
+  const [hasWeakNetwork, setHasWeakNetwork] = useState(false)
   const [presenterPage, setPresenterPage] = useState(0)
   const [screenSharing, setScreenSharing] = useState(false)
   const [screenSharingPeers, setScreenSharingPeers] = useState<Set<string>>(new Set())
@@ -400,6 +382,8 @@ export function MeetingPage() {
   const [whiteboardActiveDrawersAt, setWhiteboardActiveDrawersAt] = useState<Record<string, number>>({})
   const [handRaisedByPeerId, setHandRaisedByPeerId] = useState<Record<string, boolean>>({})
   const [myHandRaised, setMyHandRaised] = useState(false)
+  const myHandRaisedRef = useRef(false)
+  myHandRaisedRef.current = myHandRaised
   const [voteSession, setVoteSession] = useState<{
     sessionId: string
     title: string
@@ -441,6 +425,8 @@ export function MeetingPage() {
 
   // refs
   const socketRef = useRef<Socket | null>(null)
+  const mySocketIdRef = useRef('')
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const getSignalingSocket = useCallback(() => socketRef.current, [])
 
   useMeetingCaptionRecognition({
@@ -459,10 +445,28 @@ export function MeetingPage() {
     socketRef.current?.emit('meeting:vote-submit', { sessionId: sid, choice })
     setMyVote(choice)
   }, [])
+  const raiseHandFromOpenPalm = useCallback(() => {
+    const socket = socketRef.current
+    if (!socket?.connected) return
+    const me = mySocketIdRef.current
+    if (!me) return
+    const next = !myHandRaisedRef.current
+    setMyHandRaised(next)
+    setHandRaisedByPeerId(prev => {
+      if (prev[me] === next) return prev
+      return { ...prev, [me]: next }
+    })
+    socket.emit('meeting:hand-raise', { raised: next })
+    setToast(next ? 'Hand raised' : 'Hand lowered')
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+    toastTimerRef.current = setTimeout(() => setToast(null), 1800)
+  }, [])
   const { status: voteGestureStatus } = useVoteGestureRecognition({
-    enabled: callView === 'call' && voteSession !== null && camEnabled,
+    enabled: callView === 'call' && camEnabled,
     getStream: getLocalCameraStream,
     onGesture: submitMeetingVote,
+    thumbGesturesEnabled: voteSession !== null,
+    onOpenPalm: raiseHandFromOpenPalm,
   })
   const peersRef = useRef<Map<string, PeerState>>(new Map())
   const preConnectIceRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map())
@@ -473,16 +477,13 @@ export function MeetingPage() {
   const micWasEnabledBeforeHostMuteRef = useRef<boolean | null>(null)
   const collabAutoConnectDoneRef = useRef(false)
   const connectRef = useRef<(() => Promise<void>) | null>(null)
-  const mySocketIdRef = useRef('')
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const timerSecondsRef = useRef(0)
-  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const peerVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map())
   const peerVideoCallbackRefs = useRef<Map<string, (el: HTMLVideoElement | null) => void>>(new Map())
   const peerStreamRefs = useRef<Map<string, MediaStream>>(new Map())
   const localPreviewRef = useRef<HTMLVideoElement>(null)
-  /** Main call grid (non-presenter): your camera at full tile size — also used by host recording layout. */
-  const localGridVideoRef = useRef<HTMLVideoElement>(null)
+  const localPipRef = useRef<HTMLVideoElement>(null)
   const localPresenterRef = useRef<HTMLVideoElement>(null)
   const localStripRef = useRef<HTMLVideoElement>(null)
   const remoteMicMonitorAudioRef = useRef<HTMLAudioElement>(null)
@@ -498,10 +499,7 @@ export function MeetingPage() {
   const controlUnavailableNotifiedRef = useRef<Set<string>>(new Set())
   const lastMouseSendRef = useRef(0)
   const iceRestartTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
-  const peerAdaptiveStatsIntervalsRef = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map())
-  const appliedTierByPeerRef = useRef<Map<string, MeetingQualityTier>>(new Map())
-  const upgradeGoodStreakRef = useRef<Map<string, number>>(new Map())
-  const lastVideoConstraintTierRef = useRef<MeetingQualityTier>('good')
+  const statsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const autoVideoPausedRef = useRef(false)
   const swipeContainerRef = useRef<HTMLDivElement>(null)
   const whiteboardCanvasRef = useRef<HTMLCanvasElement>(null)
@@ -677,18 +675,6 @@ export function MeetingPage() {
     }
   }, [screenSharingPeers, peerIds, syncPeerCameraOverlay])
 
-  useEffect(() => {
-    setTileOrder(prev => {
-      const peers = peerIds
-      const next = prev.filter(id => id === TILE_LOCAL || peers.includes(id))
-      for (const pid of peers) {
-        if (!next.includes(pid)) next.push(pid)
-      }
-      if (!next.includes(TILE_LOCAL)) next.unshift(TILE_LOCAL)
-      return next
-    })
-  }, [peerIds])
-
   // fetch meeting detail
   useEffect(() => {
     let cancelled = false
@@ -816,22 +802,19 @@ export function MeetingPage() {
     if (callView !== 'call') return
     const camStream = localStreamRef.current
     const screenStream = screenStreamRef.current
-    const remotePresent = peerIds.find(id => screenSharingPeers.has(id)) ?? null
-    const presenterIsLocal = !remotePresent && screenSharing
-    const inPresenterMode = Boolean(remotePresent || presenterIsLocal)
 
-    // Main grid (non-presenter): your camera / screen preview in a full tile (also what host recording composites)
-    if (!inPresenterMode && localGridVideoRef.current) {
+    // PiP: show screen + audio while sharing, otherwise camera
+    if (localPipRef.current) {
       if (screenSharing && screenStream) {
         const s = new MediaStream([
           ...screenStream.getVideoTracks(),
           ...(camStream?.getAudioTracks() ?? []),
         ])
-        localGridVideoRef.current.srcObject = s
+        localPipRef.current.srcObject = s
       } else if (camStream) {
-        localGridVideoRef.current.srcObject = camStream
+        localPipRef.current.srcObject = camStream
       }
-      void localGridVideoRef.current.play().catch(() => {})
+      void localPipRef.current.play().catch(() => {})
     }
 
     // Presenter full-screen tile: show screen share when local user is sharing
@@ -847,7 +830,7 @@ export function MeetingPage() {
       void localStripRef.current.play().catch(() => {})
     }
     // screenSharingPeers (Set identity) + screenSharing: re-run when presenter mode changes.
-  }, [callView, screenSharing, screenSharingPeers, peerIds])
+  }, [callView, screenSharing, screenSharingPeers])
 
   // keep chat pinned to latest message
   useEffect(() => {
@@ -933,8 +916,7 @@ export function MeetingPage() {
       peersMap.clear()
       for (const t of iceTimersMap.values()) clearTimeout(t)
       iceTimersMap.clear()
-      for (const t of peerAdaptiveStatsIntervalsRef.current.values()) clearInterval(t)
-      peerAdaptiveStatsIntervalsRef.current.clear()
+      if (statsIntervalRef.current) clearInterval(statsIntervalRef.current)
       if (timerRef.current) clearInterval(timerRef.current)
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
     }
@@ -1080,9 +1062,9 @@ export function MeetingPage() {
       localPreviewRef.current.srcObject = ls
       void localPreviewRef.current.play().catch(() => {})
     }
-    if (localGridVideoRef.current && !screenSharingRef.current) {
-      localGridVideoRef.current.srcObject = ls
-      void localGridVideoRef.current.play().catch(() => {})
+    if (localPipRef.current && !screenSharingRef.current) {
+      localPipRef.current.srcObject = ls
+      void localPipRef.current.play().catch(() => {})
     }
     if (localStripRef.current) {
       localStripRef.current.srcObject = ls
@@ -1445,7 +1427,7 @@ export function MeetingPage() {
     if (existing) return existing
 
     const pendingIce: RTCIceCandidateInit[] = []
-    const pc = new RTCPeerConnection(rtcConfiguration(iceServersRef.current))
+    const pc = new RTCPeerConnection({ iceServers: iceServersRef.current })
 
     if (localStreamRef.current) {
       if (screenSharingRef.current && screenStreamRef.current) {
@@ -1509,6 +1491,7 @@ export function MeetingPage() {
       } else if (cs === 'connected') {
         const existing = iceRestartTimersRef.current.get(remoteId)
         if (existing) { clearTimeout(existing); iceRestartTimersRef.current.delete(remoteId) }
+        setHasWeakNetwork(false)
         void applyBitrateCaps(pc, remoteId)
       }
     }
@@ -1522,20 +1505,10 @@ export function MeetingPage() {
     if (!opts?.omitFromCallGrid) {
       setPeerIds(prev => (prev.includes(remoteId) ? prev : [...prev, remoteId]))
     }
-    ensurePeerAdaptiveStatsLoop(remoteId)
     return state
   }
 
   function removePeer(remoteId: string) {
-    clearPeerAdaptiveStatsInterval(remoteId)
-    appliedTierByPeerRef.current.delete(remoteId)
-    upgradeGoodStreakRef.current.delete(remoteId)
-    setPeerNetworkQuality(prev => {
-      if (!(remoteId in prev)) return prev
-      const next = { ...prev }
-      delete next[remoteId]
-      return next
-    })
     const timer = iceRestartTimersRef.current.get(remoteId)
     if (timer) { clearTimeout(timer); iceRestartTimersRef.current.delete(remoteId) }
     peersRef.current.get(remoteId)?.pc.close()
@@ -1570,13 +1543,6 @@ export function MeetingPage() {
     setPeerShowVideoFallback({})
     setHandRaisedByPeerId({})
     setMyHandRaised(false)
-    setTileOrder([TILE_LOCAL])
-    for (const t of peerAdaptiveStatsIntervalsRef.current.values()) clearInterval(t)
-    peerAdaptiveStatsIntervalsRef.current.clear()
-    appliedTierByPeerRef.current.clear()
-    upgradeGoodStreakRef.current.clear()
-    lastVideoConstraintTierRef.current = 'good'
-    setPeerNetworkQuality({})
   }
 
   function getPeerVideoRef(remoteId: string) {
@@ -1604,10 +1570,8 @@ export function MeetingPage() {
   async function createAndSendOffer(remoteId: string, opts?: { omitFromCallGrid?: boolean }) {
     await ensureStream()
     const state = ensurePeerState(remoteId, opts)
-    preferVp9Vp8VideoCodecs(state.pc)
     const offer = await state.pc.createOffer()
     await state.pc.setLocalDescription(offer)
-    await finalizeLocalDescriptionWithOpus(state.pc, remoteId)
     const sdp = state.pc.localDescription?.toJSON()
     if (sdp && socketRef.current?.connected) {
       socketRef.current.emit('webrtc:offer', { to: remoteId, sdp })
@@ -1799,10 +1763,8 @@ export function MeetingPage() {
         await state.pc.setRemoteDescription(sdp as RTCSessionDescriptionInit)
         state.remoteDescriptionReady = true
         flushPendingIce(state)
-        preferVp9Vp8VideoCodecs(state.pc)
         const answer = await state.pc.createAnswer()
         await state.pc.setLocalDescription(answer)
-        await finalizeLocalDescriptionWithOpus(state.pc, from)
         const local = state.pc.localDescription?.toJSON()
         if (local && socketRef.current?.connected) {
           socketRef.current.emit('webrtc:answer', { to: from, sdp: local })
@@ -1910,7 +1872,7 @@ export function MeetingPage() {
     socket.on('camera:offer', async ({ from, sdp }: { from: string; sdp: RTCSessionDescriptionInit }) => {
       // Offer from a camera source — close any stale PC, create recvonly PC, answer it
       remoteCameraPcsRef.current.get(from)?.close()
-      const pc = new RTCPeerConnection(rtcConfiguration(iceServersRef.current))
+      const pc = new RTCPeerConnection({ iceServers: iceServersRef.current })
       remoteCameraPcsRef.current.set(from, pc)
       // Prepare a sendonly audio m-line so we can later route meeting audio to the device without renegotiation.
       try {
@@ -2718,7 +2680,7 @@ export function MeetingPage() {
     setCamEnabled(false)
     setPreviewCamOff(true)
     setPipCamOff(true)
-    setPeerNetworkQuality({})
+    setHasWeakNetwork(false)
     setCallView('lobby')
     setHostLiveCollabRequests([])
     setHostMutedPeerIds({})
@@ -3206,182 +3168,56 @@ export function MeetingPage() {
     }
   }
 
-  function getWorstAppliedTier(): MeetingQualityTier {
-    let w: MeetingQualityTier = 'good'
-    for (const t of appliedTierByPeerRef.current.values()) {
-      if (tierRank(t) < tierRank(w)) w = t
-    }
-    return w
-  }
-
-  async function applyVideoTrackConstraintsForTier(worst: MeetingQualityTier) {
-    if (screenSharingRef.current) return
-    if (lastVideoConstraintTierRef.current === worst) return
-    const track = localStreamRef.current?.getVideoTracks()[0]
-    if (!track || track.readyState !== 'live') return
-    const constraints: MediaTrackConstraints =
-      worst === 'good'
-        ? { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30, max: 30 } }
-        : worst === 'fair'
-          ? { width: { ideal: 640, max: 854 }, height: { ideal: 480, max: 480 }, frameRate: { ideal: 15, max: 15 } }
-          : { width: { ideal: 320, max: 426 }, height: { ideal: 240, max: 240 }, frameRate: { ideal: 10, max: 10 } }
-    try {
-      await track.applyConstraints(constraints)
-      lastVideoConstraintTierRef.current = worst
-    } catch {
-      /* ignore */
-    }
-  }
-
-  async function applySendersBitrateForPeer(
-    remoteId: string,
-    tier: MeetingQualityTier,
-    globalWorst: MeetingQualityTier,
-  ) {
-    const state = peersRef.current.get(remoteId)
-    if (!state) return
-    const publicViewer = liveViewerPeerIdsRef.current.has(remoteId)
-    const videoBps = publicViewer ? 320_000 : TIER_VIDEO_BPS[tier]
-    let audioBps = publicViewer ? 40_000 : TIER_AUDIO_BPS[tier]
-    if (tier === 'poor' && globalWorst !== 'poor') {
-      audioBps = Math.max(MIN_AUDIO_BPS, TIER_AUDIO_BPS.fair)
-    }
-    audioBps = Math.max(MIN_AUDIO_BPS, audioBps)
-
-    for (const sender of state.pc.getSenders()) {
-      if (!sender.track) continue
-      const params = sender.getParameters()
-      if (!params.encodings || params.encodings.length === 0) params.encodings = [{}]
-      const maxBr =
-        sender.track.kind === 'video'
-          ? videoBps
-          : sender.track.kind === 'audio'
-            ? audioBps
-            : undefined
-      if (maxBr === undefined) continue
-      for (const enc of params.encodings) enc.maxBitrate = maxBr
+  async function checkNetworkStats() {
+    for (const [, { pc }] of peersRef.current.entries()) {
+      if (pc.connectionState !== 'connected') continue
       try {
-        await sender.setParameters(params)
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-
-  async function applyAllPeerQualityFromTiers() {
-    const worst = getWorstAppliedTier()
-    await applyVideoTrackConstraintsForTier(worst)
-    for (const [remoteId] of peersRef.current.entries()) {
-      const tier = appliedTierByPeerRef.current.get(remoteId) ?? 'good'
-      await applySendersBitrateForPeer(remoteId, tier, worst)
-    }
-  }
-
-  async function finalizeLocalDescriptionWithOpus(pc: RTCPeerConnection, remoteId: string) {
-    const loc = pc.localDescription
-    if (!loc?.sdp) return
-    const tier = appliedTierByPeerRef.current.get(remoteId) ?? 'good'
-    const maxAv = opusMaxAverageBitrateForTier(tier)
-    const m = mungeOpusMaxAverageBitrate(loc.sdp, maxAv)
-    if (m !== loc.sdp) {
-      await pc.setLocalDescription({ type: loc.type, sdp: m })
-    }
-  }
-
-  function clearPeerAdaptiveStatsInterval(remoteId: string) {
-    const id = peerAdaptiveStatsIntervalsRef.current.get(remoteId)
-    if (id) clearInterval(id)
-    peerAdaptiveStatsIntervalsRef.current.delete(remoteId)
-  }
-
-  function ensurePeerAdaptiveStatsLoop(remoteId: string) {
-    if (peerAdaptiveStatsIntervalsRef.current.has(remoteId)) return
-    const handle = setInterval(() => {
-      void runPeerAdaptiveStats(remoteId)
-    }, 4000)
-    peerAdaptiveStatsIntervalsRef.current.set(remoteId, handle)
-  }
-
-  async function runPeerAdaptiveStats(remoteId: string) {
-    const state = peersRef.current.get(remoteId)
-    if (!state || state.pc.connectionState !== 'connected') return
-
-    let stats: RTCStatsReport
-    try {
-      stats = await state.pc.getStats()
-    } catch {
-      return
-    }
-
-    const { availableOutgoingBitrate, packetLossPercent, rttMs } = parseMeetingConnectionStats(stats)
-    const rawTier = classifyMeetingQualityTier(availableOutgoingBitrate, packetLossPercent, rttMs)
-
-    setPeerNetworkQuality(prev => {
-      if (prev[remoteId] === rawTier) return prev
-      return { ...prev, [remoteId]: rawTier }
-    })
-
-    if (availableOutgoingBitrate !== null && availableOutgoingBitrate < 50_000 && !autoVideoPausedRef.current) {
-      autoVideoPausedRef.current = true
-      showToast('Weak network — video paused to keep audio')
-      for (const [, peer] of peersRef.current.entries()) {
-        void setVideoSendersActive(peer.pc, false)
-      }
-    } else if (availableOutgoingBitrate !== null && availableOutgoingBitrate > 300_000 && autoVideoPausedRef.current) {
-      autoVideoPausedRef.current = false
-      showToast('Network improved — video resumed')
-      for (const [, peer] of peersRef.current.entries()) {
-        void setVideoSendersActive(peer.pc, true)
-      }
-    }
-
-    const applied = appliedTierByPeerRef.current.get(remoteId) ?? 'good'
-
-    if (tierRank(rawTier) < tierRank(applied)) {
-      upgradeGoodStreakRef.current.delete(remoteId)
-      appliedTierByPeerRef.current.set(remoteId, rawTier)
-      await applyAllPeerQualityFromTiers()
-    } else if (tierRank(rawTier) > tierRank(applied)) {
-      const start = upgradeGoodStreakRef.current.get(remoteId)
-      if (start === undefined) {
-        upgradeGoodStreakRef.current.set(remoteId, Date.now())
-      } else if (Date.now() - start >= 10_000) {
-        upgradeGoodStreakRef.current.delete(remoteId)
-        appliedTierByPeerRef.current.set(remoteId, rawTier)
-        await applyAllPeerQualityFromTiers()
-      }
-    } else {
-      upgradeGoodStreakRef.current.delete(remoteId)
+        const stats = await pc.getStats()
+        for (const report of stats.values()) {
+          if (report.type !== 'candidate-pair') continue
+          const pair = report as { nominated?: boolean; availableOutgoingBitrate?: number }
+          if (!pair.nominated || pair.availableOutgoingBitrate === undefined) continue
+          const avail = pair.availableOutgoingBitrate
+          if (avail < 80_000 && !autoVideoPausedRef.current) {
+            autoVideoPausedRef.current = true
+            setHasWeakNetwork(true)
+            showToast('Weak network — video paused to keep audio')
+            for (const [, peer] of peersRef.current.entries()) {
+              void setVideoSendersActive(peer.pc, false)
+            }
+          } else if (avail > 300_000 && autoVideoPausedRef.current) {
+            autoVideoPausedRef.current = false
+            showToast('Network improved — video resumed')
+            for (const [, peer] of peersRef.current.entries()) {
+              void setVideoSendersActive(peer.pc, true)
+            }
+          }
+          return // only need one nominated pair
+        }
+      } catch { /* ignore */ }
+      return // checked one connected peer, that's enough
     }
   }
 
   function startNetworkStats() {
-    for (const t of peerAdaptiveStatsIntervalsRef.current.values()) clearInterval(t)
-    peerAdaptiveStatsIntervalsRef.current.clear()
+    if (statsIntervalRef.current) clearInterval(statsIntervalRef.current)
     autoVideoPausedRef.current = false
-    for (const id of peersRef.current.keys()) {
-      ensurePeerAdaptiveStatsLoop(id)
-    }
+    statsIntervalRef.current = setInterval(() => { void checkNetworkStats() }, 5000)
   }
 
   function stopNetworkStats() {
-    for (const t of peerAdaptiveStatsIntervalsRef.current.values()) clearInterval(t)
-    peerAdaptiveStatsIntervalsRef.current.clear()
+    if (statsIntervalRef.current) { clearInterval(statsIntervalRef.current); statsIntervalRef.current = null }
     autoVideoPausedRef.current = false
-    upgradeGoodStreakRef.current.clear()
-    appliedTierByPeerRef.current.clear()
-    lastVideoConstraintTierRef.current = 'good'
   }
 
   async function iceRestart(remoteId: string) {
     const state = peersRef.current.get(remoteId)
     if (!state || !socketRef.current?.connected) return
+    setHasWeakNetwork(true)
     try {
       appendLog('ice restart →', shortId(remoteId))
-      preferVp9Vp8VideoCodecs(state.pc)
       const offer = await state.pc.createOffer({ iceRestart: true })
       await state.pc.setLocalDescription(offer)
-      await finalizeLocalDescriptionWithOpus(state.pc, remoteId)
       const sdp = state.pc.localDescription?.toJSON()
       if (sdp) socketRef.current.emit('webrtc:offer', { to: remoteId, sdp })
     } catch (e) {
@@ -3390,19 +3226,31 @@ export function MeetingPage() {
   }
 
   async function applyBitrateCaps(pc: RTCPeerConnection, remoteId?: string) {
-    void pc
-    void remoteId
-    await applyAllPeerQualityFromTiers()
+    const publicViewer =
+      remoteId !== undefined && liveViewerPeerIdsRef.current.has(remoteId)
+    for (const sender of pc.getSenders()) {
+      if (!sender.track) continue
+      const params = sender.getParameters()
+      if (!params.encodings || params.encodings.length === 0) params.encodings = [{}]
+      const maxBitrate =
+        sender.track.kind === 'video'
+          ? publicViewer
+            ? 320_000
+            : 500_000
+          : publicViewer
+            ? 40_000
+            : 48_000
+      for (const enc of params.encodings) enc.maxBitrate = maxBitrate
+      try { await sender.setParameters(params) } catch { /* browser may not support */ }
+    }
   }
 
   async function renegotiate(remoteId: string) {
     const state = peersRef.current.get(remoteId)
     if (!state || !socketRef.current?.connected) return
     try {
-      preferVp9Vp8VideoCodecs(state.pc)
       const offer = await state.pc.createOffer()
       await state.pc.setLocalDescription(offer)
-      await finalizeLocalDescriptionWithOpus(state.pc, remoteId)
       const sdp = state.pc.localDescription?.toJSON()
       if (sdp) socketRef.current.emit('webrtc:offer', { to: remoteId, sdp })
     } catch (e) {
@@ -3424,12 +3272,11 @@ export function MeetingPage() {
         void renegotiate(remoteId)
       }
     }
-    if (localGridVideoRef.current && localStreamRef.current) {
-      localGridVideoRef.current.srcObject = localStreamRef.current
+    if (localPipRef.current && localStreamRef.current) {
+      localPipRef.current.srcObject = localStreamRef.current
     }
     setPipCamOff(!cameraTrack)
     setScreenSharing(false)
-    void applyAllPeerQualityFromTiers()
     if (!opts?.silent) {
       playMeetingNotificationSound('screenShareEnd')
       showToast('Screen sharing stopped')
@@ -3461,10 +3308,10 @@ export function MeetingPage() {
           void renegotiate(remoteId)
         }
       }
-      if (localGridVideoRef.current) {
+      if (localPipRef.current) {
         const pipStream = new MediaStream([screenTrack])
         for (const t of (localStreamRef.current?.getAudioTracks() ?? [])) pipStream.addTrack(t)
-        localGridVideoRef.current.srcObject = pipStream
+        localPipRef.current.srcObject = pipStream
       }
       setScreenSharing(true)
       playMeetingNotificationSound('screenShare')
@@ -3618,29 +3465,7 @@ export function MeetingPage() {
     return peerShowVideoFallback[peerId] !== false
   }
 
-  function swapTileOrder(a: string, b: string) {
-    setTileOrder(prev => {
-      const ia = prev.indexOf(a)
-      const ib = prev.indexOf(b)
-      if (ia < 0 || ib < 0 || ia === ib) return prev
-      const next = [...prev]
-      ;[next[ia], next[ib]] = [next[ib], next[ia]]
-      return next
-    })
-  }
-
-  function moveTileInOrder(tileId: string, delta: -1 | 1) {
-    setTileOrder(prev => {
-      const i = prev.indexOf(tileId)
-      if (i < 0) return prev
-      const j = i + delta
-      if (j < 0 || j >= prev.length) return prev
-      const next = [...prev]
-      ;[next[i], next[j]] = [next[j], next[i]]
-      return next
-    })
-  }
-
+  const isSoloInCall = peerIds.length === 0
   const remotePresenterId = peerIds.find(id => screenSharingPeers.has(id)) ?? null
   const presenterIsLocal = !remotePresenterId && screenSharing
   const presenterMode = Boolean(remotePresenterId || presenterIsLocal)
@@ -3660,24 +3485,14 @@ export function MeetingPage() {
     .map(([peerId]) => peerId)
   const raisedHandCount = raisedHandPeerIds.length
 
-  const meetingNetworkBannerSeverity = useMemo((): MeetingQualityTier | 'none' => {
-    if (peerIds.length === 0) return 'none'
-    let worst: MeetingQualityTier = 'good'
-    for (const id of peerIds) {
-      const q = peerNetworkQuality[id] ?? 'good'
-      if (tierRank(q) < tierRank(worst)) worst = q
-    }
-    return worst
-  }, [peerIds, peerNetworkQuality])
-
-  const gridTileCount = tileOrder.length
   const gridStyle: React.CSSProperties =
-    gridTileCount <= 1 ? { gridTemplateColumns: '1fr', gridTemplateRows: '1fr' } :
-    gridTileCount === 2 ? { gridTemplateColumns: 'repeat(2,1fr)', gridTemplateRows: '1fr' } :
-    gridTileCount <= 4 ? { gridTemplateColumns: 'repeat(2,1fr)', gridTemplateRows: 'repeat(2,1fr)' } :
-    gridTileCount <= 6 ? { gridTemplateColumns: 'repeat(3,1fr)', gridTemplateRows: 'repeat(2,1fr)' } :
-    gridTileCount <= 9 ? { gridTemplateColumns: 'repeat(3,1fr)', gridTemplateRows: 'repeat(3,1fr)' } :
-    { gridTemplateColumns: 'repeat(4,1fr)', gridTemplateRows: `repeat(${Math.ceil(gridTileCount / 4)},1fr)` }
+    peerIds.length === 0 ? {} :
+    peerIds.length === 1 ? { gridTemplateColumns: '1fr', gridTemplateRows: '1fr' } :
+    peerIds.length === 2 ? { gridTemplateColumns: 'repeat(2,1fr)', gridTemplateRows: '1fr' } :
+    peerIds.length <= 4 ? { gridTemplateColumns: 'repeat(2,1fr)', gridTemplateRows: 'repeat(2,1fr)' } :
+    peerIds.length <= 6 ? { gridTemplateColumns: 'repeat(3,1fr)', gridTemplateRows: 'repeat(2,1fr)' } :
+    peerIds.length <= 9 ? { gridTemplateColumns: 'repeat(3,1fr)', gridTemplateRows: 'repeat(3,1fr)' } :
+    { gridTemplateColumns: 'repeat(4,1fr)', gridTemplateRows: `repeat(${Math.ceil(peerIds.length / 4)},1fr)` }
 
   const stripTileCount = stripPeerIds.length + (presenterIsLocal ? 0 : 1)
   const stripGridStyle: React.CSSProperties =
@@ -3922,201 +3737,58 @@ export function MeetingPage() {
           {/* Video grid — regular mode */}
           {!presenterMode && (
             <div className="absolute inset-0 grid gap-1.5 bg-[#111]" style={gridStyle}>
-              {tileOrder.map((tileId, tileIndex) => {
-                if (tileId === TILE_LOCAL) {
-                  return (
-                    <div
-                      key={TILE_LOCAL}
-                      draggable
-                      onDragStart={e => {
-                        e.dataTransfer.setData('text/plain', TILE_LOCAL)
-                        e.dataTransfer.effectAllowed = 'move'
-                      }}
-                      onDragOver={e => {
-                        e.preventDefault()
-                        e.dataTransfer.dropEffect = 'move'
-                      }}
-                      onDrop={e => {
-                        e.preventDefault()
-                        const from = e.dataTransfer.getData('text/plain')
-                        if (from && from !== TILE_LOCAL) swapTileOrder(from, TILE_LOCAL)
-                      }}
-                      className="group relative min-h-0 min-w-0 cursor-grab overflow-hidden rounded-[10px] bg-[#2d2e30] active:cursor-grabbing"
-                    >
-                      <div className="absolute top-2 left-2 z-4 flex flex-col gap-0.5 rounded-md border border-white/10 bg-black/45 p-0.5 opacity-100 shadow sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100">
-                        <button
-                          type="button"
-                          className="rounded px-1.5 py-0.5 text-[11px] font-semibold text-white/90 hover:bg-white/15 disabled:opacity-30"
-                          disabled={tileIndex <= 0}
-                          onClick={() => moveTileInOrder(TILE_LOCAL, -1)}
-                          aria-label="Move tile earlier"
-                          title="Move earlier"
-                        >
-                          ↑
-                        </button>
-                        <button
-                          type="button"
-                          className="rounded px-1.5 py-0.5 text-[11px] font-semibold text-white/90 hover:bg-white/15 disabled:opacity-30"
-                          disabled={tileIndex >= tileOrder.length - 1}
-                          onClick={() => moveTileInOrder(TILE_LOCAL, 1)}
-                          aria-label="Move tile later"
-                          title="Move later"
-                        >
-                          ↓
-                        </button>
-                      </div>
-                      <video
-                        ref={localGridVideoRef}
-                        playsInline
-                        autoPlay
-                        muted
-                        draggable={false}
-                        style={{
-                          width: '100%',
-                          height: '100%',
-                          objectFit: 'cover',
-                          display: 'block',
-                          transform: screenSharing ? 'none' : 'scaleX(-1)',
-                        }}
-                      />
-                      {pipCamOff && (
-                        <VideoOffParticipantCard
-                          name={
-                            participantRoster[callLocalSocketId ?? '']?.userName
-                            || getJwtProfile(getToken() ?? '').name
-                            || 'You'
-                          }
-                          email={rosterEntryEmail(callLocalSocketId ?? '')}
-                        />
-                      )}
-                      {callLocalSocketId && handRaisedByPeerId[callLocalSocketId] && (
-                        <div className="absolute top-2 right-2 z-3 flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
-                          ✋
-                        </div>
-                      )}
-                      {peerIds.length === 0 && (
-                        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/35 text-center text-sm text-white/85">
-                          <div className="flex h-14 w-14 items-center justify-center rounded-full bg-[#2d2e30]/90">
-                            <svg viewBox="0 0 24 24" fill="currentColor" width="28" height="28" className="opacity-80">
-                              <path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z" />
-                            </svg>
-                          </div>
-                          <p className="max-w-56 px-2">Waiting for others to join&hellip;</p>
-                        </div>
-                      )}
-                      <div className="absolute bottom-0 left-0 right-0 z-2 flex items-center justify-between bg-linear-to-t from-black/65 to-transparent px-2.5 py-1.5 text-xs text-white">
-                        <span>You</span>
-                        {!micEnabled && (
-                          <svg viewBox="0 0 24 24" fill="#ea4335" width="12" height="12">
-                            <path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z" />
-                          </svg>
-                        )}
-                      </div>
-                    </div>
-                  )
-                }
-                const id = tileId
-                return (
-                  <div
-                    key={id}
-                    draggable
-                    onDragStart={e => {
-                      e.dataTransfer.setData('text/plain', id)
-                      e.dataTransfer.effectAllowed = 'move'
-                    }}
-                    onDragOver={e => {
-                      e.preventDefault()
-                      e.dataTransfer.dropEffect = 'move'
-                    }}
-                    onDrop={e => {
-                      e.preventDefault()
-                      const from = e.dataTransfer.getData('text/plain')
-                      if (from && from !== id) swapTileOrder(from, id)
-                    }}
-                    className="group relative min-h-0 min-w-0 cursor-grab overflow-hidden rounded-[10px] bg-[#2d2e30] active:cursor-grabbing"
-                  >
-                    <div className="absolute top-2 left-2 z-4 flex flex-col gap-0.5 rounded-md border border-white/10 bg-black/45 p-0.5 opacity-100 shadow sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100">
-                      <button
-                        type="button"
-                        className="rounded px-1.5 py-0.5 text-[11px] font-semibold text-white/90 hover:bg-white/15 disabled:opacity-30"
-                        disabled={tileIndex <= 0}
-                        onClick={() => moveTileInOrder(id, -1)}
-                        aria-label="Move tile earlier"
-                        title="Move earlier"
-                      >
-                        ↑
-                      </button>
-                      <button
-                        type="button"
-                        className="rounded px-1.5 py-0.5 text-[11px] font-semibold text-white/90 hover:bg-white/15 disabled:opacity-30"
-                        disabled={tileIndex >= tileOrder.length - 1}
-                        onClick={() => moveTileInOrder(id, 1)}
-                        aria-label="Move tile later"
-                        title="Move later"
-                      >
-                        ↓
-                      </button>
-                    </div>
-                    <video
-                      ref={getPeerVideoRef(id)}
-                      playsInline
-                      autoPlay
-                      draggable={false}
-                      style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: screenSharingPeers.has(id) ? 'none' : 'scaleX(-1)' }}
-                    />
-                    {showPeerVideoFallbackForPeer(id) && (
-                      <VideoOffParticipantCard name={rosterLabel(id)} email={rosterEntryEmail(id)} />
-                    )}
-                    {handRaisedByPeerId[id] && (
-                      <div className="absolute top-2 right-2 z-3 flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
-                        ✋
-                      </div>
-                    )}
-                    <div className="absolute bottom-2.5 left-3 z-2 flex max-w-[calc(100%-16px)] items-center gap-1.5 truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">
-                      <span
-                        className={cx(
-                          'h-2 w-2 shrink-0 rounded-full',
-                          (peerNetworkQuality[id] ?? 'good') === 'poor' && 'bg-red-500',
-                          (peerNetworkQuality[id] ?? 'good') === 'fair' && 'bg-amber-400',
-                          (peerNetworkQuality[id] ?? 'good') === 'good' && 'bg-emerald-400',
-                        )}
-                        title={
-                          (peerNetworkQuality[id] ?? 'good') === 'good'
-                            ? 'Connection good'
-                            : (peerNetworkQuality[id] ?? 'good') === 'fair'
-                              ? 'Limited bandwidth'
-                              : 'Poor connection'
-                        }
-                        aria-hidden
-                      />
-                      <span className="min-w-0 truncate">{rosterLabel(id)}</span>
-                    </div>
-                    {screenSharingPeers.has(id) && !controllingPeer && !controlledBy && (
-                      <button
-                        type="button"
-                        className="absolute bottom-2.5 left-1/2 z-10 flex -translate-x-1/2 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-full border border-white/20 bg-[#111]/75 px-3.5 py-1.5 text-xs font-semibold text-white opacity-0 backdrop-blur-sm transition-[opacity,background] hover:border-sky-400/40 hover:bg-blue-600/85 group-hover:opacity-100"
-                        onClick={() => requestControl(id)}
-                        title={companionAvailable ? 'Request control' : 'Requires Bandr Companion app'}
-                      >
-                        <RemoteConnectionIcon size={13} />
-                        {companionAvailable ? 'Request Control' : 'Needs Companion'}
-                      </button>
-                    )}
-                    {controllingPeer === id && (
-                      <div
-                        className="absolute inset-0 z-10 cursor-crosshair outline-3 -outline-offset-[3px] outline-blue-600/70 focus:outline-blue-500"
-                        onMouseMove={e => handleControlMouseMove(e, id)}
-                        onClick={e => handleControlClick(e, id)}
-                        onDoubleClick={e => handleControlDblClick(e, id)}
-                        onContextMenu={e => { e.preventDefault(); handleControlClick(e, id) }}
-                        onWheel={e => handleControlScroll(e, id)}
-                        onKeyDown={e => handleControlKey(e, id)}
-                        tabIndex={0}
-                      />
-                    )}
+              {peerIds.length === 0 && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3.5 text-sm text-[#9aa0a6]">
+                  <div className="flex h-16 w-16 items-center justify-center rounded-full bg-[#2d2e30]">
+                    <svg viewBox="0 0 24 24" fill="#9aa0a6" width="32" height="32">
+                      <path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z" />
+                    </svg>
                   </div>
-                )
-              })}
+                  <p>Waiting for others to join&hellip;</p>
+                </div>
+              )}
+              {peerIds.map(id => (
+                <div key={id} className="group relative min-h-0 min-w-0 overflow-hidden rounded-[10px] bg-[#2d2e30]">
+                  <video
+                    ref={getPeerVideoRef(id)}
+                    playsInline
+                    autoPlay
+                    style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: screenSharingPeers.has(id) ? 'none' : 'scaleX(-1)' }}
+                  />
+                  {showPeerVideoFallbackForPeer(id) && (
+                    <VideoOffParticipantCard name={rosterLabel(id)} email={rosterEntryEmail(id)} />
+                  )}
+                  {handRaisedByPeerId[id] && (
+                    <div className="absolute top-2 right-2 z-[3] flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
+                      ✋
+                    </div>
+                  )}
+                  <div className="absolute bottom-2.5 left-3 z-2 max-w-[calc(100%-16px)] truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">{rosterLabel(id)}</div>
+                  {screenSharingPeers.has(id) && !controllingPeer && !controlledBy && (
+                    <button
+                      type="button"
+                      className="absolute bottom-2.5 left-1/2 z-10 flex -translate-x-1/2 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-full border border-white/20 bg-[#111]/75 px-3.5 py-1.5 text-xs font-semibold text-white opacity-0 backdrop-blur-sm transition-[opacity,background] hover:border-sky-400/40 hover:bg-blue-600/85 group-hover:opacity-100"
+                      onClick={() => requestControl(id)}
+                      title={companionAvailable ? 'Request control' : 'Requires Bandr Companion app'}
+                    >
+                      <RemoteConnectionIcon size={13} />
+                      {companionAvailable ? 'Request Control' : 'Needs Companion'}
+                    </button>
+                  )}
+                  {controllingPeer === id && (
+                    <div
+                      className="absolute inset-0 z-10 cursor-crosshair outline-3 -outline-offset-[3px] outline-blue-600/70 focus:outline-blue-500"
+                      onMouseMove={e => handleControlMouseMove(e, id)}
+                      onClick={e => handleControlClick(e, id)}
+                      onDoubleClick={e => handleControlDblClick(e, id)}
+                      onContextMenu={e => { e.preventDefault(); handleControlClick(e, id) }}
+                      onWheel={e => handleControlScroll(e, id)}
+                      onKeyDown={e => handleControlKey(e, id)}
+                      tabIndex={0}
+                    />
+                  )}
+                </div>
+              ))}
             </div>
           )}
 
@@ -4140,7 +3812,7 @@ export function MeetingPage() {
                       />
                       <div className="absolute bottom-2.5 left-3 max-w-[calc(100%-16px)] truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">{rosterLabel(remotePresenterId)} · Presenting</div>
                       {handRaisedByPeerId[remotePresenterId] && (
-                        <div className="absolute top-2 right-2 z-3 flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
+                        <div className="absolute top-2 right-2 z-[3] flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
                           ✋
                         </div>
                       )}
@@ -4173,7 +3845,7 @@ export function MeetingPage() {
                       <video ref={localPresenterRef} playsInline autoPlay muted style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block', background: '#000' }} />
                       <div className="absolute bottom-2.5 left-3 rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">You · Presenting</div>
                       {callLocalSocketId && handRaisedByPeerId[callLocalSocketId] && (
-                        <div className="absolute top-2 right-2 z-3 flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
+                        <div className="absolute top-2 right-2 z-[3] flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
                           ✋
                         </div>
                       )}
@@ -4190,7 +3862,7 @@ export function MeetingPage() {
                         <video ref={localStripRef} playsInline autoPlay muted style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: 'scaleX(-1)' }} />
                         <div className="absolute bottom-2.5 left-3 z-2 rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">You</div>
                         {callLocalSocketId && handRaisedByPeerId[callLocalSocketId] && (
-                          <div className="absolute top-2 right-2 z-3 flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
+                          <div className="absolute top-2 right-2 z-[3] flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
                             ✋
                           </div>
                         )}
@@ -4223,29 +3895,11 @@ export function MeetingPage() {
                           />
                         )}
                         {handRaisedByPeerId[id] && (
-                          <div className="absolute top-2 right-2 z-3 flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
+                          <div className="absolute top-2 right-2 z-[3] flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
                             ✋
                           </div>
                         )}
-                        <div className="absolute bottom-2.5 left-3 z-2 flex max-w-[calc(100%-16px)] items-center gap-1.5 truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">
-                          <span
-                            className={cx(
-                              'h-2 w-2 shrink-0 rounded-full',
-                              (peerNetworkQuality[id] ?? 'good') === 'poor' && 'bg-red-500',
-                              (peerNetworkQuality[id] ?? 'good') === 'fair' && 'bg-amber-400',
-                              (peerNetworkQuality[id] ?? 'good') === 'good' && 'bg-emerald-400',
-                            )}
-                            title={
-                              (peerNetworkQuality[id] ?? 'good') === 'good'
-                                ? 'Connection good'
-                                : (peerNetworkQuality[id] ?? 'good') === 'fair'
-                                  ? 'Limited bandwidth'
-                                  : 'Poor connection'
-                            }
-                            aria-hidden
-                          />
-                          <span className="min-w-0 truncate">{rosterLabel(id)}</span>
-                        </div>
+                        <div className="absolute bottom-2.5 left-3 z-2 max-w-[calc(100%-16px)] truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">{rosterLabel(id)}</div>
                       </div>
                     ))}
                   </div>
@@ -4276,6 +3930,42 @@ export function MeetingPage() {
             </div>
           )}
 
+          {/* Local PiP */}
+          <div
+            className={cx(
+              'z-15 overflow-hidden rounded-xl border border-white/12 bg-[#2d2e30] shadow-2xl',
+              presenterMode && 'hidden',
+              isSoloInCall
+                ? 'absolute top-14 right-2.5 bottom-[104px] left-2.5 sm:top-[62px] sm:right-6 sm:bottom-[108px] sm:left-6'
+                : 'absolute right-2.5 bottom-[88px] aspect-video w-[min(168px,40vw)] sm:bottom-24 sm:right-4 sm:w-[196px]',
+            )}
+          >
+            <video ref={localPipRef} playsInline autoPlay muted className={screenSharing ? 'block h-full w-full object-cover' : 'block h-full w-full -scale-x-100 object-cover'} />
+            {pipCamOff && (
+              <VideoOffParticipantCard
+                compact
+                name={
+                  participantRoster[callLocalSocketId ?? '']?.userName
+                  || getJwtProfile(getToken() ?? '').name
+                  || 'You'
+                }
+                email={rosterEntryEmail(callLocalSocketId ?? '')}
+              />
+            )}
+            {callLocalSocketId && handRaisedByPeerId[callLocalSocketId] && (
+              <div className="absolute top-1.5 right-1.5 z-[3] flex h-7 w-7 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-base shadow-lg" title="Raised hand">
+                ✋
+              </div>
+            )}
+            <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between bg-linear-to-t from-black/65 to-transparent px-2.5 py-1.5 text-xs text-white">
+              <span>You</span>
+              {!micEnabled && (
+                <svg viewBox="0 0 24 24" fill="#ea4335" width="12" height="12">
+                  <path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z" />
+                </svg>
+              )}
+            </div>
+          </div>
           </div>
 
           {/* Top bar */}
@@ -4474,14 +4164,9 @@ export function MeetingPage() {
                   ✋ {raisedHandCount}
                 </span>
               )}
-              {meetingNetworkBannerSeverity === 'poor' && (
-                <span className="rounded-full bg-red-600/90 px-2.5 py-0.5 text-[11px] font-semibold text-white" title="High packet loss or very low bandwidth on at least one link">
-                  Weak network
-                </span>
-              )}
-              {meetingNetworkBannerSeverity === 'fair' && (
-                <span className="rounded-full bg-amber-500/85 px-2.5 py-0.5 text-[11px] font-semibold text-white" title="Elevated loss or limited bandwidth">
-                  Limited bandwidth
+              {hasWeakNetwork && (
+                <span className="rounded-full bg-red-500/85 px-2.5 py-0.5 text-[11px] text-white animate-pulse" title="Network issues detected — attempting to reconnect">
+                  Reconnecting…
                 </span>
               )}
               <span className="rounded-full bg-[#3c4043]/85 px-2.5 py-0.5 font-mono text-[11px] text-white">{activeMeetingCode}</span>
@@ -5470,7 +5155,7 @@ export function MeetingPage() {
                 'flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border-0 text-xl transition active:scale-95',
                 myHandRaised ? 'bg-amber-500 hover:bg-amber-400' : 'bg-[#3c4043] hover:bg-[#4a4d50]',
               )}
-              title={myHandRaised ? 'Lower hand' : 'Raise hand'}
+              title={myHandRaised ? 'Lower hand' : 'Raise hand (or show open palm to camera)'}
               aria-pressed={myHandRaised}
             >
               ✋
