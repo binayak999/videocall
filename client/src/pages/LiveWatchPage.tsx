@@ -3,7 +3,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import { io, type Socket } from 'socket.io-client'
 import { errorMessage, getMeeting } from '../lib/api'
 import { getToken } from '../lib/auth'
-import { getIceServers } from '../lib/ice'
+import { getIceServers, rtcConfiguration } from '../lib/ice'
 import { MeetingVoteOverlay, type MeetingVoteChoice } from '../components/MeetingVoteOverlay'
 import { ShellBackgroundLayer } from '../components/ShellBackgroundLayer'
 import { useAuthToken } from '../lib/useAuthToken'
@@ -51,10 +51,17 @@ export function LiveWatchPage() {
   const [statusLine, setStatusLine] = useState('Connecting…')
   const [streamLive, setStreamLive] = useState<boolean | null>(null)
   const [videoMuted, setVideoMuted] = useState(true)
+  /** Host screen share should not be mirrored (same rule as in-meeting tiles). */
+  const [hostScreenSharing, setHostScreenSharing] = useState(false)
 
   const videoRef = useRef<HTMLVideoElement>(null)
   const socketRef = useRef<Socket | null>(null)
   const pcRef = useRef<RTCPeerConnection | null>(null)
+  const liveWatchPendingIceRef = useRef<RTCIceCandidateInit[]>([])
+  const liveWatchRemoteReadyRef = useRef(false)
+  const liveWatchStuckTimerRef = useRef<number | null>(null)
+  const liveWatchDiscTimerRef = useRef<number | null>(null)
+  const liveWatchLastReofferRef = useRef(0)
   const hostPeerIdRef = useRef<string | null>(null)
   const mySocketIdRef = useRef('')
   const activeVoteSessionIdRef = useRef<string | null>(null)
@@ -90,8 +97,19 @@ export function LiveWatchPage() {
   }, [])
 
   const teardownPc = useCallback(() => {
+    if (liveWatchStuckTimerRef.current != null) {
+      window.clearTimeout(liveWatchStuckTimerRef.current)
+      liveWatchStuckTimerRef.current = null
+    }
+    if (liveWatchDiscTimerRef.current != null) {
+      window.clearTimeout(liveWatchDiscTimerRef.current)
+      liveWatchDiscTimerRef.current = null
+    }
     pcRef.current?.close()
     pcRef.current = null
+    liveWatchPendingIceRef.current = []
+    liveWatchRemoteReadyRef.current = false
+    setHostScreenSharing(false)
     if (videoRef.current) videoRef.current.srcObject = null
   }, [])
 
@@ -244,9 +262,43 @@ export function LiveWatchPage() {
         })
         socketRef.current = socket
 
+        const requestLiveWatchReoffer = () => {
+          if (!socket.connected || cancelled) return
+          const now = Date.now()
+          if (now - liveWatchLastReofferRef.current < 8_000) return
+          liveWatchLastReofferRef.current = now
+          socket.emit('live:viewer-request-reoffer')
+        }
+
+        const flushLiveWatchIce = (pc: RTCPeerConnection) => {
+          const q = liveWatchPendingIceRef.current
+          liveWatchPendingIceRef.current = []
+          for (const c of q) {
+            void pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {})
+          }
+        }
+
+        const armLiveWatchStuckTimer = () => {
+          if (liveWatchStuckTimerRef.current != null) {
+            window.clearTimeout(liveWatchStuckTimerRef.current)
+          }
+          liveWatchStuckTimerRef.current = window.setTimeout(() => {
+            liveWatchStuckTimerRef.current = null
+            if (cancelled) return
+            const p = pcRef.current
+            if (!p) return
+            const iceSt = p.iceConnectionState
+            if (iceSt !== 'connected' && iceSt !== 'completed') {
+              setStatusLine('Still connecting — trying another path…')
+              requestLiveWatchReoffer()
+            }
+          }, 22_000)
+        }
+
         const ensurePc = () => {
           if (pcRef.current) return pcRef.current
-          const pc = new RTCPeerConnection({ iceServers: ice })
+          liveWatchRemoteReadyRef.current = false
+          const pc = new RTCPeerConnection(rtcConfiguration(ice))
           pc.addTransceiver('audio', { direction: 'recvonly' })
           pc.addTransceiver('video', { direction: 'recvonly' })
           pc.ontrack = ev => {
@@ -255,12 +307,57 @@ export function LiveWatchPage() {
             const s = ev.streams[0] ?? new MediaStream([ev.track])
             v.srcObject = s
             void v.play().catch(() => {})
+            if (ev.track.kind === 'video') {
+              const hint = ev.track.contentHint
+              if (hint === 'detail') setHostScreenSharing(true)
+              else if (hint === 'motion') setHostScreenSharing(false)
+            }
           }
           pc.onicecandidate = ev => {
             const hp = hostPeerIdRef.current
             if (ev.candidate && hp && socket.connected) {
               socket.emit('webrtc:ice', { to: hp, candidate: ev.candidate.toJSON() })
             }
+          }
+          pc.onconnectionstatechange = () => {
+            if (cancelled) return
+            const s = pc.connectionState
+            if (s === 'failed') {
+              setStatusLine('Network issue — retrying media…')
+              requestLiveWatchReoffer()
+            } else if (s === 'disconnected') {
+              if (liveWatchDiscTimerRef.current != null) {
+                window.clearTimeout(liveWatchDiscTimerRef.current)
+              }
+              liveWatchDiscTimerRef.current = window.setTimeout(() => {
+                liveWatchDiscTimerRef.current = null
+                if (cancelled) return
+                const p = pcRef.current
+                if (!p) return
+                if (p.connectionState === 'disconnected' || p.connectionState === 'failed') {
+                  setStatusLine('Reconnecting stream…')
+                  requestLiveWatchReoffer()
+                }
+              }, 3_500)
+            } else if (s === 'connected') {
+              if (liveWatchDiscTimerRef.current != null) {
+                window.clearTimeout(liveWatchDiscTimerRef.current)
+                liveWatchDiscTimerRef.current = null
+              }
+              setStatusLine('Connected')
+            }
+          }
+          pc.oniceconnectionstatechange = () => {
+            if (cancelled) return
+            const iceSt = pc.iceConnectionState
+            if (iceSt === 'connected' || iceSt === 'completed') {
+              if (liveWatchStuckTimerRef.current != null) {
+                window.clearTimeout(liveWatchStuckTimerRef.current)
+                liveWatchStuckTimerRef.current = null
+              }
+              return
+            }
+            if (iceSt === 'failed') requestLiveWatchReoffer()
           }
           pcRef.current = pc
           return pc
@@ -291,9 +388,18 @@ export function LiveWatchPage() {
             applyJoinPayload(a)
             const hp = typeof a.hostPeerId === 'string' ? a.hostPeerId : null
             hostPeerIdRef.current = hp
+            setHostScreenSharing(false)
             if (!hp) return
             ensurePc()
           })
+        })
+
+        socket.on('meeting:screenshare', (payload: unknown) => {
+          if (!payload || typeof payload !== 'object') return
+          const { peerId, sharing } = payload as { peerId?: unknown; sharing?: unknown }
+          if (typeof peerId !== 'string' || typeof sharing !== 'boolean') return
+          if (peerId !== hostPeerIdRef.current) return
+          setHostScreenSharing(sharing)
         })
 
         socket.on('webrtc:offer', async (msg: unknown) => {
@@ -303,15 +409,19 @@ export function LiveWatchPage() {
           if (from !== hostPeerIdRef.current) return
           const pc = ensurePc()
           try {
+            liveWatchRemoteReadyRef.current = false
             await pc.setRemoteDescription(sdp as RTCSessionDescriptionInit)
             const answer = await pc.createAnswer()
             await pc.setLocalDescription(answer)
+            liveWatchRemoteReadyRef.current = true
+            flushLiveWatchIce(pc)
+            armLiveWatchStuckTimer()
             const local = pc.localDescription?.toJSON()
             if (local && socket.connected) {
               socket.emit('webrtc:answer', { to: from, sdp: local })
             }
           } catch {
-            /* ignore */
+            liveWatchRemoteReadyRef.current = false
           }
         })
 
@@ -320,8 +430,17 @@ export function LiveWatchPage() {
           const { from, candidate } = msg as { from?: unknown; candidate?: unknown }
           if (typeof from !== 'string' || !candidate || typeof candidate !== 'object') return
           if (from !== hostPeerIdRef.current) return
+          const init = candidate as RTCIceCandidateInit
           const pc = pcRef.current
-          if (pc) await pc.addIceCandidate(new RTCIceCandidate(candidate as RTCIceCandidateInit)).catch(() => {})
+          if (!pc) {
+            liveWatchPendingIceRef.current.push(init)
+            return
+          }
+          if (!liveWatchRemoteReadyRef.current) {
+            liveWatchPendingIceRef.current.push(init)
+            return
+          }
+          await pc.addIceCandidate(new RTCIceCandidate(init)).catch(() => {})
         })
 
         socket.on('meeting:chat-rejected', (payload: unknown) => {
@@ -679,7 +798,10 @@ export function LiveWatchPage() {
               playsInline
               autoPlay
               muted={videoMuted}
-              className="absolute inset-0 z-1 h-full w-full object-cover shadow-2xl ring-1 ring-white/10 -scale-x-100"
+              className={cx(
+                'absolute inset-0 z-1 h-full w-full object-cover shadow-2xl ring-1 ring-white/10',
+                !hostScreenSharing && '-scale-x-100',
+              )}
             />
             {videoMuted && streamLive !== false && (
               <button

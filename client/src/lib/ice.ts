@@ -45,6 +45,16 @@ function apiBase(): string {
 
 let iceCache: RTCIceServer[] | null = null
 
+/** Stronger defaults for cross-network / slow links (TURN + trickle ICE ordering). */
+export function rtcConfiguration(iceServers: RTCIceServer[]): RTCConfiguration {
+  return {
+    iceServers,
+    iceCandidatePoolSize: 10,
+    bundlePolicy: 'max-bundle',
+    rtcpMuxPolicy: 'require',
+  }
+}
+
 export async function getIceServers(): Promise<RTCIceServer[]> {
   if (iceCache) return iceCache
   try {
