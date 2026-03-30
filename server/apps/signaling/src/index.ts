@@ -1125,6 +1125,19 @@ io.on("connection", (socket) => {
     });
   });
 
+  /** Viewer asks host for ICE restart / fresh offer when media is stuck (slow or asymmetric networks). */
+  socket.on("live:viewer-request-reoffer", () => {
+    const data = socket.data as MeetingSocketData;
+    if (data.role !== "live-viewer") return;
+    const room = data.meetingRoom;
+    if (room === undefined || room.length === 0) return;
+    void (async () => {
+      const hostPeerId = await getHostPeerId(room);
+      if (hostPeerId === null) return;
+      io.to(hostPeerId).emit("meeting:live-viewer-request-reoffer", { peerId: socket.id });
+    })();
+  });
+
   socket.on("meeting:live-stream", (msg: unknown) => {
     const room = socket.data.meetingRoom as string | undefined;
     if (!room) return;

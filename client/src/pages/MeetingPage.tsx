@@ -1094,7 +1094,7 @@ export function MeetingPage() {
         const existing = iceRestartTimersRef.current.get(remoteId)
         if (existing) { clearTimeout(existing); iceRestartTimersRef.current.delete(remoteId) }
         setHasWeakNetwork(false)
-        void applyBitrateCaps(pc)
+        void applyBitrateCaps(pc, remoteId)
       }
     }
 
@@ -1236,6 +1236,18 @@ export function MeetingPage() {
       liveViewerPeerIdsRef.current.add(peerId)
       void createAndSendOffer(peerId, { omitFromCallGrid: true }).catch(e =>
         appendLog('live viewer offer error', String(e)),
+      )
+    })
+    socket.on('meeting:live-viewer-request-reoffer', (payload: unknown) => {
+      if (!payload || typeof payload !== 'object') return
+      const peerId = (payload as { peerId?: unknown }).peerId
+      if (typeof peerId !== 'string') return
+      if (!isHostInCallRef.current) return
+      if (!liveViewerPeerIdsRef.current.has(peerId)) return
+      const state = peersRef.current.get(peerId)
+      if (state) void iceRestart(peerId)
+      else void createAndSendOffer(peerId, { omitFromCallGrid: true }).catch(e =>
+        appendLog('live viewer re-offer error', String(e)),
       )
     })
     socket.on('meeting:live-state', (payload: unknown) => {
@@ -2656,12 +2668,21 @@ export function MeetingPage() {
     }
   }
 
-  async function applyBitrateCaps(pc: RTCPeerConnection) {
+  async function applyBitrateCaps(pc: RTCPeerConnection, remoteId?: string) {
+    const publicViewer =
+      remoteId !== undefined && liveViewerPeerIdsRef.current.has(remoteId)
     for (const sender of pc.getSenders()) {
       if (!sender.track) continue
       const params = sender.getParameters()
       if (!params.encodings || params.encodings.length === 0) params.encodings = [{}]
-      const maxBitrate = sender.track.kind === 'video' ? 500_000 : 48_000
+      const maxBitrate =
+        sender.track.kind === 'video'
+          ? publicViewer
+            ? 320_000
+            : 500_000
+          : publicViewer
+            ? 40_000
+            : 48_000
       for (const enc of params.encodings) enc.maxBitrate = maxBitrate
       try { await sender.setParameters(params) } catch { /* browser may not support */ }
     }
