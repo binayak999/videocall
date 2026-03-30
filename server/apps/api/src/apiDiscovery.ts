@@ -145,11 +145,65 @@ export function buildApiManifest(req: Request): Record<string, unknown> {
         },
         {
           method: "GET",
+          path: "/api/meetings/:code/captions",
+          auth: "Bearer JWT",
+          description: "Host only: saved live-caption transcript lines for the meeting.",
+          responses: {
+            200: { captions: "MeetingCaptionRow[]" },
+            403: { error: "Only the meeting host can download captions" },
+            404: { error: "Meeting not found" },
+          },
+        },
+        {
+          method: "GET",
+          path: "/api/meetings/:code/polls",
+          auth: "Bearer JWT",
+          description:
+            "Host only: saved 👍/👎 polls for the meeting; anonymous polls omit per-voter list in JSON.",
+          responses: {
+            200: { polls: "MeetingPollSaved[]" },
+            403: { error: "Only the meeting host can view saved polls" },
+            404: { error: "Meeting not found" },
+          },
+        },
+        {
+          method: "GET",
           path: "/api/meetings/:code",
           auth: false,
           responses: {
             200: { meeting: "Meeting with host" },
             404: { error: "Meeting not found" },
+          },
+        },
+        {
+          method: "POST",
+          path: "/api/meetings/:code/agenda/analyze",
+          auth: "Bearer JWT",
+          description:
+            "Host only: compares agenda + transcript via AI. Prefer HUGGINGFACE_API_TOKEN (router) or OPENAI_API_KEY.",
+          body: { agenda: "string", transcript: "string" },
+          responses: {
+            200: { summary: "string", items: "AgendaCheckItem[]" },
+            403: { error: "Only the meeting host can analyze the agenda" },
+            503: { error: "AI not configured (HF token or OpenAI key)" },
+          },
+        },
+        {
+          method: "POST",
+          path: "/api/translate",
+          auth: "Bearer JWT",
+          description:
+            "Translate text (same AI credentials as agenda: HF router or OpenAI). Optional sourceLanguage hint.",
+          body: {
+            text: "string",
+            targetLanguage: "string (e.g. English (United States))",
+            sourceLanguage: "string | optional",
+          },
+          responses: {
+            200: { translated: "string" },
+            401: { error: "string" },
+            503: { error: "AI not configured" },
+            502: { error: "Translation failed" },
           },
         },
       ],
@@ -189,6 +243,7 @@ export function buildOpenApi(req: Request): Record<string, unknown> {
       { name: "Health", description: "Liveness and upstream checks" },
       { name: "Auth", description: "Register and login" },
       { name: "Meetings", description: "Create and resolve meetings by code" },
+      { name: "Translate", description: "Authenticated text translation (shared AI backend)" },
     ],
     components: {
       securitySchemes: {
@@ -398,6 +453,116 @@ export function buildOpenApi(req: Request): Record<string, unknown> {
           },
         },
       },
+      "/api/meetings/{code}/captions": {
+        get: {
+          tags: ["Meetings"],
+          summary: "List saved live captions (host only)",
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            {
+              name: "code",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+          ],
+          responses: {
+            "200": {
+              description: "OK",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    required: ["captions"],
+                    properties: {
+                      captions: {
+                        type: "array",
+                        items: {
+                          type: "object",
+                          required: ["id", "speakerUserId", "speakerName", "text", "createdAt"],
+                          properties: {
+                            id: { type: "string" },
+                            speakerUserId: { type: "string" },
+                            speakerName: { type: "string" },
+                            text: { type: "string" },
+                            createdAt: { type: "string" },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            "403": {
+              description: "Not the meeting host",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+            "404": {
+              description: "Not found",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+          },
+        },
+      },
+      "/api/meetings/{code}/polls": {
+        get: {
+          tags: ["Meetings"],
+          summary: "List saved meeting polls (host only)",
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            {
+              name: "code",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+          ],
+          responses: {
+            "200": {
+              description: "OK",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    required: ["polls"],
+                    properties: {
+                      polls: {
+                        type: "array",
+                        items: { type: "object" },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            "403": {
+              description: "Not the meeting host",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+            "404": {
+              description: "Not found",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+          },
+        },
+      },
       "/api/meetings/{code}": {
         get: {
           tags: ["Meetings"],
@@ -421,6 +586,145 @@ export function buildOpenApi(req: Request): Record<string, unknown> {
             },
             "404": {
               description: "Not found",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+          },
+        },
+      },
+      "/api/meetings/{code}/agenda/analyze": {
+        post: {
+          tags: ["Meetings"],
+          summary: "Analyze agenda vs transcript (host only, HF or OpenAI)",
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            {
+              name: "code",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["agenda", "transcript"],
+                  properties: {
+                    agenda: { type: "string" },
+                    transcript: { type: "string" },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            "200": {
+              description: "Structured checklist from model",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    required: ["summary", "items"],
+                    properties: {
+                      summary: { type: "string" },
+                      items: {
+                        type: "array",
+                        items: {
+                          type: "object",
+                          required: ["label", "met", "confidence", "reason"],
+                          properties: {
+                            label: { type: "string" },
+                            met: { type: "boolean" },
+                            confidence: {
+                              type: "string",
+                              enum: ["high", "medium", "low"],
+                            },
+                            reason: { type: "string" },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            "403": {
+              description: "Not the meeting host",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+            "503": {
+              description: "No Hugging Face or OpenAI API key configured",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+          },
+        },
+      },
+      "/api/translate": {
+        post: {
+          tags: ["Translate"],
+          summary: "Translate text (HF or OpenAI)",
+          security: [{ bearerAuth: [] }],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["text", "targetLanguage"],
+                  properties: {
+                    text: { type: "string" },
+                    targetLanguage: { type: "string" },
+                    sourceLanguage: { type: "string" },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            "200": {
+              description: "OK",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    required: ["translated"],
+                    properties: { translated: { type: "string" } },
+                  },
+                },
+              },
+            },
+            "401": {
+              description: "Unauthorized",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+            "503": {
+              description: "AI not configured",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+            "502": {
+              description: "Upstream translation error",
               content: {
                 "application/json": {
                   schema: { $ref: "#/components/schemas/Error" },

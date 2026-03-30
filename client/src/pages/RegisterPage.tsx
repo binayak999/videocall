@@ -1,11 +1,18 @@
 import { useState } from 'react'
-import { Link, Navigate, useNavigate } from 'react-router-dom'
+import { Link, Navigate, useNavigate, useSearchParams } from 'react-router-dom'
+import { ShellBackgroundLayer } from '../components/ShellBackgroundLayer'
+import { useAppTheme } from '../components/ThemeProvider'
 import { errorMessage, register } from '../lib/api'
 import { setToken } from '../lib/auth'
 import { useAuthToken } from '../lib/useAuthToken'
 
+const fieldClass =
+  'h-11 rounded-xl border border-(--nexivo-input-border) bg-(--nexivo-input-bg) px-4 text-sm text-(--nexivo-text) outline-none transition placeholder:text-(--nexivo-placeholder) focus:border-[#f59e0b]/50'
+
 export function RegisterPage() {
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const theme = useAppTheme()
   const authed = useAuthToken() !== null
   const [name, setName] = useState('')
   const [email, setEmail] = useState('')
@@ -22,7 +29,12 @@ export function RegisterPage() {
     try {
       const r = await register({ name: name.trim(), email: email.trim(), password })
       setToken(r.token)
-      navigate('/', { replace: true })
+      const redirect = searchParams.get('redirect')
+      if (redirect && redirect.startsWith('/') && !redirect.startsWith('//')) {
+        navigate(redirect, { replace: true })
+      } else {
+        navigate('/', { replace: true })
+      }
     } catch (e2: unknown) {
       setErr(errorMessage(e2))
     } finally {
@@ -31,62 +43,68 @@ export function RegisterPage() {
   }
 
   return (
-    <div className="fixed inset-0 overflow-hidden" style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+    <div className="fixed inset-0 flex flex-col overflow-x-hidden overflow-y-auto" style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+      <ShellBackgroundLayer />
 
-      {/* background image */}
-      <img
-        src="/image.png"
-        alt=""
-        aria-hidden
-        draggable={false}
-        className="pointer-events-none absolute inset-0 h-full w-full select-none object-cover"
-      />
-
-      {/* header */}
-      <div className="relative z-20 flex items-center px-10 py-4">
+      <div className="relative z-20 flex shrink-0 items-center justify-between gap-3 px-4 py-3 sm:px-8 sm:py-4 lg:px-10">
         <Link to="/">
-          <img src="/nexivo_logo.svg" alt="Nexivo" className="h-14 w-auto" draggable={false} />
+          <img src="/nexivo_logo.svg" alt="Nexivo" className="h-10 w-auto sm:h-14" draggable={false} />
         </Link>
+        <label className="sr-only" htmlFor="register-theme">
+          Theme
+        </label>
+        <select
+          id="register-theme"
+          value={theme.preference}
+          onChange={e => {
+            const v = e.target.value
+            if (v === 'light' || v === 'dark' || v === 'system') theme.setPreference(v)
+          }}
+          className="h-9 max-w-34 cursor-pointer rounded-lg border border-(--nexivo-input-border) bg-(--nexivo-input-bg) px-2 text-xs text-(--nexivo-text) outline-none backdrop-blur-sm focus:border-[#f59e0b]/50"
+          aria-label="Theme"
+        >
+          <option value="system">System</option>
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
       </div>
 
-      {/* centered card */}
-      <div className="relative z-10 flex h-[calc(100vh-80px)] items-center justify-center px-4">
-        <div className="w-full max-w-sm rounded-[22px] bg-[#1c1c1e]/90 backdrop-blur-xl p-7">
-
-          <h1 className="text-2xl font-bold tracking-tight text-white/90">Create account</h1>
-          <p className="mt-1.5 text-sm text-white/50">
+      <div className="relative z-10 flex min-h-0 flex-1 items-center justify-center px-4 py-6 sm:min-h-[calc(100vh-80px)] sm:py-0">
+        <div className="w-full max-w-sm rounded-[22px] border border-(--nexivo-border-subtle) bg-(--nexivo-panel) p-6 backdrop-blur-xl sm:p-7">
+          <h1 className="text-2xl font-bold tracking-tight text-(--nexivo-text)">Create account</h1>
+          <p className="mt-1.5 text-sm text-(--nexivo-text-muted)">
             Already have an account?{' '}
-            <Link to="/login" className="text-[#f59e0b] hover:text-[#fbbf24] transition">
+            <Link to="/login" className="text-[#f59e0b] transition hover:text-[#fbbf24]">
               Sign in
             </Link>
           </p>
 
           <form onSubmit={onSubmit} className="mt-6 flex flex-col gap-3">
             <label className="flex flex-col gap-1">
-              <span className="text-xs font-medium text-white/50 uppercase tracking-wider">Name</span>
+              <span className="text-xs font-medium text-(--nexivo-text-muted) uppercase tracking-wider">Name</span>
               <input
                 value={name}
                 onChange={e => setName(e.target.value)}
                 autoComplete="name"
                 required
-                className="h-11 rounded-xl border border-white/8 bg-white/6 px-4 text-sm text-white/90 placeholder-white/20 outline-none transition focus:border-[#f59e0b]/50 focus:bg-white/9"
+                className={fieldClass}
               />
             </label>
 
             <label className="flex flex-col gap-1">
-              <span className="text-xs font-medium text-white/50 uppercase tracking-wider">Email</span>
+              <span className="text-xs font-medium text-(--nexivo-text-muted) uppercase tracking-wider">Email</span>
               <input
                 value={email}
                 onChange={e => setEmail(e.target.value)}
                 type="email"
                 autoComplete="email"
                 required
-                className="h-11 rounded-xl border border-white/8 bg-white/6 px-4 text-sm text-white/90 placeholder-white/20 outline-none transition focus:border-[#f59e0b]/50 focus:bg-white/9"
+                className={fieldClass}
               />
             </label>
 
             <label className="flex flex-col gap-1">
-              <span className="text-xs font-medium text-white/50 uppercase tracking-wider">Password</span>
+              <span className="text-xs font-medium text-(--nexivo-text-muted) uppercase tracking-wider">Password</span>
               <input
                 value={password}
                 onChange={e => setPassword(e.target.value)}
@@ -94,7 +112,7 @@ export function RegisterPage() {
                 autoComplete="new-password"
                 required
                 minLength={8}
-                className="h-11 rounded-xl border border-white/8 bg-white/6 px-4 text-sm text-white/90 placeholder-white/20 outline-none transition focus:border-[#f59e0b]/50 focus:bg-white/9"
+                className={fieldClass}
               />
             </label>
 

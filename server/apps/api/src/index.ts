@@ -11,7 +11,11 @@ import rateLimit from "express-rate-limit";
 import { prisma } from "@bandr/db";
 import { buildApiManifest, buildOpenApi } from "./apiDiscovery";
 import { authRouter } from "./routes/auth";
+import { authMiddleware } from "./middleware/auth";
+import { meetingRecordingUploadHandler } from "./routes/meetingRecordingUpload";
 import { meetingsRouter } from "./routes/meetings";
+import { recordingsListRouter } from "./routes/recordings";
+import { translateRouter } from "./routes/translate";
 
 /**
  * Resolve `apps/api/public` whether we run from `src/` (ts-node) or `dist/` (node),
@@ -125,6 +129,15 @@ app.use(
 );
 
 app.use(express.static(publicPath, { fallthrough: true }));
+
+// Recording upload: raw body, must run before express.json (browser → API → R2; avoids R2 CORS on presigned PUT).
+// `type` must accept any Content-Type (e.g. video/webm;codecs=vp9,opus) — string "*/*" does not match those in type-is.
+app.post(
+  "/api/meetings/:code/recordings/upload",
+  express.raw({ type: () => true, limit: "512mb" }),
+  authMiddleware,
+  meetingRecordingUploadHandler,
+);
 
 app.use(express.json({ limit: "1mb" }));
 
@@ -274,6 +287,8 @@ app.get("/api/openapi.json", (req, res) => {
 
 app.use("/api/auth", authRouter);
 app.use("/api/meetings", meetingsRouter);
+app.use("/api/translate", translateRouter);
+app.use("/api/recordings", recordingsListRouter);
 
 app.use(
   (

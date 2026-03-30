@@ -1,7 +1,30 @@
+// STUN-only: works for direct connections but fails on strict NAT / bad networks
 const DEFAULT_STUN_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   { urls: 'stun:stun2.l.google.com:19302' },
+]
+
+// Free public TURN relay — provides a guaranteed fallback path on restrictive networks.
+// openrelay.metered.ca is a community-run open relay, suitable for dev/testing.
+// For production, replace with your own TURN server (coturn, Metered, Xirsys, Twilio, etc.)
+const FREE_TURN_SERVERS: RTCIceServer[] = [
+  {
+    urls: [
+      'turn:openrelay.metered.ca:80',
+      'turn:openrelay.metered.ca:80?transport=tcp',
+      'turn:openrelay.metered.ca:443',
+      'turns:openrelay.metered.ca:443',
+    ],
+    username: 'openrelayproject',
+    credential: 'openrelayproject',
+  },
+]
+
+// Combined fallback: STUN for fast direct paths + TURN for relay when direct fails
+const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
+  ...DEFAULT_STUN_SERVERS,
+  ...FREE_TURN_SERVERS,
 ]
 
 interface IceConfigResponse {
@@ -40,9 +63,12 @@ export async function getIceServers(): Promise<RTCIceServer[]> {
       return servers
     }
   } catch {
-    // fall through to default STUN-only fallback
+    // fall through to default fallback
   }
-  iceCache = DEFAULT_STUN_SERVERS
-  return DEFAULT_STUN_SERVERS
+  iceCache = DEFAULT_ICE_SERVERS
+  return DEFAULT_ICE_SERVERS
 }
 
+export function clearIceCache() {
+  iceCache = null
+}
