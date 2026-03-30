@@ -7,7 +7,11 @@ import { getIceServers } from '../lib/ice'
 import { MeetingVoteOverlay, type MeetingVoteChoice } from '../components/MeetingVoteOverlay'
 import { ShellBackgroundLayer } from '../components/ShellBackgroundLayer'
 import { useAuthToken } from '../lib/useAuthToken'
-import { mergeCaptionMessage, type CaptionLine } from '../lib/meetingCaptions'
+import {
+  captionLinesFromHistory,
+  mergeCaptionMessage,
+  type CaptionLine,
+} from '../lib/meetingCaptions'
 import type { Meeting } from '../lib/types'
 
 function defaultSignalingUrl() {
@@ -129,9 +133,9 @@ export function LiveWatchPage() {
     setChatMessages(ch)
 
     const capHist = Array.isArray(a.captionHistory)
-      ? (a.captionHistory as unknown[])
-          .map(item => {
-            if (!item || typeof item !== 'object') return null
+      ? captionLinesFromHistory(
+          (a.captionHistory as unknown[]).flatMap(item => {
+            if (!item || typeof item !== 'object') return []
             const c = item as {
               speakerUserId?: unknown
               speakerName?: unknown
@@ -144,18 +148,20 @@ export function LiveWatchPage() {
               typeof c.text !== 'string' ||
               typeof c.createdAt !== 'string'
             ) {
-              return null
+              return []
             }
-            return {
-              speakerUserId: c.speakerUserId,
-              speakerName: c.speakerName,
-              text: c.text,
-              interim: false,
-              id: `${c.createdAt}-${c.speakerUserId}`,
-              createdAt: c.createdAt,
-            } as CaptionLine
-          })
-          .filter((x): x is CaptionLine => x != null)
+            const id = `${c.createdAt}-${c.speakerUserId}`
+            return [
+              {
+                id,
+                speakerUserId: c.speakerUserId,
+                speakerName: c.speakerName,
+                text: c.text,
+                createdAt: c.createdAt,
+              },
+            ]
+          }),
+        )
       : []
     setCaptionLines(capHist)
 
@@ -358,17 +364,15 @@ export function LiveWatchPage() {
           ) {
             return
           }
-          setChatMessages(prev => [
-            ...prev,
-            {
-              id: p.id,
-              senderId: p.senderId,
-              senderUserId: typeof p.senderUserId === 'string' ? p.senderUserId : undefined,
-              senderName: typeof p.senderName === 'string' ? p.senderName : undefined,
-              text: p.text,
-              createdAt: p.createdAt,
-            },
-          ])
+          const row: ChatRow = {
+            id: p.id,
+            senderId: p.senderId,
+            senderUserId: typeof p.senderUserId === 'string' ? p.senderUserId : undefined,
+            senderName: typeof p.senderName === 'string' ? p.senderName : undefined,
+            text: p.text,
+            createdAt: p.createdAt,
+          }
+          setChatMessages(prev => [...prev, row])
         })
 
         socket.on('meeting:caption', (payload: unknown) => {
@@ -389,12 +393,16 @@ export function LiveWatchPage() {
           ) {
             return
           }
+          const speakerUserId = p.speakerUserId
+          const speakerName = p.speakerName
+          const text = p.text
+          const interim = p.interim
           setCaptionLines(prev =>
             mergeCaptionMessage(prev, {
-              speakerUserId: p.speakerUserId,
-              speakerName: p.speakerName,
-              text: p.text,
-              interim: p.interim,
+              speakerUserId,
+              speakerName,
+              text,
+              interim,
               id: typeof p.id === 'string' ? p.id : undefined,
               createdAt: typeof p.createdAt === 'string' ? p.createdAt : undefined,
             }),
@@ -456,7 +464,10 @@ export function LiveWatchPage() {
         })
 
         socket.on('meeting:live-state', (payload: unknown) => {
-          const live = payload && typeof payload === 'object' && (payload as { live?: unknown }).live === true
+          const live =
+            payload != null &&
+            typeof payload === 'object' &&
+            (payload as { live?: unknown }).live === true
           setStreamLive(live)
           if (!live) {
             setStatusLine('Live stream paused by host')

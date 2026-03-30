@@ -11,7 +11,7 @@ export type BrowserSpeechRecognition = {
 
 export type BrowserSpeechResultEvent = {
   resultIndex: number
-  results: ArrayLike<{ 0: { transcript: string } }>
+  results: ArrayLike<{ 0: { transcript: string }; isFinal: boolean }>
 }
 
 export type BrowserSpeechErrorEvent = { error: string }

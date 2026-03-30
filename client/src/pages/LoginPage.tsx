@@ -11,6 +11,7 @@ const fieldClass =
 
 export function LoginPage() {
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const theme = useAppTheme()
   const authed = useAuthToken() !== null
   const [email, setEmail] = useState('')

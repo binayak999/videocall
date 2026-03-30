@@ -1,11 +1,7 @@
 import { useEffect, useRef } from 'react'
 import type { Socket } from 'socket.io-client'
 import { mergeCaptionContinuation, collapseStutteringCaption } from './captionContinuationMerge'
-import { speechRecognitionCtor } from './browserSpeechRecognition'
-
-type SRResultList = ArrayLike<{ 0: { transcript: string }; isFinal: boolean }>
-
-type SREvent = { resultIndex: number; results: SRResultList }
+import { speechRecognitionCtor, type BrowserSpeechResultEvent } from './browserSpeechRecognition'
 
 /**
  * Streams the local mic to the browser speech API and emits captions on the signaling socket.
@@ -68,11 +64,10 @@ export function useMeetingCaptionRecognition(opts: {
       r.continuous = true
       r.interimResults = true
       r.lang = speechLang
-      r.onresult = (event: Event) => {
+      r.onresult = (event: BrowserSpeechResultEvent) => {
         const socketNow = optsRef.current.getSocket()
         if (!socketNow?.connected) return
-        const ev = event as unknown as SREvent
-        const { results, resultIndex } = ev
+        const { results, resultIndex } = event
         if (!results || results.length === 0 || resultIndex >= results.length) return
         // Browsers often append several progressive finals in one event; only the last
         // result reflects the current phrase. Emitting every index duplicates the transcript.
