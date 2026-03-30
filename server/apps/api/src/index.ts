@@ -247,7 +247,7 @@ app.get("/api/signaling-health", async (_req, res) => {
   res.status(502).json({ status: "error", detail: message });
 });
 
-app.get("/api/turn-credentials", (_req, res) => {
+app.get("/api/turn-credentials", authMiddleware, (_req, res) => {
   const secret = process.env.TURN_SECRET?.trim();
   const host = process.env.TURN_HOST?.trim();
   if (!secret || !host) {

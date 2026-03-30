@@ -1,3 +1,5 @@
+import { getToken } from './auth'
+
 // STUN-only: works for direct connections but fails on strict NAT / bad networks
 const DEFAULT_STUN_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -58,10 +60,13 @@ export function rtcConfiguration(iceServers: RTCIceServer[]): RTCConfiguration {
 export async function getIceServers(): Promise<RTCIceServer[]> {
   if (iceCache) return iceCache
   try {
+    const headers: Record<string, string> = { Accept: 'application/json' }
+    const token = getToken()
+    if (token) headers['Authorization'] = `Bearer ${token}`
     const res = await fetch(`${apiBase()}/api/turn-credentials`, {
       method: 'GET',
       credentials: 'include',
-      headers: { Accept: 'application/json' },
+      headers,
     })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const json = (await res.json()) as IceConfigResponse
