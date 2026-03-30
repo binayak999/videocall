@@ -5066,26 +5066,60 @@ export function MeetingPage() {
               const sid = `remote:${cameraId}`
               const isActive = activeCameraId === sid
               return (
-                <button
+                <div
                   key={cameraId}
-                  type="button"
-                  onClick={() => void switchCamera(sid)}
                   className={cx(
-                    'flex w-full items-center gap-3 rounded-xl border px-3 py-2.5 text-left text-[13px] transition',
+                    'flex w-full items-center gap-2 rounded-xl border px-2.5 py-2 text-left text-[13px] transition',
                     isActive
                       ? 'border-amber-500/40 bg-amber-500/12 text-white'
                       : 'border-white/8 bg-white/4 text-white/70 hover:border-white/14 hover:bg-white/8',
                   )}
                 >
-                  {/* Live thumbnail preview */}
-                  <RemoteCameraThumb cameraId={cameraId} streamsRef={remoteCameraStreamsRef} ready={ready} />
-                  <span className="min-w-0 flex-1 truncate">{label}</span>
-                  {ready
-                    ? <span className="shrink-0 h-1.5 w-1.5 rounded-full bg-green-400" />
-                    : <span className="shrink-0 text-[10px] text-white/40 italic">connecting…</span>
-                  }
-                  {isActive && <span className="shrink-0 rounded-full bg-amber-500/25 px-1.5 py-0.5 text-[10px] font-semibold text-amber-400">Active</span>}
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => void switchCamera(sid)}
+                    className="flex min-w-0 flex-1 items-center gap-3 text-left"
+                  >
+                    {/* Live thumbnail preview */}
+                    <RemoteCameraThumb cameraId={cameraId} streamsRef={remoteCameraStreamsRef} ready={ready} />
+                    <span className="min-w-0 flex-1 truncate">{label}</span>
+                    {ready
+                      ? <span className="shrink-0 h-1.5 w-1.5 rounded-full bg-green-400" />
+                      : <span className="shrink-0 text-[10px] text-white/40 italic">connecting…</span>
+                    }
+                    {isActive && <span className="shrink-0 rounded-full bg-amber-500/25 px-1.5 py-0.5 text-[10px] font-semibold text-amber-400">Active</span>}
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={!ready}
+                    title={ready ? 'Hold to send host audio to this device' : 'Waiting for device media…'}
+                    onPointerDown={e => {
+                      e.stopPropagation()
+                      ;(e.currentTarget as HTMLButtonElement).setPointerCapture(e.pointerId)
+                      setRemoteSpeakerCameraId(cameraId)
+                    }}
+                    onPointerUp={e => {
+                      e.stopPropagation()
+                      if (remoteSpeakerCameraIdRef.current === cameraId) setRemoteSpeakerCameraId(null)
+                    }}
+                    onPointerCancel={e => {
+                      e.stopPropagation()
+                      if (remoteSpeakerCameraIdRef.current === cameraId) setRemoteSpeakerCameraId(null)
+                    }}
+                    className={cx(
+                      'shrink-0 rounded-lg border px-2.5 py-2 text-[11px] font-semibold transition select-none',
+                      !ready
+                        ? 'cursor-not-allowed border-white/8 bg-white/4 text-white/35'
+                        : remoteSpeakerCameraId === cameraId
+                          ? 'border-sky-300/50 bg-sky-300/15 text-sky-100'
+                          : 'border-white/12 bg-black/25 text-white/75 hover:border-white/18 hover:bg-black/35',
+                    )}
+                    aria-label="Hold to send audio to device"
+                  >
+                    Hold
+                  </button>
+                </div>
               )
             })}
           </div>
