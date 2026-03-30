@@ -904,6 +904,32 @@ io.on("connection", (socket) => {
     io.to(m.to).emit("camera:ice", { from: socket.id, candidate: m.candidate });
   });
 
+  /**
+   * Push-to-talk: camera device requests the host to send audio to it
+   * (walkie-talkie "hear host" button on the camera device).
+   */
+  socket.on("camera:ptt-speaker", (msg: unknown) => {
+    const sd = socket.data as MeetingSocketData;
+    if (sd.role !== "camera-source" || !sd.hostSocketId) return;
+    if (!msg || typeof msg !== "object") return;
+    const m = msg as { on?: unknown };
+    if (typeof m.on !== "boolean") return;
+    io.to(sd.hostSocketId).emit("camera:ptt-speaker", { cameraId: socket.id, on: m.on });
+  });
+
+  /**
+   * Push-to-talk: camera device is transmitting its mic to the host
+   * (walkie-talkie "talk to host" button on the camera device).
+   */
+  socket.on("camera:ptt-mic", (msg: unknown) => {
+    const sd = socket.data as MeetingSocketData;
+    if (sd.role !== "camera-source" || !sd.hostSocketId) return;
+    if (!msg || typeof msg !== "object") return;
+    const m = msg as { on?: unknown };
+    if (typeof m.on !== "boolean") return;
+    io.to(sd.hostSocketId).emit("camera:ptt-mic", { cameraId: socket.id, on: m.on });
+  });
+
   /** Client-side moderation hook — log only; extend for admin webhooks or bans. */
   socket.on("meeting:policy-violation", (msg: unknown) => {
     const room = socket.data.meetingRoom as string | undefined;

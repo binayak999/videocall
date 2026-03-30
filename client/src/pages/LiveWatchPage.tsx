@@ -591,7 +591,38 @@ export function LiveWatchPage() {
           if (!live) {
             setStatusLine('Live stream paused by host')
             teardownPc()
+            hostPeerIdRef.current = null
+            return
           }
+
+          // Host restarted the broadcast. Re-join to receive a fresh host peerId and trigger a new offer.
+          if (!socket.connected || cancelled) return
+          setStatusLine('Live stream resumed — reconnecting…')
+          socket.emit('live:join', code, (ack: unknown) => {
+            if (cancelled) return
+            if (!ack || typeof ack !== 'object') {
+              setStatusLine('Could not re-join live stream')
+              return
+            }
+            const a = ack as Record<string, unknown>
+            if (a.ok !== true) {
+              const msg = typeof a.error === 'string' ? a.error : 'Re-join failed'
+              setStatusLine(msg)
+              if (a.streamLive === false) setStreamLive(false)
+              else if (a.streamLive === true) setStreamLive(true)
+              else setStreamLive(null)
+              return
+            }
+            setStreamLive(true)
+            mySocketIdRef.current = socket.id ?? ''
+            applyJoinPayload(a)
+            const hp = typeof a.hostPeerId === 'string' ? a.hostPeerId : null
+            hostPeerIdRef.current = hp
+            setHostScreenSharing(false)
+            if (!hp) return
+            ensurePc()
+            requestLiveWatchReoffer()
+          })
         })
 
         socket.on('disconnect', () => {
@@ -830,7 +861,7 @@ export function LiveWatchPage() {
               </div>
             )}
             {latestCaption && latestCaption.text.trim().length > 0 && (
-              <div className="pointer-events-none absolute bottom-4 left-4 right-4 z-[5] rounded-2xl border border-(--nexivo-border-subtle) bg-(--nexivo-panel-solid)/92 px-4 py-3 text-center shadow-lg backdrop-blur-xl">
+              <div className="pointer-events-none absolute bottom-4 left-4 right-4 z-5 rounded-2xl border border-(--nexivo-border-subtle) bg-(--nexivo-panel-solid)/92 px-4 py-3 text-center shadow-lg backdrop-blur-xl">
                 <span className="text-[11px] font-semibold text-[#fbbf24]">{latestCaption.speakerName}</span>
                 <p className="mt-1 text-sm leading-snug text-(--nexivo-text)">{latestCaption.text}</p>
               </div>

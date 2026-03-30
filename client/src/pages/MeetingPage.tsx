@@ -202,14 +202,14 @@ function VideoOffParticipantCard({
   return (
     <div
       className={cx(
-        'absolute inset-0 z-[1] flex flex-col items-center justify-center bg-[#1a1b1d]/95 px-2',
+        'absolute inset-0 z-1 flex flex-col items-center justify-center bg-[#1a1b1d]/95 px-2',
         compact && 'px-1',
       )}
     >
       <div
         className={cx(
           'flex shrink-0 items-center justify-center rounded-full border border-white/20 bg-linear-to-br from-amber-500/40 via-amber-600/25 to-sky-600/30 font-semibold text-white shadow-lg ring-1 ring-white/10',
-          compact ? 'h-11 w-11 text-xs' : 'h-16 w-16 text-base sm:h-[4.5rem] sm:w-[4.5rem] sm:text-lg',
+          compact ? 'h-11 w-11 text-xs' : 'h-16 w-16 text-base sm:h-18 sm:text-lg',
         )}
       >
         {initials}
@@ -366,9 +366,18 @@ export function MeetingPage() {
   const attentionBadPrevRef = useRef<Set<string>>(new Set())
   const [cameraBgMode, setCameraBgMode] = useState<CameraBackgroundUiMode>('none')
   const [localCameraDevices, setLocalCameraDevices] = useState<MediaDeviceInfo[]>([])
+  const [localMicDevices, setLocalMicDevices] = useState<MediaDeviceInfo[]>([])
+  const [localSpeakerDevices, setLocalSpeakerDevices] = useState<MediaDeviceInfo[]>([])
   const [remoteCameras, setRemoteCameras] = useState<Map<string, { label: string; ready: boolean }>>(new Map())
   const [activeCameraId, setActiveCameraId] = useState<string | null>(null) // null = default | 'local:deviceId' | 'remote:socketId'
   const activeCameraIdRef = useRef<string | null>(null)
+  const [activeMicDeviceId, setActiveMicDeviceId] = useState<string | null>(null) // null = default
+  const [activeSpeakerDeviceId, setActiveSpeakerDeviceId] = useState<string | null>(null) // null = default
+  const [remoteMicCameraId, setRemoteMicCameraId] = useState<string | null>(null) // cameraId or null (local mic)
+  const remoteMicCameraIdRef = useRef<string | null>(null)
+  const [remoteSpeakerCameraId, setRemoteSpeakerCameraId] = useState<string | null>(null) // cameraId or null (no remote speaker)
+  const remoteSpeakerCameraIdRef = useRef<string | null>(null)
+  const [monitorRemoteDeviceMic, setMonitorRemoteDeviceMic] = useState(true)
   const [showCameraPanel, setShowCameraPanel] = useState(false)
   const [cameraShareUrl, setCameraShareUrl] = useState<string | null>(null)
 
@@ -403,6 +412,7 @@ export function MeetingPage() {
   const liveStreamPublicRef = useRef(false)
   const liveViewerPeerIdsRef = useRef<Set<string>>(new Set())
   const micLockedByHostRef = useRef(false)
+  const micWasEnabledBeforeHostMuteRef = useRef<boolean | null>(null)
   const collabAutoConnectDoneRef = useRef(false)
   const connectRef = useRef<(() => Promise<void>) | null>(null)
   const mySocketIdRef = useRef('')
@@ -416,6 +426,7 @@ export function MeetingPage() {
   const localPipRef = useRef<HTMLVideoElement>(null)
   const localPresenterRef = useRef<HTMLVideoElement>(null)
   const localStripRef = useRef<HTMLVideoElement>(null)
+  const remoteMicMonitorAudioRef = useRef<HTMLAudioElement>(null)
   const chatSeqRef = useRef(0)
   const myUserIdRef = useRef('')
   const chatBottomRef = useRef<HTMLDivElement>(null)
@@ -440,12 +451,100 @@ export function MeetingPage() {
   const cameraBgPipelineRef = useRef<CameraBackgroundPipeline | null>(null)
   const remoteCameraPcsRef = useRef<Map<string, RTCPeerConnection>>(new Map())
   const remoteCameraStreamsRef = useRef<Map<string, MediaStream>>(new Map())
+  const remoteCameraSpeakerSenderRef = useRef<Map<string, RTCRtpSender>>(new Map())
   const cameraBgImageElRef = useRef<HTMLImageElement | null>(null)
   const cameraBgImageObjectUrlRef = useRef<string | null>(null)
   const cameraBgFileInputRef = useRef<HTMLInputElement>(null)
   const recordingRootRef = useRef<HTMLDivElement>(null)
   const hostRecorderRef = useRef<HostMeetingRecorder | null>(null)
   const recordingStartedAtRef = useRef(0)
+  const speakerMixCtxRef = useRef<AudioContext | null>(null)
+  const speakerMixDestRef = useRef<MediaStreamAudioDestinationNode | null>(null)
+  const speakerMixInputNodesRef = useRef<Map<string, MediaStreamAudioSourceNode>>(new Map())
+  const speakerMixSilentTrackRef = useRef<MediaStreamTrack | null>(null)
+
+  function ensureSpeakerMixGraph(): { dest: MediaStreamAudioDestinationNode; silentTrack: MediaStreamTrack } {
+    if (!speakerMixCtxRef.current) speakerMixCtxRef.current = new AudioContext()
+    const ctx = speakerMixCtxRef.current
+    if (!speakerMixDestRef.current) speakerMixDestRef.current = ctx.createMediaStreamDestination()
+    const dest = speakerMixDestRef.current
+    if (!speakerMixSilentTrackRef.current) {
+      const osc = ctx.createOscillator()
+      const gain = ctx.createGain()
+      gain.gain.value = 0
+      osc.connect(gain)
+      gain.connect(dest)
+      osc.start()
+      speakerMixSilentTrackRef.current = dest.stream.getAudioTracks()[0] ?? null
+    }
+    return { dest, silentTrack: speakerMixSilentTrackRef.current! }
+  }
+
+  function syncSpeakerMixInputs(): MediaStreamTrack | null {
+    const { dest, silentTrack } = ensureSpeakerMixGraph()
+    const current = new Map<string, MediaStreamTrack>()
+    for (const s of peerStreamRefs.current.values()) {
+      for (const t of s.getAudioTracks()) {
+        if (t.readyState === 'live') current.set(t.id, t)
+      }
+    }
+
+    // Add new sources
+    for (const [id, t] of current.entries()) {
+      if (speakerMixInputNodesRef.current.has(id)) continue
+      try {
+        const src = speakerMixCtxRef.current!.createMediaStreamSource(new MediaStream([t]))
+        src.connect(dest)
+        speakerMixInputNodesRef.current.set(id, src)
+      } catch {
+        // ignore unsupported tracks
+      }
+    }
+
+    // Remove missing sources
+    for (const [id, node] of [...speakerMixInputNodesRef.current.entries()]) {
+      if (current.has(id)) continue
+      try { node.disconnect() } catch { /* ignore */ }
+      speakerMixInputNodesRef.current.delete(id)
+    }
+
+    // If no inputs, keep silence (prevents some browsers from glitching)
+    const mixed = dest.stream.getAudioTracks()[0] ?? null
+    return mixed ?? silentTrack
+  }
+
+  async function applyRemoteSpeakerTracks() {
+    const track = syncSpeakerMixInputs()
+    try { await speakerMixCtxRef.current?.resume() } catch { /* ignore */ }
+    for (const [cameraId, sender] of remoteCameraSpeakerSenderRef.current.entries()) {
+      const want = remoteSpeakerCameraId === cameraId
+      const nextTrack = want ? track : ensureSpeakerMixGraph().silentTrack
+      if (sender.track?.id === nextTrack?.id) continue
+      await sender.replaceTrack(nextTrack).catch(() => {})
+    }
+  }
+
+  function supportsSetSinkId(
+    el: HTMLMediaElement,
+  ): el is HTMLMediaElement & { setSinkId: (deviceId: string) => Promise<void> } {
+    return typeof (el as unknown as { setSinkId?: unknown }).setSinkId === 'function'
+  }
+
+  async function applySpeakerSinkIdToEl(el: HTMLMediaElement) {
+    if (!activeSpeakerDeviceId) return
+    if (!supportsSetSinkId(el)) return
+    try {
+      await el.setSinkId(activeSpeakerDeviceId)
+    } catch {
+      // ignore (unsupported browser / permissions / invalid device)
+    }
+  }
+
+  async function applySpeakerSinkIdToAllPeerMedia() {
+    if (!activeSpeakerDeviceId) return
+    const els = [...peerVideoRefs.current.values()]
+    await Promise.allSettled(els.map(el => applySpeakerSinkIdToEl(el)))
+  }
 
   const syncPeerCameraOverlay = useCallback((remoteId: string) => {
     setPeerShowVideoFallback(prev => {
@@ -467,6 +566,47 @@ export function MeetingPage() {
   useEffect(() => {
     syncPeerCameraOverlayRef.current = syncPeerCameraOverlay
   }, [syncPeerCameraOverlay])
+
+  useEffect(() => {
+    void applySpeakerSinkIdToAllPeerMedia()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSpeakerDeviceId])
+
+  useEffect(() => {
+    remoteMicCameraIdRef.current = remoteMicCameraId
+  }, [remoteMicCameraId])
+
+  useEffect(() => {
+    remoteSpeakerCameraIdRef.current = remoteSpeakerCameraId
+  }, [remoteSpeakerCameraId])
+
+  useEffect(() => {
+    const el = remoteMicMonitorAudioRef.current
+    if (!el) return
+
+    if (!monitorRemoteDeviceMic || !remoteMicCameraId) {
+      try { el.pause() } catch { /* ignore */ }
+      el.srcObject = null
+      return
+    }
+
+    const remoteStream = remoteCameraStreamsRef.current.get(remoteMicCameraId)
+    const remoteTrack = remoteStream?.getAudioTracks()[0] ?? null
+    if (!remoteTrack) {
+      try { el.pause() } catch { /* ignore */ }
+      el.srcObject = null
+      return
+    }
+
+    el.srcObject = new MediaStream([remoteTrack])
+    void applySpeakerSinkIdToEl(el)
+    void el.play().catch(() => {})
+  }, [monitorRemoteDeviceMic, remoteMicCameraId, activeSpeakerDeviceId])
+
+  useEffect(() => {
+    void applyRemoteSpeakerTracks()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [remoteSpeakerCameraId, remoteMicCameraId, micEnabled])
 
   useEffect(() => {
     screenSharingPeersRef.current = new Set(screenSharingPeers)
@@ -811,6 +951,15 @@ export function MeetingPage() {
     return false
   }
 
+  /** Inbound mic from camera-source WebRTC must not be stopped when swapping the local send track. */
+  function isInboundRemoteCameraAudioTrack(track: MediaStreamTrack): boolean {
+    if (track.kind !== 'audio') return false
+    for (const stream of remoteCameraStreamsRef.current.values()) {
+      if (stream.getAudioTracks().some(t => t.id === track.id)) return true
+    }
+    return false
+  }
+
   async function pushLocalVideoToPeersAndPreview(videoTrack: MediaStreamTrack) {
     const ls = localStreamRef.current
     if (!ls) return
@@ -939,6 +1088,151 @@ export function MeetingPage() {
     } catch { /* ignore */ }
   }
 
+  async function enumerateLocalAudioDevices() {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices()
+      setLocalMicDevices(devices.filter(d => d.kind === 'audioinput'))
+      setLocalSpeakerDevices(devices.filter(d => d.kind === 'audiooutput'))
+    } catch { /* ignore */ }
+  }
+
+  async function switchMicDevice(deviceId: string | null) {
+    setActiveMicDeviceId(deviceId)
+    setRemoteMicCameraId(null)
+    if (!micEnabled) return
+    const localStream = localStreamRef.current ?? await ensureStream()
+    if (micLockedByHostRef.current) {
+      showToast('The host has muted your microphone')
+      return
+    }
+    try {
+      const micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: deviceId ? { exact: deviceId } : undefined,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+        video: false,
+      })
+      const newAudioTrack = micStream.getAudioTracks()[0] ?? null
+      if (!newAudioTrack) throw new Error('No microphone track available')
+
+      for (const t of [...localStream.getAudioTracks()]) {
+        localStream.removeTrack(t)
+        if (!isInboundRemoteCameraAudioTrack(t)) t.stop()
+      }
+      localStream.addTrack(newAudioTrack)
+      newAudioTrack.enabled = true
+
+      for (const [remoteId, { pc }] of peersRef.current.entries()) {
+        const sender = pc.getSenders().find(s => s.track?.kind === 'audio')
+        if (sender) {
+          await sender.replaceTrack(newAudioTrack)
+        } else {
+          pc.addTrack(newAudioTrack, localStream)
+          void renegotiate(remoteId)
+        }
+      }
+      showToast('Microphone switched')
+      void applyRemoteSpeakerTracks()
+    } catch (e) {
+      appendLog('mic switch error', String(e))
+      showToast('Unable to switch microphone')
+    }
+  }
+
+  async function switchSpeakerDevice(deviceId: string | null) {
+    setActiveSpeakerDeviceId(deviceId)
+    if (!deviceId) {
+      showToast('Speaker set to default')
+      return
+    }
+    await applySpeakerSinkIdToAllPeerMedia()
+    showToast('Speaker switched')
+  }
+
+  async function switchRemoteMicCamera(cameraId: string | null) {
+    setRemoteMicCameraId(cameraId)
+    remoteMicCameraIdRef.current = cameraId
+    const localStream = localStreamRef.current ?? await ensureStream()
+
+    if (!cameraId) {
+      for (const t of [...localStream.getAudioTracks()]) {
+        localStream.removeTrack(t)
+        if (!isInboundRemoteCameraAudioTrack(t)) t.stop()
+      }
+      if (!micEnabled) return
+      if (micLockedByHostRef.current) {
+        showToast('The host has muted your microphone')
+        return
+      }
+      try {
+        const micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: activeMicDeviceId ? { exact: activeMicDeviceId } : undefined,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+          video: false,
+        })
+        const newAudioTrack = micStream.getAudioTracks()[0] ?? null
+        if (!newAudioTrack) throw new Error('No microphone track available')
+        localStream.addTrack(newAudioTrack)
+        for (const [remoteId, { pc }] of peersRef.current.entries()) {
+          const sender = pc.getSenders().find(s => s.track?.kind === 'audio')
+          if (sender) {
+            await sender.replaceTrack(newAudioTrack)
+          } else {
+            pc.addTrack(newAudioTrack, localStream)
+            void renegotiate(remoteId)
+          }
+        }
+        newAudioTrack.enabled = true
+        showToast('Local microphone restored')
+      } catch (e) {
+        appendLog('mic restore error', String(e))
+        setMicEnabled(false)
+        showToast('Unable to restore local microphone')
+      }
+      void applyRemoteSpeakerTracks()
+      return
+    }
+
+    if (micLockedByHostRef.current) {
+      showToast('The host has muted your microphone')
+      return
+    }
+    const remoteStream = remoteCameraStreamsRef.current.get(cameraId)
+    const remoteTrack = remoteStream?.getAudioTracks()[0] ?? null
+    if (!remoteTrack) {
+      showToast('Remote device microphone not available yet')
+      return
+    }
+
+    for (const t of [...localStream.getAudioTracks()]) {
+      localStream.removeTrack(t)
+      if (!isInboundRemoteCameraAudioTrack(t)) t.stop()
+    }
+    localStream.addTrack(remoteTrack)
+
+    for (const [remoteId, { pc }] of peersRef.current.entries()) {
+      const sender = pc.getSenders().find(s => s.track?.kind === 'audio')
+      if (sender) {
+        await sender.replaceTrack(remoteTrack)
+      } else {
+        pc.addTrack(remoteTrack, localStream)
+        void renegotiate(remoteId)
+      }
+    }
+
+    remoteTrack.enabled = true
+    setMicEnabled(true)
+    showToast('Remote device mic selected')
+    void applyRemoteSpeakerTracks()
+  }
+
   async function generateCameraToken() {
     const socket = socketRef.current
     if (!socket) return
@@ -1053,6 +1347,9 @@ export function MeetingPage() {
       peerStreamRefs.current.set(remoteId, s)
       const runSync = () => syncPeerCameraOverlayRef.current(remoteId)
       runSync()
+      if (ev.track.kind === 'audio') {
+        void applyRemoteSpeakerTracks()
+      }
       if (ev.track.kind === 'video') {
         ev.track.addEventListener('ended', runSync)
         ev.track.addEventListener('mute', runSync)
@@ -1061,6 +1358,7 @@ export function MeetingPage() {
       const videoEl = peerVideoRefs.current.get(remoteId)
       if (videoEl) {
         videoEl.srcObject = s
+        void applySpeakerSinkIdToEl(videoEl)
         void videoEl.play().catch(() => {})
       }
     }
@@ -1119,6 +1417,8 @@ export function MeetingPage() {
     peerVideoRefs.current.delete(remoteId)
     peerVideoCallbackRefs.current.delete(remoteId)
     peerStreamRefs.current.delete(remoteId)
+    // Keep remote speaker mix in sync when peers change
+    void applyRemoteSpeakerTracks()
     setPeerShowVideoFallback(prev => {
       if (!(remoteId in prev)) return prev
       const next = { ...prev }
@@ -1137,6 +1437,7 @@ export function MeetingPage() {
     peerVideoRefs.current.clear()
     peerVideoCallbackRefs.current.clear()
     peerStreamRefs.current.clear()
+    void applyRemoteSpeakerTracks()
     setPeerIds([])
     setParticipantRoster({})
     setPeerShowVideoFallback({})
@@ -1305,6 +1606,39 @@ export function MeetingPage() {
       setMeeting(prev => (prev ? { ...prev, hostId: newHostUserId } : prev))
       showToast(iAmHost ? 'You are now the host' : 'Host changed')
     })
+    socket.on('meeting:host-mic-state', (payload: unknown) => {
+      if (!payload || typeof payload !== 'object') return
+      const muted = (payload as { muted?: unknown }).muted === true
+
+      if (muted) {
+        if (micWasEnabledBeforeHostMuteRef.current === null) micWasEnabledBeforeHostMuteRef.current = micEnabled
+        micLockedByHostRef.current = true
+        setMicEnabled(false)
+        const localStream = localStreamRef.current
+        if (localStream) {
+          for (const t of localStream.getAudioTracks()) t.enabled = false
+        }
+        showToast('The host has muted your microphone')
+        return
+      }
+
+      micLockedByHostRef.current = false
+      const restore = micWasEnabledBeforeHostMuteRef.current
+      micWasEnabledBeforeHostMuteRef.current = null
+      if (restore) {
+        const localStream = localStreamRef.current
+        const tracks = localStream?.getAudioTracks() ?? []
+        if (tracks.length > 0) {
+          for (const t of tracks) t.enabled = true
+          setMicEnabled(true)
+          showToast('The host unmuted your microphone')
+        } else {
+          showToast('The host unmuted you — turn your mic back on')
+        }
+      } else {
+        showToast('The host unmuted you')
+      }
+    })
     socket.on('webrtc:offer', async (msg: unknown) => {
       if (!msg || typeof msg !== 'object') return
       const { from, sdp } = msg as { from?: unknown; sdp?: unknown }
@@ -1383,6 +1717,9 @@ export function MeetingPage() {
       remoteCameraPcsRef.current.get(cameraId)?.close()
       remoteCameraPcsRef.current.delete(cameraId)
       remoteCameraStreamsRef.current.delete(cameraId)
+      remoteCameraSpeakerSenderRef.current.delete(cameraId)
+      setRemoteMicCameraId(prev => (prev === cameraId ? null : prev))
+      setRemoteSpeakerCameraId(prev => (prev === cameraId ? null : prev))
       setActiveCameraId(prev => {
         const next = prev === `remote:${cameraId}` ? null : prev
         activeCameraIdRef.current = next
@@ -1391,11 +1728,46 @@ export function MeetingPage() {
       showToast('A camera source disconnected')
     })
 
+    // Push-to-talk: device requests host audio be sent to it while held.
+    socket.on('camera:ptt-speaker', ({ cameraId, on }: { cameraId: string; on: boolean }) => {
+      if (on) {
+        setRemoteSpeakerCameraId(cameraId)
+        showToast('Sending audio to device…')
+        return
+      }
+      if (remoteSpeakerCameraIdRef.current === cameraId) {
+        setRemoteSpeakerCameraId(null)
+        showToast('Stopped sending audio to device')
+      }
+    })
+
+    // Push-to-talk: device is transmitting mic (host can auto-monitor it while held).
+    socket.on('camera:ptt-mic', ({ cameraId, on }: { cameraId: string; on: boolean }) => {
+      if (on) {
+        setRemoteMicCameraId(cameraId)
+        setMonitorRemoteDeviceMic(true)
+        showToast('Listening to device mic…')
+        return
+      }
+      if (remoteMicCameraIdRef.current === cameraId) {
+        setRemoteMicCameraId(null)
+        showToast('Stopped listening to device mic')
+      }
+    })
+
     socket.on('camera:offer', async ({ from, sdp }: { from: string; sdp: RTCSessionDescriptionInit }) => {
       // Offer from a camera source — close any stale PC, create recvonly PC, answer it
       remoteCameraPcsRef.current.get(from)?.close()
       const pc = new RTCPeerConnection({ iceServers: iceServersRef.current })
       remoteCameraPcsRef.current.set(from, pc)
+      // Prepare a sendonly audio m-line so we can later route meeting audio to the device without renegotiation.
+      try {
+        const tx = pc.addTransceiver('audio', { direction: 'sendonly' })
+        remoteCameraSpeakerSenderRef.current.set(from, tx.sender)
+        void tx.sender.replaceTrack(ensureSpeakerMixGraph().silentTrack)
+      } catch {
+        // ignore (browser may not support)
+      }
       pc.ontrack = ev => {
         const stream = ev.streams[0] ?? new MediaStream([ev.track])
         remoteCameraStreamsRef.current.set(from, stream)
@@ -1427,6 +1799,13 @@ export function MeetingPage() {
           track.addEventListener('unmute', markReady, { once: true })
           // Fallback: mark ready after 4 s even if unmute never fires
           setTimeout(markReady, 4000)
+        }
+
+        if (track.kind === 'audio') {
+          void applyRemoteSpeakerTracks()
+          if (remoteMicCameraIdRef.current === from) {
+            void switchRemoteMicCamera(from)
+          }
         }
       }
       pc.onicecandidate = ev => {
@@ -2430,14 +2809,48 @@ export function MeetingPage() {
       setMicEnabled(false)
       for (const t of localStream.getAudioTracks()) t.enabled = false
       showToast('Microphone muted')
+      void applyRemoteSpeakerTracks()
       return
     }
 
     try {
+      if (remoteMicCameraId) {
+        const remoteStream = remoteCameraStreamsRef.current.get(remoteMicCameraId)
+        const remoteTrack = remoteStream?.getAudioTracks()[0] ?? null
+        if (!remoteTrack) throw new Error('Remote device microphone not available')
+
+        // Replace local audio tracks with the inbound remote track (do NOT stop inbound camera tracks).
+        for (const t of [...localStream.getAudioTracks()]) {
+          localStream.removeTrack(t)
+          if (!isInboundRemoteCameraAudioTrack(t)) t.stop()
+        }
+        localStream.addTrack(remoteTrack)
+        remoteTrack.enabled = true
+
+        for (const [remoteId, { pc }] of peersRef.current.entries()) {
+          const sender = pc.getSenders().find(s => s.track?.kind === 'audio')
+          if (sender) {
+            await sender.replaceTrack(remoteTrack)
+          } else {
+            pc.addTrack(remoteTrack, localStream)
+            void renegotiate(remoteId)
+          }
+        }
+        setMicEnabled(true)
+        showToast('Remote device mic on')
+        void applyRemoteSpeakerTracks()
+        return
+      }
+
       let audioTrack = localStream.getAudioTracks()[0] ?? null
       if (!audioTrack) {
         const micStream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          audio: {
+            deviceId: activeMicDeviceId ? { exact: activeMicDeviceId } : undefined,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
           video: false,
         })
         const newAudioTrack = micStream.getAudioTracks()[0]
@@ -2459,6 +2872,7 @@ export function MeetingPage() {
       audioTrack.enabled = true
       setMicEnabled(true)
       showToast('Microphone on')
+      void applyRemoteSpeakerTracks()
     } catch (e) {
       appendLog('mic toggle error', String(e))
       setMicEnabled(false)
@@ -3173,7 +3587,7 @@ export function MeetingPage() {
                   {showPeerVideoFallbackForPeer(id) && (
                     <VideoOffParticipantCard name={rosterLabel(id)} email={rosterEntryEmail(id)} />
                   )}
-                  <div className="absolute bottom-2.5 left-3 z-[2] max-w-[calc(100%-16px)] truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">{rosterLabel(id)}</div>
+                  <div className="absolute bottom-2.5 left-3 z-2 max-w-[calc(100%-16px)] truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">{rosterLabel(id)}</div>
                   {screenSharingPeers.has(id) && !controllingPeer && !controlledBy && (
                     <button
                       type="button"
@@ -3260,7 +3674,7 @@ export function MeetingPage() {
                     {!presenterIsLocal && (
                       <div className="group relative min-h-0 min-w-0 overflow-hidden rounded-[10px] bg-[#2d2e30]">
                         <video ref={localStripRef} playsInline autoPlay muted style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: 'scaleX(-1)' }} />
-                        <div className="absolute bottom-2.5 left-3 z-[2] rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">You</div>
+                        <div className="absolute bottom-2.5 left-3 z-2 rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">You</div>
                         {pipCamOff && (
                           <VideoOffParticipantCard
                             compact
@@ -3289,7 +3703,7 @@ export function MeetingPage() {
                             email={rosterEntryEmail(id)}
                           />
                         )}
-                        <div className="absolute bottom-2.5 left-3 z-[2] max-w-[calc(100%-16px)] truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">{rosterLabel(id)}</div>
+                        <div className="absolute bottom-2.5 left-3 z-2 max-w-[calc(100%-16px)] truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">{rosterLabel(id)}</div>
                       </div>
                     ))}
                   </div>
@@ -3405,7 +3819,7 @@ export function MeetingPage() {
                           <div className="min-w-0 flex-1">
                             <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
                               <span
-                                className="text-[13px] font-medium leading-snug break-words text-white/90 [overflow-wrap:anywhere]"
+                                className="text-[13px] font-medium leading-snug wrap-break-word text-white/90"
                                 title={participantRoster[callLocalSocketId]?.userName ?? 'You'}
                               >
                                 {participantRoster[callLocalSocketId]?.userName ?? 'You'}
@@ -3449,7 +3863,7 @@ export function MeetingPage() {
                               <div>
                                 <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
                                   <span
-                                    className="text-[13px] font-medium leading-snug break-words text-white/90 [overflow-wrap:anywhere]"
+                                    className="text-[13px] font-medium leading-snug wrap-break-word text-white/90"
                                     title={displayName}
                                   >
                                     {displayName}
@@ -4033,6 +4447,98 @@ export function MeetingPage() {
                       )}
                     </div>
                     <div className="border-t border-white/10 pt-4">
+                      <div className="mb-2 flex items-center justify-between gap-3">
+                        <p className="text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Audio devices</p>
+                        <button
+                          type="button"
+                          onClick={() => void enumerateLocalAudioDevices()}
+                          className="shrink-0 cursor-pointer rounded-full border border-white/12 bg-white/8 px-2.5 py-1 text-[11px] font-semibold text-white/70 hover:border-white/18 hover:bg-white/12 hover:text-white"
+                          title="Refresh device list"
+                        >
+                          Refresh
+                        </button>
+                      </div>
+                      <p className="mb-2.5 text-[12px] leading-snug text-white/45">
+                        Pick which connected mic and speaker to use for this tab. Speaker selection requires a supported browser (Chrome/Edge).
+                      </p>
+
+                      <label className="mb-1 block text-[11px] font-semibold text-white/55">Microphone</label>
+                      <select
+                        value={activeMicDeviceId ?? ''}
+                        onChange={e => void switchMicDevice(e.target.value ? e.target.value : null)}
+                        onClick={() => void enumerateLocalAudioDevices()}
+                        className="w-full cursor-pointer rounded-xl border border-white/10 bg-white/5 px-3 py-2.5 text-[13px] font-medium text-white outline-none focus:border-amber-500/45 focus:bg-white/8"
+                        aria-label="Microphone device"
+                      >
+                        <option value="">Default microphone</option>
+                        {localMicDevices.map((d, i) => (
+                          <option key={d.deviceId} value={d.deviceId}>
+                            {d.label || `Microphone ${i + 1}`}
+                          </option>
+                        ))}
+                      </select>
+
+                      <label className="mt-3 mb-1 block text-[11px] font-semibold text-white/55">Remote device mic</label>
+                      <select
+                        value={remoteMicCameraId ?? ''}
+                        onChange={e => void switchRemoteMicCamera(e.target.value ? e.target.value : null)}
+                        className="w-full cursor-pointer rounded-xl border border-white/10 bg-white/5 px-3 py-2.5 text-[13px] font-medium text-white outline-none focus:border-amber-500/45 focus:bg-white/8"
+                        aria-label="Remote device microphone"
+                      >
+                        <option value="">Off (use local mic)</option>
+                        {[...remoteCameras.entries()].map(([id, c]) => (
+                          <option key={id} value={id}>
+                            {c.label}
+                          </option>
+                        ))}
+                      </select>
+                      <audio ref={remoteMicMonitorAudioRef} autoPlay playsInline className="hidden" />
+
+                      <label className="mt-2 flex cursor-pointer items-center gap-2 text-[12px] font-medium text-white/70">
+                        <input
+                          type="checkbox"
+                          checked={monitorRemoteDeviceMic}
+                          onChange={e => setMonitorRemoteDeviceMic(e.target.checked)}
+                          className="h-4 w-4 cursor-pointer accent-amber-400"
+                        />
+                        Hear remote device mic on this speaker
+                      </label>
+
+                      <label className="mt-3 mb-1 block text-[11px] font-semibold text-white/55">Speaker</label>
+                      <select
+                        value={activeSpeakerDeviceId ?? ''}
+                        onChange={e => void switchSpeakerDevice(e.target.value ? e.target.value : null)}
+                        onClick={() => void enumerateLocalAudioDevices()}
+                        className="w-full cursor-pointer rounded-xl border border-white/10 bg-white/5 px-3 py-2.5 text-[13px] font-medium text-white outline-none focus:border-amber-500/45 focus:bg-white/8"
+                        aria-label="Speaker device"
+                      >
+                        <option value="">Default speaker</option>
+                        {localSpeakerDevices.map((d, i) => (
+                          <option key={d.deviceId} value={d.deviceId}>
+                            {d.label || `Speaker ${i + 1}`}
+                          </option>
+                        ))}
+                      </select>
+
+                      <label className="mt-3 mb-1 block text-[11px] font-semibold text-white/55">Send meeting audio to device (speaker)</label>
+                      <p className="mb-1.5 text-[11px] leading-snug text-white/35">
+                        Sends your mic plus other participants to that phone or tablet so it can play it on its speaker (enable below after the camera connects).
+                      </p>
+                      <select
+                        value={remoteSpeakerCameraId ?? ''}
+                        onChange={e => setRemoteSpeakerCameraId(e.target.value ? e.target.value : null)}
+                        className="w-full cursor-pointer rounded-xl border border-white/10 bg-white/5 px-3 py-2.5 text-[13px] font-medium text-white outline-none focus:border-amber-500/45 focus:bg-white/8"
+                        aria-label="Remote device speaker"
+                      >
+                        <option value="">Off</option>
+                        {[...remoteCameras.entries()].map(([id, c]) => (
+                          <option key={id} value={id}>
+                            {c.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="border-t border-white/10 pt-4">
                       <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Voice &amp; translation</p>
                       <p className="mb-2.5 text-[12px] leading-snug text-white/45">
                         Language for mic capture in Notes and Agenda (this meeting, this device). You can translate text afterward in those panels.
@@ -4110,7 +4616,7 @@ export function MeetingPage() {
 
           {callView === 'call' && attentionWarnCompose && (
             <div
-              className="fixed inset-0 z-[101] flex items-center justify-center bg-black/65 p-4 backdrop-blur-sm"
+              className="fixed inset-0 z-101 flex items-center justify-center bg-black/65 p-4 backdrop-blur-sm"
               role="dialog"
               aria-modal="true"
               aria-labelledby="attention-compose-title"
@@ -4319,7 +4825,7 @@ export function MeetingPage() {
           {/* Live captions — full-bleed subtitle strip over video, just above bottom controls (z above tiles & side panels) */}
           {liveCaptionsEnabled && (
             <div
-              className="pointer-events-none absolute inset-0 z-[22] flex flex-col justify-end bg-transparent"
+              className="pointer-events-none absolute inset-0 z-22 flex flex-col justify-end bg-transparent"
               aria-live="polite"
               role="region"
               aria-label="Live captions"
@@ -4438,7 +4944,7 @@ export function MeetingPage() {
               type="button"
               onClick={() => void toggleScreenShare()}
               className={cx(
-                'flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border-0 transition active:scale-95',
+                'flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border-0 transition active:scale-95 max-sm:hidden',
                 screenSharing ? 'bg-red-500 hover:bg-[#d33828]' : 'bg-[#3c4043] hover:bg-[#4a4d50]',
               )}
               title={screenSharing ? 'Stop sharing' : 'Share screen'}
@@ -4512,7 +5018,7 @@ export function MeetingPage() {
               </button>
             )}
             <button type="button" onClick={() => leave()} className="flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border-0 bg-red-500 transition hover:bg-[#d33828] active:scale-95" title="Leave call">
-              <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden className="origin-center rotate-[135deg]">
+              <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden className="origin-center rotate-135">
                 <path
                   fill="white"
                   d="M6.62 10.79c1.44 2.83 3.76 5.14 6.59 6.59l2.2-2.2c.27-.27.67-.36 1.02-.24 1.12.37 2.33.57 3.57.57.55 0 1 .45 1 1V20c0 .55-.45 1-1 1-9.39 0-17-7.61-17-17 0-.55.45-1 1-1h3.5c.55 0 1 .45 1 1 0 1.25.2 2.45.57 3.57.11.35.03.74-.25 1.02l-2.2 2.2z"
