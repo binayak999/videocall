@@ -47,6 +47,10 @@ export function useMeetingCaptionRecognition(opts: {
       return
     }
 
+    const INTERIM_MIN_MS = 75
+    /** First tokens after silence feel laggy if throttled the same as steady speech. */
+    const INTERIM_BURST_MS = 28
+
     let cancelled = false
     let lastInterimSend = 0
     let lastFinalNorm = ''
@@ -85,7 +89,10 @@ export function useMeetingCaptionRecognition(opts: {
           out = cleaned
           if (out.toLowerCase() === utteranceAccum.toLowerCase()) return
           const now = Date.now()
-          if (now - lastInterimSend < 260) return
+          const gap = now - lastInterimSend
+          const afterSilence = utteranceAccum.length === 0
+          const minGap = afterSilence ? INTERIM_BURST_MS : INTERIM_MIN_MS
+          if (gap < minGap) return
           lastInterimSend = now
           utteranceAccum = out
         } else {

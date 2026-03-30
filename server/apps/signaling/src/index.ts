@@ -71,6 +71,8 @@ const roomWhiteboardState = new Map<string, boolean>();
 const roomWhiteboardOwner = new Map<string, string>();
 const roomWhiteboardEditors = new Map<string, Set<string>>();
 const roomHostUserId = new Map<string, string>();
+/** room → peer socketIds with raised hands */
+const roomHandRaisedPeers = new Map<string, Set<string>>();
 /** True while the meeting host has announced active in-call recording (client-side capture). */
 const roomMeetingRecording = new Map<string, boolean>();
 const roomPendingJoinIds = new Map<string, Set<string>>();
@@ -531,6 +533,11 @@ async function buildJoinApprovedPayload(
   const peerRosterForAck = rosterFromSockets(existing).filter((r) => r.peerId !== participantSocket.id);
   const { chatHistory, chatHasMore } = await loadRecentChat(meetingId);
   const { captionHistory, captionHasMore } = await loadRecentCaptions(meetingId);
+  const raisedSet = roomHandRaisedPeers.get(room);
+  const raisedPeerIds =
+    raisedSet
+      ? [...raisedSet].filter((sid) => existing.some((s) => s.id === sid))
+      : [];
   return {
     ok: true,
     room: code,
@@ -548,6 +555,7 @@ async function buildJoinApprovedPayload(
     whiteboardActive: roomWhiteboardState.get(room) === true,
     whiteboardOwnerId: roomWhiteboardOwner.get(room) ?? null,
     whiteboardEditors: [...(roomWhiteboardEditors.get(room) ?? new Set<string>())],
+    handRaisedPeerIds: raisedPeerIds,
     meetingRecordingActive: roomMeetingRecording.get(room) === true,
     ...voteJoinFields(room, reqData.userId),
   };
@@ -667,6 +675,11 @@ function leaveMeeting(socket: Socket): void {
   } else {
     socket.to(room).emit("meeting:peer-left", { peerId: socket.id });
   }
+  const raised = roomHandRaisedPeers.get(room);
+  if (raised?.has(socket.id)) {
+    raised.delete(socket.id);
+    io.in(room).emit("meeting:hand-raise", { peerId: socket.id, raised: false, by: socket.id });
+  }
   const hostUserIdForRoom = roomHostUserId.get(room);
   if (
     hostUserIdForRoom &&
@@ -691,6 +704,7 @@ function leaveMeeting(socket: Socket): void {
   if (remaining <= 1) {
     const av = roomActiveVote.get(room);
     if (av) void closePollInDb(av.sessionId);
+    roomHandRaisedPeers.delete(room);
     roomWhiteboardOwner.delete(room);
     roomWhiteboardEditors.delete(room);
     roomHostUserId.delete(room);
@@ -1056,6 +1070,12 @@ io.on("connection", (socket) => {
     });
     const { chatHistory, chatHasMore } = await loadRecentChat(meeting.id);
     const { captionHistory, captionHasMore } = await loadRecentCaptions(meeting.id);
+    const adapterAfterHostJoin = io.sockets.adapter.rooms.get(room);
+    const raisedSetHost = roomHandRaisedPeers.get(room);
+    const handRaisedPeerIdsHost =
+      raisedSetHost && adapterAfterHostJoin
+        ? [...raisedSetHost].filter((sid) => adapterAfterHostJoin.has(sid))
+        : [];
     ack({
       ok: true,
       room: trimmed,
@@ -1073,6 +1093,7 @@ io.on("connection", (socket) => {
       whiteboardActive: roomWhiteboardState.get(room) === true,
       whiteboardOwnerId: roomWhiteboardOwner.get(room) ?? null,
       whiteboardEditors: [...(roomWhiteboardEditors.get(room) ?? new Set<string>())],
+      handRaisedPeerIds: handRaisedPeerIdsHost,
       meetingRecordingActive: roomMeetingRecording.get(room) === true,
       ...voteJoinFields(room, selfData.userId),
     });
@@ -1652,6 +1673,28 @@ io.on("connection", (socket) => {
         io.to(sid).emit("meeting:attention-warning", { fromName, message, by: socket.id });
       }
     }
+  });
+
+  // ── Hand raise ────────────────────────────────────────────────────────────
+  socket.on("meeting:hand-raise", (msg: unknown) => {
+    const room = socket.data.meetingRoom as string | undefined;
+    if (!room) return;
+    const data = socket.data as MeetingSocketData;
+    if (data.role === "camera-source" || data.role === "live-viewer") return;
+    if (!msg || typeof msg !== "object") return;
+    const payload = msg as { raised?: unknown };
+    if (typeof payload.raised !== "boolean") return;
+    if (!roomHandRaisedPeers.has(room)) roomHandRaisedPeers.set(room, new Set());
+    const set = roomHandRaisedPeers.get(room)!;
+    if (payload.raised) set.add(socket.id);
+    else set.delete(socket.id);
+    io.in(room).emit("meeting:hand-raise", {
+      peerId: socket.id,
+      raised: payload.raised,
+      userId: data.userId,
+      userName: data.userName,
+      by: socket.id,
+    });
   });
 
   socket.on("meeting:host-remove-peer", (msg: unknown) => {
