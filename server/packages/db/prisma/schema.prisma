@@ -13,6 +13,7 @@ model User {
   name      String
   password  String?
   provider  String
+  googleSub String?  @unique
   createdAt DateTime @default(now())
 
   hostedMeetings Meeting[]           @relation("MeetingHost")

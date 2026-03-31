@@ -16,6 +16,7 @@
     "@tensorflow-models/body-segmentation": "^1.0.2",
     "@tensorflow/tfjs": "^4.22.0",
     "buffer": "^6.0.3",
+    "livekit-client": "^2.18.0",
     "nsfwjs": "^4.3.0",
     "qrcode.react": "^4.2.0",
     "react": "^19.2.4",

@@ -116,6 +116,7 @@ export function buildApiManifest(req: Request): Record<string, unknown> {
             email: "string",
             password: "string (min 8)",
             name: "string",
+            recaptchaToken: "string | optional if RECAPTCHA_SECRET_KEY unset",
           },
           responses: {
             201: { token: "string", user: "User" },
@@ -127,10 +128,33 @@ export function buildApiManifest(req: Request): Record<string, unknown> {
           method: "POST",
           path: "/api/auth/login",
           auth: false,
-          body: { email: "string", password: "string" },
+          body: {
+            email: "string",
+            password: "string",
+            recaptchaToken: "string | optional if RECAPTCHA_SECRET_KEY unset",
+          },
           responses: {
             200: { token: "string", user: "User" },
             401: { error: "string" },
+          },
+        },
+        {
+          method: "POST",
+          path: "/api/auth/google",
+          auth: false,
+          description:
+            "Google Identity Services ID token; creates or links user by verified email. Requires GOOGLE_CLIENT_ID.",
+          body: {
+            idToken: "string (Google JWT credential)",
+            recaptchaToken: "string | optional if RECAPTCHA_SECRET_KEY unset",
+          },
+          responses: {
+            200: { token: "string", user: "User" },
+            400: { error: "string" },
+            401: { error: "Invalid Google token" },
+            403: { error: "Google email is not verified" },
+            409: { error: "Account conflict" },
+            503: { error: "Google sign-in is not configured" },
           },
         },
         {
@@ -344,6 +368,7 @@ export function buildOpenApi(req: Request): Record<string, unknown> {
                     email: { type: "string", format: "email" },
                     password: { type: "string", minLength: 8 },
                     name: { type: "string" },
+                    recaptchaToken: { type: "string", description: "reCAPTCHA v3 token (required when API has RECAPTCHA_SECRET_KEY)" },
                   },
                 },
               },
@@ -391,6 +416,7 @@ export function buildOpenApi(req: Request): Record<string, unknown> {
                   properties: {
                     email: { type: "string", format: "email" },
                     password: { type: "string" },
+                    recaptchaToken: { type: "string", description: "reCAPTCHA v3 token (required when API has RECAPTCHA_SECRET_KEY)" },
                   },
                 },
               },
@@ -407,6 +433,77 @@ export function buildOpenApi(req: Request): Record<string, unknown> {
             },
             "401": {
               description: "Invalid credentials",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+          },
+        },
+      },
+      "/api/auth/google": {
+        post: {
+          tags: ["Auth"],
+          summary: "Sign in with Google (ID token)",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["idToken"],
+                  properties: {
+                    idToken: { type: "string", description: "Credential JWT from Google Identity Services" },
+                    recaptchaToken: { type: "string", description: "reCAPTCHA v3 token (required when API has RECAPTCHA_SECRET_KEY)" },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            "200": {
+              description: "OK",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/AuthResponse" },
+                },
+              },
+            },
+            "400": {
+              description: "Bad request",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+            "401": {
+              description: "Invalid Google token",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+            "403": {
+              description: "Google email not verified",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+            "409": {
+              description: "Account conflict",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+            "503": {
+              description: "Google OAuth client id not configured",
               content: {
                 "application/json": {
                   schema: { $ref: "#/components/schemas/Error" },

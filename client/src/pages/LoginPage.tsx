@@ -1,8 +1,11 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, Navigate, useNavigate, useSearchParams } from 'react-router-dom'
 import { ShellBackgroundLayer } from '../components/ShellBackgroundLayer'
 import { useAppTheme } from '../components/ThemeProvider'
-import { errorMessage, login } from '../lib/api'
+import { GoogleSignInButton } from '../components/GoogleSignInButton'
+import { RecaptchaDisclosure } from '../components/RecaptchaDisclosure'
+import { errorMessage, login, loginWithGoogle } from '../lib/api'
+import { getRecaptchaToken, warmupRecaptcha } from '../lib/recaptchaBrowser'
 import { setToken } from '../lib/auth'
 import { useAuthToken } from '../lib/useAuthToken'
 
@@ -19,21 +22,48 @@ export function LoginPage() {
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
 
+  const recaptchaSiteKey = import.meta.env.VITE_RECAPTCHA_SITE_KEY
+  const googleClientId = (import.meta.env.VITE_GOOGLE_CLIENT_ID ?? '').trim()
+
+  useEffect(() => {
+    if (!authed) warmupRecaptcha(recaptchaSiteKey)
+  }, [authed, recaptchaSiteKey])
+
   if (authed) return <Navigate to="/" replace />
+
+  const redirectAfterAuth = () => {
+    const redirect = searchParams.get('redirect')
+    if (redirect && redirect.startsWith('/') && !redirect.startsWith('//')) {
+      navigate(redirect, { replace: true })
+    } else {
+      navigate('/', { replace: true })
+    }
+  }
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setBusy(true)
     setErr(null)
     try {
-      const r = await login({ email: email.trim(), password })
+      const recaptchaToken = await getRecaptchaToken(recaptchaSiteKey, 'login')
+      const r = await login({ email: email.trim(), password, recaptchaToken })
       setToken(r.token)
-      const redirect = searchParams.get('redirect')
-      if (redirect && redirect.startsWith('/') && !redirect.startsWith('//')) {
-        navigate(redirect, { replace: true })
-      } else {
-        navigate('/', { replace: true })
-      }
+      redirectAfterAuth()
+    } catch (e2: unknown) {
+      setErr(errorMessage(e2))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const onGoogleCredential = async (idToken: string) => {
+    setBusy(true)
+    setErr(null)
+    try {
+      const recaptchaToken = await getRecaptchaToken(recaptchaSiteKey, 'google_login')
+      const r = await loginWithGoogle({ idToken, recaptchaToken })
+      setToken(r.token)
+      redirectAfterAuth()
     } catch (e2: unknown) {
       setErr(errorMessage(e2))
     } finally {
@@ -113,6 +143,21 @@ export function LoginPage() {
               {busy ? 'Signing in…' : 'Sign in'}
             </button>
           </form>
+
+          {googleClientId.length > 0 && (
+            <div className="mt-5">
+              <div className="flex items-center gap-3">
+                <div className="h-px flex-1 bg-(--nexivo-border-subtle)" />
+                <span className="text-xs text-(--nexivo-text-muted)">or</span>
+                <div className="h-px flex-1 bg-(--nexivo-border-subtle)" />
+              </div>
+              <div className="mt-4">
+                <GoogleSignInButton clientId={googleClientId} onCredential={onGoogleCredential} disabled={busy} />
+              </div>
+            </div>
+          )}
+
+          <RecaptchaDisclosure />
         </div>
       </div>
     </div>

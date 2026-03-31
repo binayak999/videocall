@@ -230,3 +230,9 @@
   border-inline: none;
   text-align: left;
 }
+
+/* reCAPTCHA v3: small fixed badge; keep above full-screen shells */
+.grecaptcha-badge {
+  z-index: 2147483000 !important;
+  visibility: visible !important;
+}

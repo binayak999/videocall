@@ -66,6 +66,7 @@ async function requestJson<T>(
 export async function login(input: {
   email: string
   password: string
+  recaptchaToken?: string
 }): Promise<AuthResponse> {
   return await requestJson<AuthResponse>('/api/auth/login', {
     method: 'POST',
@@ -77,8 +78,19 @@ export async function register(input: {
   email: string
   password: string
   name: string
+  recaptchaToken?: string
 }): Promise<AuthResponse> {
   return await requestJson<AuthResponse>('/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
+export async function loginWithGoogle(input: {
+  idToken: string
+  recaptchaToken?: string
+}): Promise<AuthResponse> {
+  return await requestJson<AuthResponse>('/api/auth/google', {
     method: 'POST',
     body: JSON.stringify(input),
   })

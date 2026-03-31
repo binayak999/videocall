@@ -49,7 +49,7 @@ export function MeetingVoteOverlay({
 
   return (
     <div
-      className="pointer-events-auto absolute left-1/2 z-[24] w-[min(400px,calc(100vw-28px))] -translate-x-1/2 rounded-[20px] border border-white/12 bg-[#141416]/96 p-4 shadow-2xl backdrop-blur-xl max-[480px]:bottom-[calc(5.25rem+env(safe-area-inset-bottom,0px))] max-[480px]:max-h-[min(52vh,420px)] max-[480px]:overflow-y-auto bottom-[calc(5.75rem+env(safe-area-inset-bottom,0px))] sm:bottom-[calc(6.25rem+env(safe-area-inset-bottom,0px))]"
+      className="pointer-events-auto absolute left-1/2 z-24 w-[min(400px,calc(100vw-28px))] -translate-x-1/2 rounded-[20px] border border-white/12 bg-[#141416]/96 p-4 shadow-2xl backdrop-blur-xl max-[480px]:bottom-[calc(5.25rem+env(safe-area-inset-bottom,0px))] max-[480px]:max-h-[min(52vh,420px)] max-[480px]:overflow-y-auto bottom-[calc(5.75rem+env(safe-area-inset-bottom,0px))] sm:bottom-[calc(6.25rem+env(safe-area-inset-bottom,0px))]"
       role="region"
       aria-label="Live vote"
     >

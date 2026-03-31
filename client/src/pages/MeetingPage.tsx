@@ -523,6 +523,16 @@ export function MeetingPage() {
   const speakerMixInputNodesRef = useRef<Map<string, MediaStreamAudioSourceNode>>(new Map())
   const speakerMixSilentTrackRef = useRef<MediaStreamTrack | null>(null)
 
+  // ── Active speaker detection ──────────────────────────────────────────────
+  const [activeSpeakerId, setActiveSpeakerId] = useState<string | null>(null)
+  const [speakingPeerIds, setSpeakingPeerIds] = useState<Set<string>>(new Set())
+  const speakerAudioCtxRef = useRef<AudioContext | null>(null)
+  type AnalyserEntry = { source: MediaStreamAudioSourceNode; analyser: AnalyserNode; buf: Uint8Array<ArrayBuffer> }
+  const speakerAnalyserMapRef = useRef<Map<string, AnalyserEntry>>(new Map())
+  const localSpeakerAnalyserRef = useRef<AnalyserEntry | null>(null)
+  const activeSpeakerHoldRef = useRef<{ id: string | null; since: number }>({ id: null, since: 0 })
+  const speakerMainVideoRef = useRef<HTMLVideoElement>(null)
+
   function ensureSpeakerMixGraph(): { dest: MediaStreamAudioDestinationNode; silentTrack: MediaStreamTrack } {
     if (!speakerMixCtxRef.current) speakerMixCtxRef.current = new AudioContext()
     const ctx = speakerMixCtxRef.current
@@ -573,6 +583,44 @@ export function MeetingPage() {
     return mixed ?? silentTrack
   }
 
+  function getSpeakerAudioCtx(): AudioContext {
+    if (!speakerAudioCtxRef.current || speakerAudioCtxRef.current.state === 'closed') {
+      speakerAudioCtxRef.current = new AudioContext()
+    }
+    if (speakerAudioCtxRef.current.state === 'suspended') void speakerAudioCtxRef.current.resume()
+    return speakerAudioCtxRef.current
+  }
+
+  function setupSpeakerAnalyser(id: string, stream: MediaStream) {
+    const existing = speakerAnalyserMapRef.current.get(id)
+    if (existing) existing.source.disconnect()
+    try {
+      const ctx = getSpeakerAudioCtx()
+      const source = ctx.createMediaStreamSource(stream)
+      const analyser = ctx.createAnalyser()
+      analyser.fftSize = 512
+      analyser.smoothingTimeConstant = 0.4
+      source.connect(analyser)
+      speakerAnalyserMapRef.current.set(id, {
+        source,
+        analyser,
+        buf: new Uint8Array(new ArrayBuffer(analyser.frequencyBinCount)),
+      })
+    } catch { /* ignore */ }
+  }
+
+  function teardownSpeakerAnalyser(id: string) {
+    const entry = speakerAnalyserMapRef.current.get(id)
+    if (entry) { entry.source.disconnect(); speakerAnalyserMapRef.current.delete(id) }
+  }
+
+  function getByteRms(analyser: AnalyserNode, buf: Uint8Array<ArrayBuffer>): number {
+    analyser.getByteTimeDomainData(buf)
+    let sum = 0
+    for (const v of buf) { const d = (v - 128) / 128; sum += d * d }
+    return Math.sqrt(sum / buf.length)
+  }
+
   async function applyRemoteSpeakerTracks() {
     const track = syncSpeakerMixInputs()
     try { await speakerMixCtxRef.current?.resume() } catch { /* ignore */ }
@@ -590,7 +638,7 @@ export function MeetingPage() {
     return typeof (el as unknown as { setSinkId?: unknown }).setSinkId === 'function'
   }
 
-  async function applySpeakerSinkIdToEl(el: HTMLMediaElement) {
+  const applySpeakerSinkIdToEl = useCallback(async (el: HTMLMediaElement) => {
     if (!activeSpeakerDeviceId) return
     if (!supportsSetSinkId(el)) return
     try {
@@ -598,13 +646,13 @@ export function MeetingPage() {
     } catch {
       // ignore (unsupported browser / permissions / invalid device)
     }
-  }
+  }, [activeSpeakerDeviceId])
 
-  async function applySpeakerSinkIdToAllPeerMedia() {
+  const applySpeakerSinkIdToAllPeerMedia = useCallback(async () => {
     if (!activeSpeakerDeviceId) return
     const els = [...peerVideoRefs.current.values()]
     await Promise.allSettled(els.map(el => applySpeakerSinkIdToEl(el)))
-  }
+  }, [activeSpeakerDeviceId, applySpeakerSinkIdToEl])
 
   const syncPeerCameraOverlay = useCallback((remoteId: string) => {
     setPeerShowVideoFallback(prev => {
@@ -629,8 +677,7 @@ export function MeetingPage() {
 
   useEffect(() => {
     void applySpeakerSinkIdToAllPeerMedia()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSpeakerDeviceId])
+  }, [applySpeakerSinkIdToAllPeerMedia])
 
   useEffect(() => {
     remoteMicCameraIdRef.current = remoteMicCameraId
@@ -661,7 +708,7 @@ export function MeetingPage() {
     el.srcObject = new MediaStream([remoteTrack])
     void applySpeakerSinkIdToEl(el)
     void el.play().catch(() => {})
-  }, [monitorRemoteDeviceMic, remoteMicCameraId, activeSpeakerDeviceId])
+  }, [monitorRemoteDeviceMic, remoteMicCameraId, applySpeakerSinkIdToEl])
 
   useEffect(() => {
     void applyRemoteSpeakerTracks()
@@ -973,6 +1020,114 @@ export function MeetingPage() {
       window.clearInterval(id)
     }
   }, [callView, callLocalSocketId])
+
+  // ── Local mic analyser – set up / tear down with mic state ────────────────
+  useEffect(() => {
+    if (callView !== 'call' || !micEnabled) {
+      if (localSpeakerAnalyserRef.current) {
+        localSpeakerAnalyserRef.current.source.disconnect()
+        localSpeakerAnalyserRef.current = null
+      }
+      return
+    }
+    const stream = localStreamRef.current
+    if (!stream) return
+    try {
+      const ctx = getSpeakerAudioCtx()
+      const source = ctx.createMediaStreamSource(stream)
+      const analyser = ctx.createAnalyser()
+      analyser.fftSize = 512
+      analyser.smoothingTimeConstant = 0.4
+      source.connect(analyser)
+      if (localSpeakerAnalyserRef.current) localSpeakerAnalyserRef.current.source.disconnect()
+      localSpeakerAnalyserRef.current = {
+        source,
+        analyser,
+        buf: new Uint8Array(new ArrayBuffer(analyser.frequencyBinCount)),
+      }
+    } catch { /* ignore */ }
+    return () => {
+      if (localSpeakerAnalyserRef.current) {
+        localSpeakerAnalyserRef.current.source.disconnect()
+        localSpeakerAnalyserRef.current = null
+      }
+    }
+  }, [callView, micEnabled])
+
+  // ── Active speaker polling ────────────────────────────────────────────────
+  useEffect(() => {
+    if (callView !== 'call') {
+      setActiveSpeakerId(null)
+      setSpeakingPeerIds(new Set())
+      activeSpeakerHoldRef.current = { id: null, since: 0 }
+      return
+    }
+    const SILENCE_THRESHOLD = 0.015
+    const HOLD_MS = 2500
+
+    const interval = setInterval(() => {
+      const now = Date.now()
+      const levels = new Map<string, number>()
+
+      const localEntry = localSpeakerAnalyserRef.current
+      if (localEntry) {
+        const myId = mySocketIdRef.current
+        if (myId) levels.set(myId, getByteRms(localEntry.analyser, localEntry.buf))
+      }
+      for (const [id, entry] of speakerAnalyserMapRef.current) {
+        levels.set(id, getByteRms(entry.analyser, entry.buf))
+      }
+
+      let loudestId: string | null = null
+      let loudestLevel = SILENCE_THRESHOLD
+      const speaking = new Set<string>()
+      for (const [id, lvl] of levels) {
+        if (lvl > SILENCE_THRESHOLD) speaking.add(id)
+        if (lvl > loudestLevel) { loudestLevel = lvl; loudestId = id }
+      }
+
+      setSpeakingPeerIds(prev => {
+        if (prev.size === speaking.size && [...speaking].every(id => prev.has(id))) return prev
+        return speaking
+      })
+
+      const hold = activeSpeakerHoldRef.current
+      if (loudestId !== null && loudestId !== hold.id) {
+        if (hold.id === null || now - hold.since > HOLD_MS) {
+          activeSpeakerHoldRef.current = { id: loudestId, since: now }
+          setActiveSpeakerId(loudestId)
+        }
+      } else if (loudestId === null && hold.id !== null && now - hold.since > HOLD_MS) {
+        activeSpeakerHoldRef.current = { id: null, since: now }
+        setActiveSpeakerId(null)
+      }
+    }, 150)
+
+    return () => {
+      clearInterval(interval)
+      setActiveSpeakerId(null)
+      setSpeakingPeerIds(new Set())
+      activeSpeakerHoldRef.current = { id: null, since: 0 }
+      if (speakerAudioCtxRef.current?.state !== 'closed') {
+        void speakerAudioCtxRef.current?.close()
+        speakerAudioCtxRef.current = null
+      }
+      speakerAnalyserMapRef.current.clear()
+    }
+  }, [callView])
+
+  // ── Sync main speaker video element ──────────────────────────────────────
+  useEffect(() => {
+    const el = speakerMainVideoRef.current
+    if (!el) return
+    if (!activeSpeakerId) { el.srcObject = null; return }
+    const isLocal = activeSpeakerId === mySocketIdRef.current
+    const stream = isLocal ? localStreamRef.current : (peerStreamRefs.current.get(activeSpeakerId) ?? null)
+    if (el.srcObject !== stream) {
+      el.srcObject = stream
+      if (stream) void el.play().catch(() => {})
+    }
+  }, [activeSpeakerId])
 
   useEffect(() => {
     if (!isHostInCall || callView !== 'call') {
@@ -1449,6 +1604,7 @@ export function MeetingPage() {
       runSync()
       if (ev.track.kind === 'audio') {
         void applyRemoteSpeakerTracks()
+        setupSpeakerAnalyser(remoteId, s)
       }
       if (ev.track.kind === 'video') {
         ev.track.addEventListener('ended', runSync)
@@ -1517,6 +1673,7 @@ export function MeetingPage() {
     peerVideoRefs.current.delete(remoteId)
     peerVideoCallbackRefs.current.delete(remoteId)
     peerStreamRefs.current.delete(remoteId)
+    teardownSpeakerAnalyser(remoteId)
     // Keep remote speaker mix in sync when peers change
     void applyRemoteSpeakerTracks()
     setPeerShowVideoFallback(prev => {
@@ -3472,6 +3629,13 @@ export function MeetingPage() {
   const stripPeerIds = presenterMode
     ? peerIds.filter(id => id !== remotePresenterId)
     : peerIds
+
+  // Speaker spotlight: active when someone is speaking, no screen share, 2+ people in call
+  const speakerMode = !presenterMode && !isSoloInCall && activeSpeakerId !== null
+  const speakerIsLocal = speakerMode && activeSpeakerId === callLocalSocketId
+  const nonSpeakerPeerIds = speakerMode
+    ? peerIds.filter(id => id !== activeSpeakerId)
+    : peerIds
   const whiteboardCanEdit = whiteboardEditors.includes(mySocketIdRef.current)
   const whiteboardIsOwner = whiteboardOwnerId === mySocketIdRef.current
   const whiteboardOtherEditors = whiteboardEditors.filter(id => id !== whiteboardOwnerId)
@@ -3734,8 +3898,8 @@ export function MeetingPage() {
       {callView === 'call' && (
         <div className="meeting-route-root fixed inset-0 z-100 bg-[#111]">
           <div ref={recordingRootRef} className="absolute inset-0">
-          {/* Video grid — regular mode */}
-          {!presenterMode && (
+          {/* Video grid — regular mode (no screen share, nobody speaking yet) */}
+          {!presenterMode && !speakerMode && (
             <div className="absolute inset-0 grid gap-1.5 bg-[#111]" style={gridStyle}>
               {peerIds.length === 0 && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center gap-3.5 text-sm text-[#9aa0a6]">
@@ -3758,8 +3922,11 @@ export function MeetingPage() {
                   {showPeerVideoFallbackForPeer(id) && (
                     <VideoOffParticipantCard name={rosterLabel(id)} email={rosterEntryEmail(id)} />
                   )}
+                  {speakingPeerIds.has(id) && (
+                    <div className="pointer-events-none absolute inset-0 z-2 rounded-[10px] ring-[3px] ring-inset ring-green-400/80" />
+                  )}
                   {handRaisedByPeerId[id] && (
-                    <div className="absolute top-2 right-2 z-[3] flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
+                    <div className="absolute top-2 right-2 z-3 flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
                       ✋
                     </div>
                   )}
@@ -3792,6 +3959,89 @@ export function MeetingPage() {
             </div>
           )}
 
+          {/* Speaker spotlight — active speaker large, everyone else in a strip */}
+          {speakerMode && (
+            <div className="absolute inset-0 flex flex-col bg-[#111]">
+              {/* Main speaker view */}
+              <div className="relative min-h-0 flex-1 overflow-hidden">
+                <video
+                  ref={speakerMainVideoRef}
+                  playsInline
+                  autoPlay
+                  muted={speakerIsLocal}
+                  style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: speakerIsLocal && !screenSharing ? 'scaleX(-1)' : 'none' }}
+                />
+                {speakerIsLocal && pipCamOff && (
+                  <VideoOffParticipantCard
+                    name={participantRoster[callLocalSocketId ?? '']?.userName || getJwtProfile(getToken() ?? '').name || 'You'}
+                    email={rosterEntryEmail(callLocalSocketId ?? '')}
+                  />
+                )}
+                {!speakerIsLocal && activeSpeakerId && showPeerVideoFallbackForPeer(activeSpeakerId) && (
+                  <VideoOffParticipantCard name={rosterLabel(activeSpeakerId)} email={rosterEntryEmail(activeSpeakerId)} />
+                )}
+                {/* Green speaking ring */}
+                <div className="pointer-events-none absolute inset-0 ring-[3px] ring-inset ring-green-400/70" />
+                {/* Name + speaking indicator */}
+                <div className="absolute bottom-4 left-4 z-2 flex items-center gap-2">
+                  <div className="flex items-center gap-2 rounded-xl bg-black/60 px-3 py-1.5 backdrop-blur-sm">
+                    <span className="h-2 w-2 animate-pulse rounded-full bg-green-400" />
+                    <span className="text-sm font-semibold text-white">
+                      {speakerIsLocal ? 'You' : rosterLabel(activeSpeakerId!)}
+                    </span>
+                  </div>
+                </div>
+                {activeSpeakerId && handRaisedByPeerId[activeSpeakerId] && (
+                  <div className="absolute top-2 right-2 z-3 flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg">✋</div>
+                )}
+              </div>
+
+              {/* Thumbnail strip */}
+              <div className="flex h-[104px] shrink-0 items-center gap-2 overflow-x-auto bg-[#0d0d0d] px-3 py-2 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                {/* Local tile (when not the speaker) */}
+                {!speakerIsLocal && (
+                  <div className="relative h-full shrink-0 overflow-hidden rounded-xl bg-[#2d2e30]" style={{ aspectRatio: '16/9' }}>
+                    <video ref={localStripRef} playsInline autoPlay muted className="h-full w-full object-cover -scale-x-100" />
+                    {pipCamOff && (
+                      <VideoOffParticipantCard compact
+                        name={participantRoster[callLocalSocketId ?? '']?.userName || 'You'}
+                        email={rosterEntryEmail(callLocalSocketId ?? '')}
+                      />
+                    )}
+                    {callLocalSocketId && speakingPeerIds.has(callLocalSocketId) && (
+                      <div className="pointer-events-none absolute inset-0 rounded-xl ring-2 ring-inset ring-green-400/80" />
+                    )}
+                    {callLocalSocketId && handRaisedByPeerId[callLocalSocketId] && (
+                      <div className="absolute top-1 right-1 flex h-6 w-6 items-center justify-center rounded-full bg-amber-500/95 text-sm">✋</div>
+                    )}
+                    <div className="absolute bottom-1 left-2 truncate rounded bg-black/55 px-1.5 py-px text-[11px] text-white">You</div>
+                  </div>
+                )}
+                {/* Non-speaker peer tiles */}
+                {nonSpeakerPeerIds.map(id => (
+                  <div key={id} className="relative h-full shrink-0 overflow-hidden rounded-xl bg-[#2d2e30]" style={{ aspectRatio: '16/9' }}>
+                    <video
+                      ref={getPeerVideoRef(id)}
+                      playsInline
+                      autoPlay
+                      style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: 'scaleX(-1)' }}
+                    />
+                    {showPeerVideoFallbackForPeer(id) && (
+                      <VideoOffParticipantCard compact name={rosterLabel(id)} email={rosterEntryEmail(id)} />
+                    )}
+                    {speakingPeerIds.has(id) && (
+                      <div className="pointer-events-none absolute inset-0 rounded-xl ring-2 ring-inset ring-green-400/80" />
+                    )}
+                    {handRaisedByPeerId[id] && (
+                      <div className="absolute top-1 right-1 flex h-6 w-6 items-center justify-center rounded-full bg-amber-500/95 text-sm">✋</div>
+                    )}
+                    <div className="absolute bottom-1 left-2 max-w-[calc(100%-8px)] truncate rounded bg-black/55 px-1.5 py-px text-[11px] text-white">{rosterLabel(id)}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* Presenter mode — swipe between full-screen share and participant tiles */}
           {presenterMode && (
             <div className="absolute inset-0">
@@ -3812,7 +4062,7 @@ export function MeetingPage() {
                       />
                       <div className="absolute bottom-2.5 left-3 max-w-[calc(100%-16px)] truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">{rosterLabel(remotePresenterId)} · Presenting</div>
                       {handRaisedByPeerId[remotePresenterId] && (
-                        <div className="absolute top-2 right-2 z-[3] flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
+                        <div className="absolute top-2 right-2 z-3 flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
                           ✋
                         </div>
                       )}
@@ -3845,7 +4095,7 @@ export function MeetingPage() {
                       <video ref={localPresenterRef} playsInline autoPlay muted style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block', background: '#000' }} />
                       <div className="absolute bottom-2.5 left-3 rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">You · Presenting</div>
                       {callLocalSocketId && handRaisedByPeerId[callLocalSocketId] && (
-                        <div className="absolute top-2 right-2 z-[3] flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
+                        <div className="absolute top-2 right-2 z-3 flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
                           ✋
                         </div>
                       )}
@@ -3862,7 +4112,7 @@ export function MeetingPage() {
                         <video ref={localStripRef} playsInline autoPlay muted style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: 'scaleX(-1)' }} />
                         <div className="absolute bottom-2.5 left-3 z-2 rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">You</div>
                         {callLocalSocketId && handRaisedByPeerId[callLocalSocketId] && (
-                          <div className="absolute top-2 right-2 z-[3] flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
+                          <div className="absolute top-2 right-2 z-3 flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
                             ✋
                           </div>
                         )}
@@ -3895,7 +4145,7 @@ export function MeetingPage() {
                           />
                         )}
                         {handRaisedByPeerId[id] && (
-                          <div className="absolute top-2 right-2 z-[3] flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
+                          <div className="absolute top-2 right-2 z-3 flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
                             ✋
                           </div>
                         )}
@@ -3934,7 +4184,7 @@ export function MeetingPage() {
           <div
             className={cx(
               'z-15 overflow-hidden rounded-xl border border-white/12 bg-[#2d2e30] shadow-2xl',
-              presenterMode && 'hidden',
+              (presenterMode || speakerMode) && 'hidden',
               isSoloInCall
                 ? 'absolute top-14 right-2.5 bottom-[104px] left-2.5 sm:top-[62px] sm:right-6 sm:bottom-[108px] sm:left-6'
                 : 'absolute right-2.5 bottom-[88px] aspect-video w-[min(168px,40vw)] sm:bottom-24 sm:right-4 sm:w-[196px]',
@@ -3953,7 +4203,7 @@ export function MeetingPage() {
               />
             )}
             {callLocalSocketId && handRaisedByPeerId[callLocalSocketId] && (
-              <div className="absolute top-1.5 right-1.5 z-[3] flex h-7 w-7 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-base shadow-lg" title="Raised hand">
+              <div className="absolute top-1.5 right-1.5 z-3 flex h-7 w-7 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-base shadow-lg" title="Raised hand">
                 ✋
               </div>
             )}

@@ -1,6 +1,5 @@
 import { lazy, Suspense } from 'react'
 import { Navigate, Route, Routes } from 'react-router-dom'
-import { AgeVerificationGate } from './components/AgeVerificationGate'
 import { ShellBackgroundLayer } from './components/ShellBackgroundLayer'
 import { Layout } from './components/Layout'
 import { HomePage } from './pages/HomePage'
@@ -40,23 +39,21 @@ function RouteFallback() {
 
 export default function App() {
   return (
-    <AgeVerificationGate>
-      <Suspense fallback={<RouteFallback />}>
-        <Routes>
-          <Route path="login" element={<LoginPage />} />
-          <Route path="register" element={<RegisterPage />} />
-          <Route path="m/:code" element={<MeetingPage />} />
-          <Route path="watch/:code" element={<LiveWatchPage />} />
-          <Route path="camera/:token" element={<CameraSourcePage />} />
-          <Route element={<Layout />}>
-            <Route index element={<HomePage />} />
-            <Route path="notes" element={<Navigate to="/?panel=notes" replace />} />
-            <Route path="recordings" element={<RecordingsPage />} />
-            <Route path="settings" element={<SettingsPage />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Route>
-        </Routes>
-      </Suspense>
-    </AgeVerificationGate>
+    <Suspense fallback={<RouteFallback />}>
+      <Routes>
+        <Route path="login" element={<LoginPage />} />
+        <Route path="register" element={<RegisterPage />} />
+        <Route path="m/:code" element={<MeetingPage />} />
+        <Route path="watch/:code" element={<LiveWatchPage />} />
+        <Route path="camera/:token" element={<CameraSourcePage />} />
+        <Route element={<Layout />}>
+          <Route index element={<HomePage />} />
+          <Route path="notes" element={<Navigate to="/?panel=notes" replace />} />
+          <Route path="recordings" element={<RecordingsPage />} />
+          <Route path="settings" element={<SettingsPage />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Route>
+      </Routes>
+    </Suspense>
   )
 }

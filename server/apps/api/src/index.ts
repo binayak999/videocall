@@ -90,7 +90,11 @@ const cspScriptSrc = [
   "'unsafe-inline'",
   "https://cdn.socket.io",
   "https://cdn.tailwindcss.com",
+  "https://www.google.com",
+  "https://www.gstatic.com",
+  "https://accounts.google.com",
 ];
+const cspFrameSrc = ["'self'", "https://accounts.google.com"];
 // COOP is ignored (and browsers console-warn) on non-secure origins like http://192.168.x.x.
 // We omit the header entirely so dev/LAN HTTP stays quiet; re-enable behind HTTPS if you need isolation.
 const crossOriginOpenerPolicy = false;
@@ -103,6 +107,7 @@ app.use(
           useDefaults: true,
           directives: {
             scriptSrc: cspScriptSrc,
+            frameSrc: cspFrameSrc,
             connectSrc: ["'self'", "http:", "https:", "ws:", "wss:"],
             // Default Helmet CSP includes upgrade-insecure-requests → browser fetches
             // https://<lan-ip>:4001/*.css over TLS; our server is HTTP-only → ERR_SSL_PROTOCOL_ERROR.
@@ -116,6 +121,7 @@ app.use(
           useDefaults: true,
           directives: {
             scriptSrc: cspScriptSrc,
+            frameSrc: cspFrameSrc,
             connectSrc: ["'self'", "https:", "wss:", "http:", "ws:"],
           },
         },
