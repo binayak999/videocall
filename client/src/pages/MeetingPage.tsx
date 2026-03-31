@@ -31,7 +31,7 @@ import { useMeetingSpeechLanguage } from '../lib/meetingLanguages'
 import { useMeetingCaptionRecognition } from '../lib/useMeetingCaptionRecognition'
 import { classifyCameraFrame, preloadModerationModel } from '../lib/videoContentModeration'
 import type { Meeting, MeetingPollSaved } from '../lib/types'
-import { Room, RoomEvent, type RemoteParticipant, type RemoteTrack } from 'livekit-client'
+import { DefaultReconnectPolicy, Room, RoomEvent, VideoPresets, type RemoteParticipant, type RemoteTrack } from 'livekit-client'
 import { resolvedRtcMode } from '../lib/rtcMode'
 
 type CallView = 'detail' | 'lobby' | 'call'
@@ -537,6 +537,7 @@ export function MeetingPage() {
 
   // ── Active speaker detection ──────────────────────────────────────────────
   const [activeSpeakerId, setActiveSpeakerId] = useState<string | null>(null)
+  const activeSpeakerIdRef = useRef<string | null>(null)
   const [speakingPeerIds, setSpeakingPeerIds] = useState<Set<string>>(new Set())
   const speakerAudioCtxRef = useRef<AudioContext | null>(null)
   type AnalyserEntry = { source: MediaStreamAudioSourceNode; analyser: AnalyserNode; buf: Uint8Array<ArrayBuffer> }
@@ -1075,6 +1076,7 @@ export function MeetingPage() {
   useEffect(() => {
     if (callView !== 'call') {
       setActiveSpeakerId(null)
+      activeSpeakerIdRef.current = null
       setSpeakingPeerIds(new Set())
       activeSpeakerHoldRef.current = { id: null, since: 0 }
       return
@@ -1112,10 +1114,12 @@ export function MeetingPage() {
       if (loudestId !== null && loudestId !== hold.id) {
         if (hold.id === null || now - hold.since > HOLD_MS) {
           activeSpeakerHoldRef.current = { id: loudestId, since: now }
+          activeSpeakerIdRef.current = loudestId
           setActiveSpeakerId(loudestId)
         }
       } else if (loudestId === null && hold.id !== null && now - hold.since > HOLD_MS) {
         activeSpeakerHoldRef.current = { id: null, since: now }
+        activeSpeakerIdRef.current = null
         setActiveSpeakerId(null)
       }
     }, 150)
@@ -1527,7 +1531,9 @@ export function MeetingPage() {
       let stream: MediaStream | null = null
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: deviceId ? { deviceId: { exact: deviceId } } : true,
+          video: deviceId
+            ? { deviceId: { exact: deviceId }, width: { ideal: 1280, max: 1920 }, height: { ideal: 720, max: 1080 }, frameRate: { ideal: 30, max: 60 } }
+            : { width: { ideal: 1280, max: 1920 }, height: { ideal: 720, max: 1080 }, frameRate: { ideal: 30, max: 60 } },
         })
       } catch (e) {
         const err = e as DOMException
@@ -1653,6 +1659,9 @@ export function MeetingPage() {
         videoEl.srcObject = s
         void applySpeakerSinkIdToEl(videoEl)
         void videoEl.play().catch(() => {})
+      } else if (activeSpeakerIdRef.current === remoteId && speakerMainVideoRef.current) {
+        speakerMainVideoRef.current.srcObject = s
+        void speakerMainVideoRef.current.play().catch(() => {})
       }
     }
 
@@ -1723,6 +1732,9 @@ export function MeetingPage() {
       videoEl.srcObject = stream
       void applySpeakerSinkIdToEl(videoEl)
       void videoEl.play().catch(() => {})
+    } else if (activeSpeakerIdRef.current === peerId && speakerMainVideoRef.current) {
+      speakerMainVideoRef.current.srcObject = stream
+      void speakerMainVideoRef.current.play().catch(() => {})
     }
     void applyRemoteSpeakerTracks()
     if (mst.kind === 'audio') {
@@ -1780,7 +1792,12 @@ export function MeetingPage() {
     try {
       const { url, token } = await getLiveKitJoinToken(code)
       await ensureStream()
-      const room = new Room({ adaptiveStream: true, dynacast: true })
+      const room = new Room({
+        adaptiveStream: true,
+        dynacast: true,
+        disconnectOnPageLeave: false,
+        reconnectPolicy: new DefaultReconnectPolicy(),
+      })
       liveKitRoomRef.current = room
       const onRemoteTrack = (track: RemoteTrack, participant: RemoteParticipant) => {
         if (participant.identity === room.localParticipant.identity) return
@@ -1812,7 +1829,10 @@ export function MeetingPage() {
         liveKitPublishedTracksRef.current.audio = t
       }
       for (const t of ls.getVideoTracks()) {
-        await lp.publishTrack(t)
+        await lp.publishTrack(t, {
+          videoEncoding: VideoPresets.h720.encoding,
+          simulcast: true,
+        })
         liveKitPublishedTracksRef.current.video = t
       }
       for (const p of room.remoteParticipants.values()) {
@@ -3463,7 +3483,7 @@ export function MeetingPage() {
     try {
       await ensureStream()
       const cameraStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640, max: 1280 }, height: { ideal: 480, max: 720 }, frameRate: { ideal: 15, max: 30 } },
+        video: { width: { ideal: 1280, max: 1920 }, height: { ideal: 720, max: 1080 }, frameRate: { ideal: 30, max: 60 } },
         audio: false,
       })
       const newVideoTrack = cameraStream.getVideoTracks()[0]
@@ -3654,11 +3674,11 @@ export function MeetingPage() {
       const maxBitrate =
         sender.track.kind === 'video'
           ? publicViewer
-            ? 320_000
-            : 500_000
+            ? 800_000
+            : 2_000_000
           : publicViewer
             ? 40_000
-            : 48_000
+            : 64_000
       for (const enc of params.encodings) enc.maxBitrate = maxBitrate
       try { await sender.setParameters(params) } catch { /* browser may not support */ }
     }

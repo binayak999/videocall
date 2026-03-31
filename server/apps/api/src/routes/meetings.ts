@@ -454,6 +454,7 @@ router.post("/:code/livekit/token", authMiddleware, async (req, res) => {
       identity: user.id,
       name: user.name,
       metadata: JSON.stringify({ email: user.email }),
+      ttl: '8h',
     });
     at.addGrant({
       roomJoin: true,

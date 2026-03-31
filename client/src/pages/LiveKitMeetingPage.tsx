@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
+  DefaultReconnectPolicy,
   ParticipantEvent,
   Room,
   RoomEvent,
@@ -46,11 +47,17 @@ export function LiveKitMeetingPage() {
   const [err, setErr] = useState<string | null>(null)
 
   const [connected, setConnected] = useState(false)
+  const [reconnecting, setReconnecting] = useState(false)
   const [micOn, setMicOn] = useState(true)
   const [camOn, setCamOn] = useState(true)
   const [remotes, setRemotes] = useState<RemoteParticipant[]>([])
 
-  const room = useMemo(() => new Room({ adaptiveStream: true, dynacast: true }), [])
+  const room = useMemo(() => new Room({
+    adaptiveStream: true,
+    dynacast: true,
+    disconnectOnPageLeave: false,
+    reconnectPolicy: new DefaultReconnectPolicy(),
+  }), [])
   const localVideoRef = useRef<HTMLVideoElement>(null)
   const localAudioRef = useRef<LocalAudioTrack | null>(null)
   const localVideoTrackRef = useRef<LocalVideoTrack | null>(null)
@@ -75,12 +82,16 @@ export function LiveKitMeetingPage() {
   }, [meetingCode])
 
   useEffect(() => {
-    const onConnected = () => setConnected(true)
-    const onDisconnected = () => setConnected(false)
+    const onConnected = () => { setConnected(true); setReconnecting(false) }
+    const onDisconnected = () => { setConnected(false); setReconnecting(false) }
+    const onReconnecting = () => setReconnecting(true)
+    const onReconnected = () => { setConnected(true); setReconnecting(false) }
     const sync = () => setRemotes(Array.from(room.remoteParticipants.values()))
 
     room.on(RoomEvent.Connected, onConnected)
     room.on(RoomEvent.Disconnected, onDisconnected)
+    room.on(RoomEvent.Reconnecting, onReconnecting)
+    room.on(RoomEvent.Reconnected, onReconnected)
     room.on(RoomEvent.ParticipantConnected, sync)
     room.on(RoomEvent.ParticipantDisconnected, sync)
     // Tracks change after a participant connects; trigger re-render so tiles can attach.
@@ -92,6 +103,8 @@ export function LiveKitMeetingPage() {
     return () => {
       room.off(RoomEvent.Connected, onConnected)
       room.off(RoomEvent.Disconnected, onDisconnected)
+      room.off(RoomEvent.Reconnecting, onReconnecting)
+      room.off(RoomEvent.Reconnected, onReconnected)
       room.off(RoomEvent.ParticipantConnected, sync)
       room.off(RoomEvent.ParticipantDisconnected, sync)
       room.off(RoomEvent.TrackPublished, sync)
@@ -210,6 +223,11 @@ export function LiveKitMeetingPage() {
         </div>
       </div>
 
+      {reconnecting && (
+        <div className="border-b border-yellow-500/20 bg-yellow-500/10 px-4 py-2 text-xs text-yellow-200">
+          Reconnecting…
+        </div>
+      )}
       {err && <div className="border-b border-red-500/20 bg-red-500/10 px-4 py-2 text-xs text-red-200">{err}</div>}
 
       <div className="flex min-h-0 flex-1 flex-col gap-3 p-3">
