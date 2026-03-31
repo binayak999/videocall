@@ -7,6 +7,7 @@ import { LoginPage } from './pages/LoginPage'
 import { RegisterPage } from './pages/RegisterPage'
 import { RecordingsPage } from './pages/RecordingsPage'
 import { SettingsPage } from './pages/SettingsPage'
+import { ControlPage } from './pages/ControlPage'
 
 const MeetingPage = lazy(async () => {
   const m = await import('./pages/MeetingPage')
@@ -50,6 +51,7 @@ export default function App() {
           <Route index element={<HomePage />} />
           <Route path="notes" element={<Navigate to="/?panel=notes" replace />} />
           <Route path="recordings" element={<RecordingsPage />} />
+          <Route path="control" element={<ControlPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>

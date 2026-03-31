@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { nanoid } from "nanoid";
+import { AccessToken } from "livekit-server-sdk";
 import { prisma } from "@bandr/db";
 import {
   buildRecordingObjectKey,
@@ -403,6 +404,66 @@ router.get("/:code/polls", authMiddleware, async (req, res) => {
         };
       }),
     });
+  } catch (err: unknown) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.post("/:code/livekit/token", authMiddleware, async (req, res) => {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+
+  const code = meetingCodeParam(req.params.code);
+  if (!code) {
+    res.status(400).json({ error: "Invalid code" });
+    return;
+  }
+
+  const url = process.env.LIVEKIT_URL?.trim();
+  const apiKey = process.env.LIVEKIT_API_KEY?.trim();
+  const apiSecret = process.env.LIVEKIT_API_SECRET?.trim();
+  if (!url || !apiKey || !apiSecret) {
+    res.status(503).json({ error: "LiveKit is not configured" });
+    return;
+  }
+
+  try {
+    const meeting = await prisma.meeting.findUnique({
+      where: { code },
+      select: { id: true },
+    });
+    if (!meeting) {
+      res.status(404).json({ error: "Meeting not found" });
+      return;
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, name: true, email: true },
+    });
+    if (!user) {
+      res.status(401).json({ error: "Unauthorized" });
+      return;
+    }
+
+    const at = new AccessToken(apiKey, apiSecret, {
+      identity: user.id,
+      name: user.name,
+      metadata: JSON.stringify({ email: user.email }),
+    });
+    at.addGrant({
+      roomJoin: true,
+      room: code,
+      canPublish: true,
+      canSubscribe: true,
+      canPublishData: true,
+    });
+    const token = await at.toJwt();
+    res.json({ url, token });
   } catch (err: unknown) {
     console.error(err);
     res.status(500).json({ error: "Internal server error" });

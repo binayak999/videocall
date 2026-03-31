@@ -7,6 +7,7 @@ import {
   errorMessage,
   fetchMeetingCaptions,
   fetchMeetingPolls,
+  getLiveKitJoinToken,
   getMeeting,
   uploadMeetingRecordingViaApi,
 } from '../lib/api'
@@ -30,6 +31,8 @@ import { useMeetingSpeechLanguage } from '../lib/meetingLanguages'
 import { useMeetingCaptionRecognition } from '../lib/useMeetingCaptionRecognition'
 import { classifyCameraFrame, preloadModerationModel } from '../lib/videoContentModeration'
 import type { Meeting, MeetingPollSaved } from '../lib/types'
+import { Room, RoomEvent, type RemoteParticipant, type RemoteTrack } from 'livekit-client'
+import { resolvedRtcMode } from '../lib/rtcMode'
 
 type CallView = 'detail' | 'lobby' | 'call'
 
@@ -482,6 +485,15 @@ export function MeetingPage() {
   const peerVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map())
   const peerVideoCallbackRefs = useRef<Map<string, (el: HTMLVideoElement | null) => void>>(new Map())
   const peerStreamRefs = useRef<Map<string, MediaStream>>(new Map())
+  const participantRosterRef = useRef<Record<string, ParticipantRosterEntry>>({})
+  const liveKitRoomRef = useRef<Room | null>(null)
+  const liveKitPublishedTracksRef = useRef<{ video: MediaStreamTrack | null; audio: MediaStreamTrack | null }>({
+    video: null,
+    audio: null,
+  })
+  const pendingLiveKitTracksByUserIdRef = useRef<Map<string, RemoteTrack[]>>(new Map())
+  const mediaModeRef = useRef<'mesh' | 'livekit'>(resolvedRtcMode())
+  mediaModeRef.current = resolvedRtcMode()
   const localPreviewRef = useRef<HTMLVideoElement>(null)
   const localPipRef = useRef<HTMLVideoElement>(null)
   const localPresenterRef = useRef<HTMLVideoElement>(null)
@@ -966,6 +978,7 @@ export function MeetingPage() {
       if (statsIntervalRef.current) clearInterval(statsIntervalRef.current)
       if (timerRef.current) clearInterval(timerRef.current)
       if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+      void disconnectLiveKitMedia()
     }
   }, [])
 
@@ -979,6 +992,10 @@ export function MeetingPage() {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
     toastTimerRef.current = setTimeout(() => setToast(null), duration)
   }, [])
+
+  useEffect(() => {
+    participantRosterRef.current = participantRoster
+  }, [participantRoster])
 
   useEffect(() => {
     isHostInCallRef.current = isHostInCall
@@ -1195,6 +1212,26 @@ export function MeetingPage() {
   async function pushLocalVideoToPeersAndPreview(videoTrack: MediaStreamTrack) {
     const ls = localStreamRef.current
     if (!ls) return
+    if (mediaModeRef.current === 'livekit' && !screenSharingRef.current) {
+      const room = liveKitRoomRef.current
+      if (room?.state === 'connected') {
+        const lp = room.localParticipant
+        const prev = liveKitPublishedTracksRef.current.video
+        if (prev && prev !== videoTrack) {
+          try {
+            await lp.unpublishTrack(prev)
+          } catch {
+            // ignore
+          }
+        }
+        try {
+          await lp.publishTrack(videoTrack)
+          liveKitPublishedTracksRef.current.video = videoTrack
+        } catch (e) {
+          appendLog('livekit publish video', String(e))
+        }
+      }
+    }
     if (!screenSharingRef.current) {
       for (const [remoteId, { pc }] of peersRef.current.entries()) {
         const sender = pc.getSenders().find(s => s.track?.kind === 'video')
@@ -1664,7 +1701,186 @@ export function MeetingPage() {
     return state
   }
 
+  function findPeerIdForUserId(roster: Record<string, ParticipantRosterEntry>, userId: string): string | undefined {
+    for (const [peerId, entry] of Object.entries(roster)) {
+      if (entry.userId === userId) return peerId
+    }
+    return undefined
+  }
+
+  function attachLiveKitRemoteTrack(peerId: string, track: RemoteTrack) {
+    const mst = track.mediaStreamTrack
+    const stream = peerStreamRefs.current.get(peerId) ?? new MediaStream()
+    for (const existing of stream.getTracks()) {
+      if (existing.kind === mst.kind) {
+        stream.removeTrack(existing)
+      }
+    }
+    stream.addTrack(mst)
+    peerStreamRefs.current.set(peerId, stream)
+    const videoEl = peerVideoRefs.current.get(peerId)
+    if (videoEl) {
+      videoEl.srcObject = stream
+      void applySpeakerSinkIdToEl(videoEl)
+      void videoEl.play().catch(() => {})
+    }
+    void applyRemoteSpeakerTracks()
+    if (mst.kind === 'audio') {
+      setupSpeakerAnalyser(peerId, stream)
+    }
+    if (mst.kind === 'video') {
+      queueMicrotask(() => syncPeerCameraOverlayRef.current(peerId))
+      mst.addEventListener('ended', () => syncPeerCameraOverlayRef.current(peerId))
+      mst.addEventListener('mute', () => syncPeerCameraOverlayRef.current(peerId))
+      mst.addEventListener('unmute', () => syncPeerCameraOverlayRef.current(peerId))
+    }
+  }
+
+  function flushPendingLiveKitTracksForUser(userId: string) {
+    const pending = pendingLiveKitTracksByUserIdRef.current.get(userId)
+    if (!pending || pending.length === 0) return
+    const peerId = findPeerIdForUserId(participantRosterRef.current, userId)
+    if (!peerId) return
+    pendingLiveKitTracksByUserIdRef.current.delete(userId)
+    for (const t of pending) attachLiveKitRemoteTrack(peerId, t)
+  }
+
+  async function disconnectLiveKitMedia() {
+    const room = liveKitRoomRef.current
+    liveKitRoomRef.current = null
+    pendingLiveKitTracksByUserIdRef.current.clear()
+    liveKitPublishedTracksRef.current = { video: null, audio: null }
+    if (!room) return
+    try {
+      const lp = room.localParticipant
+      const ls = localStreamRef.current
+      if (room.state === 'connected' && ls) {
+        for (const t of ls.getTracks()) {
+          try {
+            await lp.unpublishTrack(t)
+          } catch {
+            // ignore
+          }
+        }
+      }
+      room.disconnect()
+    } catch {
+      /* ignore */
+    }
+  }
+
+  async function connectLiveKitMedia(peerList: string[]) {
+    if (liveKitRoomRef.current) {
+      await disconnectLiveKitMedia()
+    }
+    try {
+      const { url, token } = await getLiveKitJoinToken(code)
+      await ensureStream()
+      const room = new Room({ adaptiveStream: true, dynacast: true })
+      liveKitRoomRef.current = room
+      const onRemoteTrack = (track: RemoteTrack, participant: RemoteParticipant) => {
+        if (participant.identity === room.localParticipant.identity) return
+        const uid = participant.identity
+        const peerId = findPeerIdForUserId(participantRosterRef.current, uid)
+        if (!peerId) {
+          const cur = pendingLiveKitTracksByUserIdRef.current.get(uid) ?? []
+          cur.push(track)
+          pendingLiveKitTracksByUserIdRef.current.set(uid, cur)
+          return
+        }
+        attachLiveKitRemoteTrack(peerId, track)
+      }
+      room.on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
+        onRemoteTrack(track, participant)
+      })
+      room.on(RoomEvent.ParticipantDisconnected, p => {
+        const uid = p.identity
+        const peerId = findPeerIdForUserId(participantRosterRef.current, uid)
+        if (peerId) removeLiveKitPeerMedia(peerId)
+        pendingLiveKitTracksByUserIdRef.current.delete(uid)
+      })
+      await room.connect(url, token)
+      const ls = localStreamRef.current
+      if (!ls) throw new Error('No local stream')
+      const lp = room.localParticipant
+      for (const t of ls.getAudioTracks()) {
+        await lp.publishTrack(t)
+        liveKitPublishedTracksRef.current.audio = t
+      }
+      for (const t of ls.getVideoTracks()) {
+        await lp.publishTrack(t)
+        liveKitPublishedTracksRef.current.video = t
+      }
+      for (const p of room.remoteParticipants.values()) {
+        if (p.identity === lp.identity) continue
+        for (const pub of p.trackPublications.values()) {
+          if (pub.isSubscribed && pub.track) onRemoteTrack(pub.track, p)
+        }
+      }
+      for (const pid of peerList) {
+        const entry = participantRosterRef.current[pid]
+        if (entry?.userId) flushPendingLiveKitTracksForUser(entry.userId)
+      }
+      appendLog('livekit', 'connected')
+    } catch (e: unknown) {
+      appendLog('livekit error', String(e))
+      showToast(errorMessage(e))
+      liveKitRoomRef.current = null
+    }
+  }
+
+  async function republishLiveKitLocalTracks() {
+    const room = liveKitRoomRef.current
+    if (!room || room.state !== 'connected') return
+    const lp = room.localParticipant
+    const ls = localStreamRef.current
+    if (!ls) return
+    const a = ls.getAudioTracks()[0]
+    const v = ls.getVideoTracks()[0]
+    if (a && liveKitPublishedTracksRef.current.audio !== a) {
+      if (liveKitPublishedTracksRef.current.audio) {
+        try {
+          await lp.unpublishTrack(liveKitPublishedTracksRef.current.audio)
+        } catch {
+          // ignore
+        }
+      }
+      await lp.publishTrack(a)
+      liveKitPublishedTracksRef.current.audio = a
+    }
+    if (v && liveKitPublishedTracksRef.current.video !== v) {
+      if (liveKitPublishedTracksRef.current.video) {
+        try {
+          await lp.unpublishTrack(liveKitPublishedTracksRef.current.video)
+        } catch {
+          // ignore
+        }
+      }
+      await lp.publishTrack(v)
+      liveKitPublishedTracksRef.current.video = v
+    }
+  }
+
+  function removeLiveKitPeerMedia(peerId: string) {
+    peerVideoRefs.current.delete(peerId)
+    peerVideoCallbackRefs.current.delete(peerId)
+    peerStreamRefs.current.delete(peerId)
+    teardownSpeakerAnalyser(peerId)
+    void applyRemoteSpeakerTracks()
+    setPeerShowVideoFallback(prev => {
+      if (!(peerId in prev)) return prev
+      const next = { ...prev }
+      delete next[peerId]
+      return next
+    })
+    setPeerIds(prev => prev.filter(id => id !== peerId))
+  }
+
   function removePeer(remoteId: string) {
+    if (mediaModeRef.current === 'livekit') {
+      removeLiveKitPeerMedia(remoteId)
+      return
+    }
     const timer = iceRestartTimersRef.current.get(remoteId)
     if (timer) { clearTimeout(timer); iceRestartTimersRef.current.delete(remoteId) }
     peersRef.current.get(remoteId)?.pc.close()
@@ -1686,6 +1902,7 @@ export function MeetingPage() {
   }
 
   function resetAllPeers() {
+    void disconnectLiveKitMedia()
     for (const timer of iceRestartTimersRef.current.values()) clearTimeout(timer)
     iceRestartTimersRef.current.clear()
     for (const s of peersRef.current.values()) s.pc.close()
@@ -1781,7 +1998,13 @@ export function MeetingPage() {
       appendLog('peer-joined', shortId(peerId))
       playMeetingNotificationSound('join')
       showToast(`${userName} joined the call`)
-      if (shouldInitiateOffer(peerId)) void createAndSendOffer(peerId).catch(e => appendLog('offer error', String(e)))
+      if (mediaModeRef.current === 'mesh' && shouldInitiateOffer(peerId)) {
+        void createAndSendOffer(peerId).catch(e => appendLog('offer error', String(e)))
+      }
+      if (mediaModeRef.current === 'livekit') {
+        setPeerIds(prev => (prev.includes(peerId) ? prev : [...prev, peerId]))
+        if (userId) queueMicrotask(() => flushPendingLiveKitTracksForUser(userId))
+      }
       // Re-announce screen share so the newly joined peer learns the current state
       if (screenSharingRef.current) {
         socket.emit('meeting:screenshare', { sharing: true })
@@ -1804,6 +2027,7 @@ export function MeetingPage() {
       const p = payload as { peerId?: unknown }
       if (typeof p.peerId !== 'string') return
       if (!isHostInCallRef.current) return
+      if (mediaModeRef.current === 'livekit') return
       const peerId = p.peerId
       liveViewerPeerIdsRef.current.add(peerId)
       void createAndSendOffer(peerId, { omitFromCallGrid: true }).catch(e =>
@@ -1815,6 +2039,7 @@ export function MeetingPage() {
       const peerId = (payload as { peerId?: unknown }).peerId
       if (typeof peerId !== 'string') return
       if (!isHostInCallRef.current) return
+      if (mediaModeRef.current === 'livekit') return
       if (!liveViewerPeerIdsRef.current.has(peerId)) return
       const state = peersRef.current.get(peerId)
       if (state) void iceRestart(peerId)
@@ -1911,6 +2136,7 @@ export function MeetingPage() {
       }
     })
     socket.on('webrtc:offer', async (msg: unknown) => {
+      if (mediaModeRef.current === 'livekit') return
       if (!msg || typeof msg !== 'object') return
       const { from, sdp } = msg as { from?: unknown; sdp?: unknown }
       if (typeof from !== 'string' || !sdp || typeof sdp !== 'object') return
@@ -1945,6 +2171,7 @@ export function MeetingPage() {
       } catch (e) { appendLog('offer handler error', String(e)) }
     })
     socket.on('webrtc:answer', async (msg: unknown) => {
+      if (mediaModeRef.current === 'livekit') return
       if (!msg || typeof msg !== 'object') return
       const { from, sdp } = msg as { from?: unknown; sdp?: unknown }
       if (typeof from !== 'string' || !sdp || typeof sdp !== 'object') return
@@ -1958,6 +2185,7 @@ export function MeetingPage() {
       } catch (e) { appendLog('answer handler error', String(e)) }
     })
     socket.on('webrtc:ice', async (msg: unknown) => {
+      if (mediaModeRef.current === 'livekit') return
       if (!msg || typeof msg !== 'object') return
       const { from, candidate } = msg as { from?: unknown; candidate?: unknown }
       if (typeof from !== 'string' || !candidate || typeof candidate !== 'object') return
@@ -2492,9 +2720,6 @@ export function MeetingPage() {
           } satisfies ChatMessage]
         })
       : []
-    for (const pid of peerList) {
-      if (shouldInitiateOffer(pid)) void createAndSendOffer(pid).catch(e => appendLog('offer error', String(e)))
-    }
     setActiveMeetingCode(code)
     setChatMessages(history)
     const capHist = Array.isArray(a.captionHistory)
@@ -2560,7 +2785,16 @@ export function MeetingPage() {
           ...(selfEmail ? { userEmail: selfEmail } : {}),
         }
       }
+      participantRosterRef.current = nextRoster
       setParticipantRoster(nextRoster)
+    }
+    if (resolvedRtcMode() === 'mesh') {
+      for (const pid of peerList) {
+        if (shouldInitiateOffer(pid)) void createAndSendOffer(pid).catch(e => appendLog('offer error', String(e)))
+      }
+    } else {
+      setPeerIds(peerList)
+      void connectLiveKitMedia(peerList)
     }
     {
       const raised = Array.isArray(a.handRaisedPeerIds)
@@ -3115,6 +3349,10 @@ export function MeetingPage() {
 
     try {
       if (remoteMicCameraId) {
+        if (mediaModeRef.current === 'livekit') {
+          showToast('Remote device mic is not available in LiveKit mode yet')
+          return
+        }
         const remoteStream = remoteCameraStreamsRef.current.get(remoteMicCameraId)
         const remoteTrack = remoteStream?.getAudioTracks()[0] ?? null
         if (!remoteTrack) throw new Error('Remote device microphone not available')
@@ -3167,6 +3405,7 @@ export function MeetingPage() {
             void renegotiate(remoteId)
           }
         }
+        void republishLiveKitLocalTracks()
       }
 
       audioTrack.enabled = true
@@ -3186,6 +3425,18 @@ export function MeetingPage() {
     if (!next) {
       if (!localStreamRef.current) return
       const localStream = localStreamRef.current
+      if (mediaModeRef.current === 'livekit') {
+        const room = liveKitRoomRef.current
+        const v = liveKitPublishedTracksRef.current.video
+        if (room?.state === 'connected' && v) {
+          try {
+            await room.localParticipant.unpublishTrack(v)
+          } catch {
+            // ignore
+          }
+          liveKitPublishedTracksRef.current.video = null
+        }
+      }
       const pipedRaw = teardownCameraBackgroundPipeline()
       for (const t of localStream.getVideoTracks()) {
         t.enabled = false
@@ -3326,6 +3577,7 @@ export function MeetingPage() {
   }
 
   async function checkNetworkStats() {
+    if (mediaModeRef.current === 'livekit') return
     for (const [, { pc }] of peersRef.current.entries()) {
       if (pc.connectionState !== 'connected') continue
       try {
@@ -3368,6 +3620,7 @@ export function MeetingPage() {
   }
 
   async function iceRestart(remoteId: string) {
+    if (mediaModeRef.current === 'livekit') return
     const state = peersRef.current.get(remoteId)
     if (!state || !socketRef.current?.connected) return
     setHasWeakNetwork(true)
@@ -3403,6 +3656,7 @@ export function MeetingPage() {
   }
 
   async function renegotiate(remoteId: string) {
+    if (mediaModeRef.current === 'livekit') return
     const state = peersRef.current.get(remoteId)
     if (!state || !socketRef.current?.connected) return
     try {
@@ -3441,6 +3695,10 @@ export function MeetingPage() {
   }
 
   async function toggleScreenShare() {
+    if (mediaModeRef.current === 'livekit') {
+      showToast('Screen sharing is not available in LiveKit mode yet')
+      return
+    }
     if (screenSharingRef.current) { void stopScreenShare(); return }
     if (!navigator.mediaDevices?.getDisplayMedia) {
       showToast('Screen share is not supported on this browser/device')

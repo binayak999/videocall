@@ -96,6 +96,13 @@ export async function loginWithGoogle(input: {
   })
 }
 
+export async function getLiveKitJoinToken(meetingCode: string): Promise<{ url: string; token: string }> {
+  return await requestJson<{ url: string; token: string }>(
+    `/api/meetings/${encodeURIComponent(meetingCode)}/livekit/token`,
+    { method: 'POST', auth: true },
+  )
+}
+
 export type MeetingCaptionRow = {
   id: string
   speakerUserId: string

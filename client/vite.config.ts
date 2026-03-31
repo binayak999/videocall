@@ -32,7 +32,7 @@ export default defineConfig(({ mode }) => {
       ],
     },
     server: {
-      allowedHosts: ['e82b-2400-1a00-4b46-41bf-fd4f-ad41-9b8d-d3cf.ngrok-free.app'],
+      allowedHosts: ['4de4-2400-1a00-4b4a-e691-f501-8199-c073-7299.ngrok-free.app'],
       proxy: {
         '/api': {
           target: proxyTarget,
