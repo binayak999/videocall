@@ -1219,7 +1219,7 @@ export function MeetingPage() {
         const prev = liveKitPublishedTracksRef.current.video
         if (prev && prev !== videoTrack) {
           try {
-            await lp.unpublishTrack(prev)
+            await lp.unpublishTrack(prev, false)
           } catch {
             // ignore
           }
@@ -1757,13 +1757,17 @@ export function MeetingPage() {
       if (room.state === 'connected' && ls) {
         for (const t of ls.getTracks()) {
           try {
-            await lp.unpublishTrack(t)
+            // false = do not stop the underlying MediaStreamTrack; MeetingPage owns the
+            // track lifecycle via localStreamRef, so LiveKit must not stop it.
+            await lp.unpublishTrack(t, false)
           } catch {
             // ignore
           }
         }
       }
-      room.disconnect()
+      // false = do not stop local media tracks on disconnect; the tracks in
+      // localStreamRef.current are shared with the local preview and mesh WebRTC.
+      room.disconnect(false)
     } catch {
       /* ignore */
     }
@@ -1825,7 +1829,12 @@ export function MeetingPage() {
     } catch (e: unknown) {
       appendLog('livekit error', String(e))
       showToast(errorMessage(e))
+      const leaked = liveKitRoomRef.current
       liveKitRoomRef.current = null
+      // Disconnect any partially-connected room without stopping local tracks.
+      if (leaked && leaked.state !== 'disconnected') {
+        try { leaked.disconnect(false) } catch { /* ignore */ }
+      }
     }
   }
 
@@ -1840,7 +1849,7 @@ export function MeetingPage() {
     if (a && liveKitPublishedTracksRef.current.audio !== a) {
       if (liveKitPublishedTracksRef.current.audio) {
         try {
-          await lp.unpublishTrack(liveKitPublishedTracksRef.current.audio)
+          await lp.unpublishTrack(liveKitPublishedTracksRef.current.audio, false)
         } catch {
           // ignore
         }
@@ -1851,7 +1860,7 @@ export function MeetingPage() {
     if (v && liveKitPublishedTracksRef.current.video !== v) {
       if (liveKitPublishedTracksRef.current.video) {
         try {
-          await lp.unpublishTrack(liveKitPublishedTracksRef.current.video)
+          await lp.unpublishTrack(liveKitPublishedTracksRef.current.video, false)
         } catch {
           // ignore
         }
