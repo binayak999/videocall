@@ -1326,7 +1326,7 @@ export function MeetingPage() {
       await pushLocalVideoToPeersAndPreview(out)
     } catch (e) {
       appendLog('background pipeline', String(e))
-      showToast('Background effect failed — using normal camera')
+      showToast(`Background effect failed — using normal camera (${errorMessage(e)})`, 6000)
       ls.addTrack(rawTrack)
       await pushLocalVideoToPeersAndPreview(rawTrack)
     }

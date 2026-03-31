@@ -8,7 +8,17 @@ async function loadSegmenter(): Promise<BodySegmenter> {
   if (!segmenterPromise) {
     segmenterPromise = (async () => {
       const tf = await import('@tensorflow/tfjs')
-      await tf.setBackend('webgl')
+      // WebGL can be unavailable/blocked (private browsing, GPU denylist, older devices).
+      // Fall back to WASM/CPU so background effects still work (albeit slower).
+      try {
+        await tf.setBackend('webgl')
+      } catch {
+        try {
+          await tf.setBackend('wasm')
+        } catch {
+          await tf.setBackend('cpu')
+        }
+      }
       await tf.ready()
       const bodySegmentation = await import('@tensorflow-models/body-segmentation')
       return bodySegmentation.createSegmenter(bodySegmentation.SupportedModels.MediaPipeSelfieSegmentation, {
