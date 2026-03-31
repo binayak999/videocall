@@ -2,8 +2,6 @@ import { useEffect, useRef, useState } from 'react'
 
 import type { GestureRecognizer, GestureRecognizerResult } from '@mediapipe/tasks-vision'
 
-import { centerSquareRegionOfInterest } from './mediapipeCenterSquareRoi'
-
 export type VoteGestureStatus = 'off' | 'loading' | 'ready' | 'error'
 
 const MODEL_URL =
@@ -225,72 +223,67 @@ export function useVoteGestureRecognition(options: {
           if (t !== lastVideoTime) {
             lastVideoTime = t
             try {
-              const roi = centerSquareRegionOfInterest(v.videoWidth, v.videoHeight)
-              if (!roi) {
-                thumbStreak.kind = null
-                thumbStreak.count = 0
-                palmStreak.active = false
-                palmStreak.count = 0
-              } else {
-                const tsMs = Math.round(t * 1000)
-                const result = recognizer.recognizeForVideo(v, tsMs, { regionOfInterest: roi })
-                const now = performance.now()
+              const tsMs = Math.round(t * 1000)
+              // Process the full frame so gestures anywhere in the camera view are
+              // detected — a truly "raised" hand is often at the edge/top of the frame
+              // and would be missed by a center-square crop.
+              const result = recognizer.recognizeForVideo(v, tsMs)
+              const now = performance.now()
 
-                let thumbDetectedThisFrame = false
-                if (thumbGesturesEnabledRef.current) {
-                  const kind = pickThumbFromResult(result)
-                  if (kind) {
-                    thumbDetectedThisFrame = true
-                    if (thumbStreak.kind === kind) thumbStreak.count += 1
-                    else {
-                      thumbStreak.kind = kind
-                      thumbStreak.count = 1
-                    }
-                    if (
-                      thumbStreak.count >= STREAK_FRAMES &&
-                      now - lastThumbFire.t >= COOLDOWN_MS
-                    ) {
-                      lastThumbFire.t = now
-                      thumbStreak.kind = null
-                      thumbStreak.count = 0
-                      onGestureRef.current(kind)
-                    }
-                  } else {
+              let thumbDetectedThisFrame = false
+              if (thumbGesturesEnabledRef.current) {
+                const kind = pickThumbFromResult(result)
+                if (kind) {
+                  thumbDetectedThisFrame = true
+                  if (thumbStreak.kind === kind) thumbStreak.count += 1
+                  else {
+                    thumbStreak.kind = kind
+                    thumbStreak.count = 1
+                  }
+                  if (
+                    thumbStreak.count >= STREAK_FRAMES &&
+                    now - lastThumbFire.t >= COOLDOWN_MS
+                  ) {
+                    lastThumbFire.t = now
                     thumbStreak.kind = null
                     thumbStreak.count = 0
+                    onGestureRef.current(kind)
                   }
                 } else {
                   thumbStreak.kind = null
                   thumbStreak.count = 0
                 }
+              } else {
+                thumbStreak.kind = null
+                thumbStreak.count = 0
+              }
 
-                if (onOpenPalmRef.current) {
-                  // Skip palm detection when a thumb gesture is active to prevent
-                  // accidental hand raise during voting.
-                  const palm = !thumbDetectedThisFrame && pickOpenPalmFromResult(result)
-                  if (palm) {
-                    if (palmStreak.active) palmStreak.count += 1
-                    else {
-                      palmStreak.active = true
-                      palmStreak.count = 1
-                    }
-                    if (
-                      palmStreak.count >= PALM_STREAK_FRAMES &&
-                      now - lastPalmFire.t >= PALM_COOLDOWN_MS
-                    ) {
-                      lastPalmFire.t = now
-                      palmStreak.active = false
-                      palmStreak.count = 0
-                      onOpenPalmRef.current()
-                    }
-                  } else {
+              if (onOpenPalmRef.current) {
+                // Skip palm detection when a thumb gesture is active to prevent
+                // accidental hand raise during voting.
+                const palm = !thumbDetectedThisFrame && pickOpenPalmFromResult(result)
+                if (palm) {
+                  if (palmStreak.active) palmStreak.count += 1
+                  else {
+                    palmStreak.active = true
+                    palmStreak.count = 1
+                  }
+                  if (
+                    palmStreak.count >= PALM_STREAK_FRAMES &&
+                    now - lastPalmFire.t >= PALM_COOLDOWN_MS
+                  ) {
+                    lastPalmFire.t = now
                     palmStreak.active = false
                     palmStreak.count = 0
+                    onOpenPalmRef.current()
                   }
                 } else {
                   palmStreak.active = false
                   palmStreak.count = 0
                 }
+              } else {
+                palmStreak.active = false
+                palmStreak.count = 0
               }
             } catch {
               /* single-frame failure */

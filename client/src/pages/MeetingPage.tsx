@@ -32,7 +32,7 @@ import { useMeetingCaptionRecognition } from '../lib/useMeetingCaptionRecognitio
 import { classifyCameraFrame, preloadModerationModel } from '../lib/videoContentModeration'
 import type { Meeting, MeetingPollSaved } from '../lib/types'
 import { DefaultReconnectPolicy, Room, RoomEvent, VideoPresets, type RemoteParticipant, type RemoteTrack } from 'livekit-client'
-import { resolvedRtcMode } from '../lib/rtcMode'
+import { resolvedRtcMode, writeRtcModeToStorage, type RtcMode } from '../lib/rtcMode'
 
 type CallView = 'detail' | 'lobby' | 'call'
 
@@ -336,6 +336,7 @@ export function MeetingPage() {
   const [toast, setToast] = useState<string | null>(null)
   const [inputSignal, setInputSignal] = useState('')
   const [connectBtnDisabled, setConnectBtnDisabled] = useState(false)
+  const [waitingForHost, setWaitingForHost] = useState(false)
   const [previewCamOff, setPreviewCamOff] = useState(true)
   const [pipCamOff, setPipCamOff] = useState(true)
   const [showDebug, setShowDebug] = useState(false)
@@ -441,7 +442,27 @@ export function MeetingPage() {
     getSocket: getSignalingSocket,
   })
   const localStreamRef = useRef<MediaStream | null>(null)
-  const getLocalCameraStream = useCallback(() => localStreamRef.current, [])
+  /** Dedicated stream for gesture recognition — always carries the raw camera track so
+   *  background blur / image-replacement does not degrade hand-pose detection. */
+  const rawGestureStreamRef = useRef<MediaStream | null>(null)
+  const getLocalCameraStream = useCallback(() => {
+    // When a background pipeline is active the raw (unprocessed) camera track lives
+    // in the pipeline, not in localStreamRef.  Feed it directly to MediaPipe so that
+    // blurred / replaced backgrounds don't reduce hand-gesture detection accuracy.
+    // cameraBgPipelineRef is declared later in this component function, but closures
+    // capture the binding (not the value), so it is fully initialised by call time.
+    // eslint-disable-next-line @typescript-eslint/no-use-before-define
+    const rawTrack = cameraBgPipelineRef.current?.getRawTrack()
+    if (rawTrack && rawTrack.readyState === 'live') {
+      const existing = rawGestureStreamRef.current
+      if (existing?.getVideoTracks()[0]?.id === rawTrack.id) return existing
+      const s = new MediaStream([rawTrack])
+      rawGestureStreamRef.current = s
+      return s
+    }
+    rawGestureStreamRef.current = null
+    return localStreamRef.current
+  }, [])
   const submitMeetingVote = useCallback((choice: MeetingVoteChoice) => {
     const sid = activeVoteSessionIdRef.current
     if (!sid) return
@@ -1229,7 +1250,7 @@ export function MeetingPage() {
           }
         }
         try {
-          await lp.publishTrack(videoTrack)
+          await lp.publishTrack(videoTrack, { videoEncoding: VideoPresets.h720.encoding })
           liveKitPublishedTracksRef.current.video = videoTrack
         } catch (e) {
           appendLog('livekit publish video', String(e))
@@ -1829,10 +1850,7 @@ export function MeetingPage() {
         liveKitPublishedTracksRef.current.audio = t
       }
       for (const t of ls.getVideoTracks()) {
-        await lp.publishTrack(t, {
-          videoEncoding: VideoPresets.h720.encoding,
-          simulcast: true,
-        })
+        await lp.publishTrack(t, { videoEncoding: VideoPresets.h720.encoding })
         liveKitPublishedTracksRef.current.video = t
       }
       for (const p of room.remoteParticipants.values()) {
@@ -1885,7 +1903,7 @@ export function MeetingPage() {
           // ignore
         }
       }
-      await lp.publishTrack(v)
+      await lp.publishTrack(v, { videoEncoding: VideoPresets.h720.encoding })
       liveKitPublishedTracksRef.current.video = v
     }
   }
@@ -2038,6 +2056,30 @@ export function MeetingPage() {
       if (screenSharingRef.current) {
         socket.emit('meeting:screenshare', { sharing: true })
       }
+      // Re-announce our RTC mode so the new peer can detect any mismatch
+      socketRef.current?.emit('meeting:rtc-mode', { mode: resolvedRtcMode() })
+    })
+    socket.on('meeting:rtc-mode', (payload: unknown) => {
+      if (!payload || typeof payload !== 'object') return
+      const p = payload as { peerId?: unknown; mode?: unknown; isHost?: unknown }
+      if (typeof p.mode !== 'string' || p.isHost !== true) return
+      const hostMode = p.mode as RtcMode
+      if (hostMode !== 'mesh' && hostMode !== 'livekit') return
+      const myMode = resolvedRtcMode()
+      if (hostMode === myMode) return
+      // Host announced a different mode. If still in lobby, auto-switch silently.
+      // If already in an active call, ask them to rejoin.
+      const inActiveCall = peersRef.current.size > 0 || liveKitRoomRef.current?.state === 'connected'
+      if (inActiveCall) {
+        showToast(
+          `Host switched to ${hostMode} mode. Leave and rejoin to match.`,
+          8000,
+        )
+      } else {
+        writeRtcModeToStorage(hostMode)
+        mediaModeRef.current = hostMode
+        showToast(`Host is using ${hostMode} mode — switching automatically`, 4000)
+      }
     })
     socket.on('meeting:hand-raise', (payload: unknown) => {
       if (!payload || typeof payload !== 'object') return
@@ -2104,12 +2146,14 @@ export function MeetingPage() {
     })
     socket.on('meeting:join-approved', (payload: unknown) => {
       if (!payload || typeof payload !== 'object') return
+      setWaitingForHost(false)
       finalizeJoin(payload as Record<string, unknown>)
     })
     socket.on('meeting:join-denied', (payload: unknown) => {
       const p = payload && typeof payload === 'object' ? payload as { message?: unknown } : {}
-      const msg = typeof p.message === 'string' ? p.message : 'Host denied your request.'
+      const msg = typeof p.message === 'string' ? p.message : 'Could not join the meeting.'
       setStatusLine(msg)
+      setWaitingForHost(false)
       showToast(msg)
       setConnectBtnDisabled(false)
       socketRef.current?.disconnect()
@@ -2825,6 +2869,8 @@ export function MeetingPage() {
       setPeerIds(peerList)
       void connectLiveKitMedia(peerList)
     }
+    // Announce our RTC mode so peers can detect a mismatch
+    socketRef.current?.emit('meeting:rtc-mode', { mode: resolvedRtcMode() })
     {
       const raised = Array.isArray(a.handRaisedPeerIds)
         ? (a.handRaisedPeerIds as unknown[]).filter((id): id is string => typeof id === 'string')
@@ -3002,8 +3048,9 @@ export function MeetingPage() {
       const a = ack as Record<string, unknown>
       if (a.ok !== true) {
         if (a.pending === true) {
-          const msg = typeof a.message === 'string' ? a.message : 'Waiting for host approval.'
+          const msg = typeof a.message === 'string' ? a.message : 'Waiting for host to admit you.'
           setStatusLine(msg)
+          setWaitingForHost(true)
           showToast(msg)
           return
         }
@@ -3012,6 +3059,15 @@ export function MeetingPage() {
         setConnectBtnDisabled(false)
         socketRef.current?.disconnect()
         return
+      }
+      // If we are NOT the host and the host has already chosen a mode, adopt it.
+      if (a.isHost !== true && (a.hostMode === 'mesh' || a.hostMode === 'livekit')) {
+        const hostMode = a.hostMode as RtcMode
+        if (hostMode !== resolvedRtcMode()) {
+          writeRtcModeToStorage(hostMode)
+          mediaModeRef.current = hostMode
+          showToast(`Host is using ${hostMode} mode — switching automatically`, 4000)
+        }
       }
       finalizeJoin(a)
     })
@@ -3068,6 +3124,7 @@ export function MeetingPage() {
     setControlledBy(null)
     setIncomingControlReq(null)
     setConnectBtnDisabled(false)
+    setWaitingForHost(false)
     stopTimer()
     stopNetworkStats()
     setChatMessages([])
@@ -4135,7 +4192,17 @@ export function MeetingPage() {
                 </div>
 
                 <div className="flex w-full flex-col justify-center gap-4 lg:w-[min(100%,280px)] lg:shrink-0">
-                  <p className="min-h-5 text-sm text-white/40">{statusLine}</p>
+                  {waitingForHost ? (
+                    <div className="flex items-center gap-2 rounded-xl border border-[#f59e0b]/30 bg-[#f59e0b]/10 px-3 py-2.5">
+                      <span className="relative flex h-2.5 w-2.5 shrink-0">
+                        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[#f59e0b] opacity-60" />
+                        <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-[#f59e0b]" />
+                      </span>
+                      <p className="text-sm text-[#f59e0b]/90">{statusLine}</p>
+                    </div>
+                  ) : (
+                    <p className="min-h-5 text-sm text-white/40">{statusLine}</p>
+                  )}
 
                   <div>
                     <p className="text-[0.6rem] font-semibold uppercase tracking-wider text-white/30">Meeting code</p>
@@ -4166,7 +4233,7 @@ export function MeetingPage() {
                     disabled={connectBtnDisabled}
                     className="flex h-11 w-full items-center justify-center rounded-2xl bg-[#f59e0b] text-sm font-semibold text-black transition hover:bg-[#fbbf24] disabled:cursor-not-allowed disabled:opacity-45"
                   >
-                    Join now
+                    {waitingForHost ? 'Waiting for host…' : 'Join now'}
                   </button>
                   <Link
                     to="/"
@@ -4568,6 +4635,11 @@ export function MeetingPage() {
                                   Host
                                 </span>
                               )}
+                              {callLocalSocketId && handRaisedByPeerId[callLocalSocketId] && (
+                                <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-300" title="Hand raised">
+                                  ✋ Hand raised
+                                </span>
+                              )}
                             </div>
                             {youEmailLine ? (
                               <p className="mt-0.5 break-all text-[11px] leading-snug text-white/38">{youEmailLine}</p>
@@ -4609,6 +4681,11 @@ export function MeetingPage() {
                                   {hostPeerId === id && (
                                     <span className="inline-flex shrink-0 rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-300">
                                       Host
+                                    </span>
+                                  )}
+                                  {handRaisedByPeerId[id] && (
+                                    <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-amber-500/20 px-2 py-0.5 text-[10px] font-semibold text-amber-300" title="Hand raised">
+                                      ✋ Hand raised
                                     </span>
                                   )}
                                 </div>

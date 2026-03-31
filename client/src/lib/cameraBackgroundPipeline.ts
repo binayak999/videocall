@@ -59,6 +59,18 @@ export async function startCameraBackgroundPipeline(
   video.srcObject = new MediaStream([rawTrack])
   await video.play().catch(() => {})
 
+  // Ensure the video has decoded at least one frame so videoWidth/videoHeight are available.
+  // play() resolves on canplay, but dimensions are sometimes still 0 on the same microtask.
+  if (video.videoWidth < 16) {
+    await new Promise<void>(resolve => {
+      const check = () => { if (video.videoWidth >= 16) resolve() }
+      video.addEventListener('resize', check, { once: true })
+      // Fallback: poll in case the event already fired
+      const t = setInterval(() => { if (video.videoWidth >= 16) { clearInterval(t); resolve() } }, 50)
+      setTimeout(() => { clearInterval(t); resolve() }, 2000)
+    })
+  }
+
   const canvas = document.createElement('canvas')
   const ctx = canvas.getContext('2d', { alpha: false })
   if (!ctx) throw new Error('Canvas 2D not available')
@@ -80,6 +92,23 @@ export async function startCameraBackgroundPipeline(
   let blurAmount = Math.min(20, Math.max(1, options?.blurAmount ?? 12))
   let running = true
   let raf = 0
+
+  // Pre-size the canvas and draw the first raw frame so the captureStream track
+  // starts at the correct resolution with real content instead of 300×150 blank.
+  // This prevents WebRTC from negotiating/encoding a tiny black frame first.
+  {
+    const vw = video.videoWidth
+    const vh = video.videoHeight
+    if (vw >= 16 && vh >= 16) {
+      const maxW = 960
+      const scale = vw > maxW ? maxW / vw : 1
+      canvas.width = Math.round(vw * scale)
+      canvas.height = Math.round(vh * scale)
+      personCanvas.width = canvas.width
+      personCanvas.height = canvas.height
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+    }
+  }
 
   const outputStream = canvas.captureStream(30)
   const processedTrack = outputStream.getVideoTracks()[0]

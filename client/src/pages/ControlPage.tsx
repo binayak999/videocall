@@ -30,6 +30,16 @@ export function ControlPage() {
         Pick how call media is carried: mesh (peer-to-peer over the existing signaling server) or LiveKit (SFU). Both stay
         available; changing this reloads the app and applies to the next meeting you join.
       </p>
+      <div className="mt-3 flex items-start gap-2 rounded-xl border border-[#f59e0b]/40 bg-[#f59e0b]/8 px-4 py-3">
+        <svg className="mt-0.5 h-4 w-4 shrink-0 text-[#f59e0b]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M12 2a10 10 0 100 20A10 10 0 0012 2z" />
+        </svg>
+        <p className="text-sm text-(--nexivo-text-muted)">
+          <span className="font-semibold text-(--nexivo-text)">Host controls the mode.</span>{' '}
+          When you start a meeting as the host, your selected mode is applied to every participant automatically.
+          Guests who join after you adopt your mode and don't need to change anything here.
+        </p>
+      </div>
 
       <div className={cx('mt-5 space-y-4', card)}>
         <div>
