@@ -57,7 +57,7 @@ export async function startCameraBackgroundPipeline(
   rawTrack: MediaStreamTrack,
   initialMode: CameraBackgroundEffectMode,
   backgroundImage: HTMLImageElement | null,
-  options?: { blurAmount?: number },
+  options?: { blurAmount?: number; onFrameError?: (err: unknown) => void },
 ): Promise<CameraBackgroundPipeline> {
   const bodySegmentation = await import('@tensorflow-models/body-segmentation')
   const segmenter = await loadSegmenter()
@@ -102,6 +102,7 @@ export async function startCameraBackgroundPipeline(
   let blurAmount = Math.min(20, Math.max(1, options?.blurAmount ?? 12))
   let running = true
   let raf = 0
+  let frameErrorReported = false
 
   // Pre-size the canvas and draw the first raw frame so the captureStream track
   // starts at the correct resolution with real content instead of 300×150 blank.
@@ -206,7 +207,15 @@ export async function startCameraBackgroundPipeline(
       personDrawCtx.globalCompositeOperation = 'source-over'
 
       drawCtx.drawImage(personCanvas, 0, 0)
-    } catch {
+    } catch (e: unknown) {
+      if (!frameErrorReported) {
+        frameErrorReported = true
+        try {
+          options?.onFrameError?.(e)
+        } catch {
+          // ignore
+        }
+      }
       resizeToVideo()
       if (canvas.width >= 16 && canvas.height >= 16) {
         drawCtx.drawImage(video, 0, 0, canvas.width, canvas.height)

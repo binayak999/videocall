@@ -1318,7 +1318,20 @@ export function MeetingPage() {
         rawTrack,
         isBlurMode(mode) ? 'blur' : 'image',
         mode === 'image' ? bgImageEl : null,
-        isBlurMode(mode) ? { blurAmount: blurAmountForMode(mode) } : undefined,
+        isBlurMode(mode)
+          ? {
+              blurAmount: blurAmountForMode(mode),
+              onFrameError: (e) => {
+                appendLog('background pipeline frame', String(e))
+                showToast(`Background effect failed while running (${errorMessage(e)})`, 7000)
+              },
+            }
+          : {
+              onFrameError: (e) => {
+                appendLog('background pipeline frame', String(e))
+                showToast(`Background effect failed while running (${errorMessage(e)})`, 7000)
+              },
+            },
       )
       cameraBgPipelineRef.current = pipeline
       const out = pipeline.getProcessedTrack()
