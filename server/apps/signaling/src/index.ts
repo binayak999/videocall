@@ -76,6 +76,20 @@ const roomHandRaisedPeers = new Map<string, Set<string>>();
 /** True while the meeting host has announced active in-call recording (client-side capture). */
 const roomMeetingRecording = new Map<string, boolean>();
 const roomPendingJoinIds = new Map<string, Set<string>>();
+/**
+ * meetingId → set of userIds who have successfully joined this meeting at least once.
+ * These users skip the waiting-room on every subsequent join within the same server session.
+ */
+const meetingApprovedUsers = new Map<string, Set<string>>();
+
+function rememberApprovedUser(meetingId: string, userId: string): void {
+  if (!meetingApprovedUsers.has(meetingId)) meetingApprovedUsers.set(meetingId, new Set());
+  meetingApprovedUsers.get(meetingId)!.add(userId);
+}
+
+function isApprovedUser(meetingId: string, userId: string): boolean {
+  return meetingApprovedUsers.get(meetingId)?.has(userId) ?? false;
+}
 const pendingJoinBySocketId = new Map<
   string,
   { room: string; meetingId: string; code: string; requesterName: string; requesterUserId: string }
@@ -520,6 +534,8 @@ async function buildJoinApprovedPayload(
   (participantSocket.data as MeetingSocketData).meetingRoom = room;
   (participantSocket.data as MeetingSocketData).meetingId = meetingId;
   const reqData = participantSocket.data as MeetingSocketData;
+  // Remember this user so they never land in the waiting room again for this meeting.
+  rememberApprovedUser(meetingId, reqData.userId);
   await restoreOpenPollForRoom(room, meetingId);
   emitAttentionSyncToHosts(room);
   participantSocket.to(room).emit("meeting:peer-joined", {
@@ -1000,6 +1016,7 @@ io.on("connection", (socket) => {
     const isHost = meeting.hostId === userId;
 
     if (!isHost) {
+      // Live-collab pre-approved guests skip straight in.
       const collabApproved = roomLiveCollabApprovedUserIds.get(room);
       if (collabApproved?.has(userId)) {
         collabApproved.delete(userId);
@@ -1012,6 +1029,20 @@ io.on("connection", (socket) => {
         }
         return;
       }
+
+      // Previously approved users (joined at least once before) are admitted without waiting.
+      if (isApprovedUser(meeting.id, userId)) {
+        try {
+          ack(await buildJoinApprovedPayload(socket, room, meeting.id, trimmed));
+        } catch (err) {
+          console.error(err);
+          ack({ ok: false, error: "Could not join room" });
+        }
+        return;
+      }
+
+      // First-time guest: always place in the waiting queue so the host can
+      // explicitly admit them, regardless of whether the host is already present.
       pendingJoinBySocketId.set(socket.id, {
         room,
         meetingId: meeting.id,
@@ -1021,18 +1052,20 @@ io.on("connection", (socket) => {
       });
       if (!roomPendingJoinIds.has(room)) roomPendingJoinIds.set(room, new Set());
       roomPendingJoinIds.get(room)!.add(socket.id);
+      ack({ ok: false, pending: true, message: "Waiting for host to admit you." });
 
+      // If the host is already in the room notify them straight away so they
+      // can act on the request without having to wait for their own join flow.
       const hostSockets = (await io.in(room).fetchSockets()).filter(
         (s) => (s.data as MeetingSocketData).userId === meeting.hostId,
       );
-      for (const hs of hostSockets) {
-        io.to(hs.id).emit("meeting:join-request", {
+      for (const hostSocket of hostSockets) {
+        io.to(hostSocket.id).emit("meeting:join-request", {
           requestId: socket.id,
           name: (socket.data as MeetingSocketData).userName,
           userId,
         });
       }
-      ack({ ok: false, pending: true, message: "Waiting for host approval." });
       return;
     }
 
@@ -1056,7 +1089,12 @@ io.on("connection", (socket) => {
     await socket.join(room);
     (socket.data as MeetingSocketData).meetingRoom = room;
     (socket.data as MeetingSocketData).meetingId = meeting.id;
+    rememberApprovedUser(meeting.id, (socket.data as MeetingSocketData).userId);
+
+    // Host has joined — send a join-request notification for every guest who
+    // was already in the waiting queue so the host can admit them one by one.
     notifyHostOfPending(room, socket.id);
+
     notifyHostOfLiveCollabPending(room, socket.id);
     await restoreOpenPollForRoom(room, meeting.id);
     emitAttentionSyncToHosts(room);

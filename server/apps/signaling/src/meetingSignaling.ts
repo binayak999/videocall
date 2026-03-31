@@ -9,6 +9,11 @@ function roomIdForCode(code: string): string {
   return `${ROOM_PREFIX}${code.trim()}`;
 }
 
+/** socket.id of the host for each active room. */
+const roomHosts = new Map<string, string>();
+/** RTC mode ('mesh' | 'livekit') chosen by the host for each active room. */
+const roomModes = new Map<string, string>();
+
 type JoinAck =
   | {
       ok: true;
@@ -17,6 +22,8 @@ type JoinAck =
       peerCount: number;
       /** Other participants' socket ids (mesh signaling). */
       peerIds: string[];
+      /** RTC mode the host has chosen for this room, if already announced. */
+      hostMode: string | null;
     }
   | { ok: false; error: string };
 
@@ -61,6 +68,12 @@ export function registerMeetingSignaling(io: Server): void {
         const peerCount = roomSockets?.size ?? 0;
         const isHost = peerCount === 1;
 
+        if (isHost) {
+          // New host — take ownership and clear any stale mode from a previous session.
+          roomHosts.set(room, socket.id);
+          roomModes.delete(room);
+        }
+
         const peerIds: string[] = [];
         if (roomSockets !== undefined) {
           for (const sid of roomSockets) {
@@ -81,12 +94,25 @@ export function registerMeetingSignaling(io: Server): void {
           isHost,
           peerCount,
           peerIds,
+          hostMode: roomModes.get(room) ?? null,
         });
       },
     );
 
     socket.on("meeting:leave", () => {
       leaveCurrentRoom(socket, "left");
+    });
+
+    // Only the host may set the room's RTC mode; relay it to all peers with isHost flag.
+    socket.on("meeting:rtc-mode", (payload: unknown) => {
+      const room = socket.data.currentRoom;
+      if (!room || !isRecord(payload)) return;
+      const mode = typeof payload.mode === "string" ? payload.mode : null;
+      if (!mode) return;
+      const isRoomHost = roomHosts.get(room) === socket.id;
+      if (!isRoomHost) return; // non-hosts cannot override the room mode
+      roomModes.set(room, mode);
+      socket.to(room).emit("meeting:rtc-mode", { peerId: socket.id, mode, isHost: true });
     });
 
     socket.on("webrtc:offer", (payload: unknown) => {
@@ -115,6 +141,11 @@ function leaveCurrentRoom(socket: Socket, reason: string): void {
   socket.data.currentRoom = undefined;
   void socket.leave(room);
   socket.to(room).emit("meeting:peer-left", { reason, peerId: socket.id });
+  // If the host left, clear room ownership so the next joiner becomes host.
+  if (roomHosts.get(room) === socket.id) {
+    roomHosts.delete(room);
+    roomModes.delete(room);
+  }
 }
 
 function relayWebRtc(
