@@ -246,7 +246,7 @@ export function HostAgentPanel({
               onChange={e => setAutopilotEnabled(e.target.checked)}
             />
             <span>
-              Autopilot: listen to live captions and speak answers automatically (host only).
+              Autopilot: when someone says your name (host profile), answer from your knowledge base — with captions on, or via audio when captions are off (host only).
             </span>
           </label>
         </div>

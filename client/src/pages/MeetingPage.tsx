@@ -9,6 +9,7 @@ import {
   fetchMeetingPolls,
   getLiveKitJoinToken,
   getMeeting,
+  hostAgentTranscribe,
   hostAgentChat,
   hostAgentTts,
   uploadMeetingRecordingViaApi,
@@ -383,6 +384,10 @@ export function MeetingPage() {
   const hostAgentAutopilotBusyRef = useRef(false)
   const hostAgentAutopilotLastKeyRef = useRef<string | null>(null)
   const hostAgentAutopilotLastAtRef = useRef(0)
+  const hostAgentAutopilotRecorderRef = useRef<MediaRecorder | null>(null)
+  const hostAgentAutopilotTranscriptRef = useRef('')
+  const hostAgentAutopilotLastQuestionAtRef = useRef(0)
+  const hostAgentAutopilotLastSpokenAtRef = useRef(0)
   const [callSettingsOpen, setCallSettingsOpen] = useState(false)
   const [callSettingsTab, setCallSettingsTab] = useState<'features' | 'settings'>('features')
   const [recordingActive, setRecordingActive] = useState(false)
@@ -1724,12 +1729,23 @@ export function MeetingPage() {
     showToast('AI voice is live (your mic is replaced)')
   }
 
-  function isLikelyQuestionForHost(text: string): boolean {
-    const t = text.trim().toLowerCase()
-    if (!t) return false
-    if (t.endsWith('?')) return true
-    if (/^(can|could|would|should|do|does|did|are|is|was|were|will|what|why|how|when|where)\b/.test(t)) return true
-    if (t.includes('can you') || t.includes('could you') || t.includes('what do you think')) return true
+  /** Autopilot only fires when someone addresses the host by name (meeting host profile, else JWT name). */
+  function textMentionsHostName(text: string, hostName: string): boolean {
+    const name = hostName.trim()
+    const raw = text.trim()
+    if (!name || !raw) return false
+    const lower = raw.toLowerCase()
+    const lowerFull = name.toLowerCase()
+    if (lowerFull.length >= 2 && lower.includes(lowerFull)) return true
+    const parts = name.split(/\s+/).filter(p => p.length >= 2)
+    for (const p of parts) {
+      const escaped = p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      try {
+        if (new RegExp(`\\b${escaped}\\b`, 'i').test(raw)) return true
+      } catch {
+        /* ignore */
+      }
+    }
     return false
   }
 
@@ -1746,6 +1762,10 @@ export function MeetingPage() {
     if (!liveCaptionsEnabled) return
     if (hostAgentAutopilotBusyRef.current) return
 
+    const hostName =
+      meeting?.host?.name?.trim() || getJwtProfile(getToken() ?? '').name.trim()
+    if (!hostName) return
+
     const last = captionLines.length > 0 ? captionLines[captionLines.length - 1] : null
     if (!last || !last.final) return
     if (last.userId === myUserIdRef.current) return
@@ -1756,14 +1776,13 @@ export function MeetingPage() {
 
     // Mark as seen even if it's not a question (prevents re-processing the same last line).
     hostAgentAutopilotLastKeyRef.current = last.key
-    if (!isLikelyQuestionForHost(last.text)) return
+    if (!textMentionsHostName(last.text, hostName)) return
 
     hostAgentAutopilotBusyRef.current = true
     hostAgentAutopilotLastAtRef.current = now
 
     void (async () => {
       try {
-        // If AI is already speaking, skip this turn.
         if (aiVoiceStopRef.current) return
         const kb = hostAgentKbRef.current.trim()
         if (kb.length === 0) {
@@ -1773,7 +1792,7 @@ export function MeetingPage() {
         const ctx = buildRecentMeetingContext(captionLines, 18)
         const question = `${last.speakerName}: ${last.text}`
         const r = await hostAgentChat(code, {
-          message: `You must respond as the host. Answer this question in one concise spoken paragraph:\\n${question}`,
+          message: `You must respond as the host. They addressed you by name. Answer in one concise spoken paragraph:\\n${question}`,
           knowledgeBase: kb,
           meetingContext: ctx.length > 0 ? ctx : undefined,
         })
@@ -1787,7 +1806,140 @@ export function MeetingPage() {
         hostAgentAutopilotBusyRef.current = false
       }
     })()
-  }, [captionLines, callView, code, hostAgentAutopilotEnabled, isHostInCall, liveCaptionsEnabled])
+  }, [
+    captionLines,
+    callView,
+    code,
+    hostAgentAutopilotEnabled,
+    isHostInCall,
+    liveCaptionsEnabled,
+    meeting?.host?.name,
+  ])
+
+  // Autopilot without captions: mix remote audio → chunked STT → detect questions → respond with TTS.
+  useEffect(() => {
+    if (!hostAgentAutopilotEnabled) return
+    if (callView !== 'call') return
+    if (!isHostInCall) return
+    if (liveCaptionsEnabled) return
+
+    const hostName =
+      meeting?.host?.name?.trim() || getJwtProfile(getToken() ?? '').name.trim()
+    if (!hostName) {
+      showToast('Autopilot needs your display name (host profile or account name).')
+      return
+    }
+
+    // Must have a knowledge base to answer "as host".
+    const kb = hostAgentKbRef.current.trim()
+    if (kb.length === 0) {
+      showToast('Autopilot needs a knowledge base (paste it in Host AI stand-in).')
+      return
+    }
+
+    // Start (or keep) a recorder on the remote-audio mix graph.
+    const { dest } = ensureSpeakerMixGraph()
+    const track = syncSpeakerMixInputs()
+    try { void speakerMixCtxRef.current?.resume() } catch { /* ignore */ }
+
+    const stream = dest.stream
+    if (!track || stream.getAudioTracks().length === 0) {
+      showToast('Autopilot: waiting for participant audio…')
+      return
+    }
+
+    if (hostAgentAutopilotRecorderRef.current) {
+      return
+    }
+
+    let stopped = false
+    const recorderMime =
+      typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : 'audio/webm'
+
+    let mr: MediaRecorder
+    try {
+      mr = new MediaRecorder(stream, { mimeType: recorderMime })
+    } catch {
+      showToast('Autopilot: audio recording is not supported in this browser.')
+      return
+    }
+
+    hostAgentAutopilotRecorderRef.current = mr
+
+    mr.ondataavailable = (e) => {
+      if (stopped) return
+      const blob = e.data
+      if (!blob || blob.size < 5000) return
+
+      // If AI is speaking, avoid feedback loops and unnecessary STT.
+      if (aiVoiceStopRef.current) return
+
+      void (async () => {
+        try {
+          // STT
+          const stt = await hostAgentTranscribe(code, blob)
+          const chunk = stt.text.trim()
+          if (!chunk) return
+
+          const prev = hostAgentAutopilotTranscriptRef.current
+          const merged = `${prev}${prev.length > 0 ? ' ' : ''}${chunk}`.trim()
+          hostAgentAutopilotTranscriptRef.current = merged.slice(-6000)
+
+          const now = Date.now()
+          const lastText = chunk
+          if (!textMentionsHostName(lastText, hostName)) return
+
+          // Throttle actual answers.
+          if (now - hostAgentAutopilotLastSpokenAtRef.current < 12_000) return
+          hostAgentAutopilotLastQuestionAtRef.current = now
+
+          hostAgentAutopilotBusyRef.current = true
+          const ctxText = hostAgentAutopilotTranscriptRef.current
+          const r = await hostAgentChat(code, {
+            message: `You must respond as the host. They said your name (speech-to-text may be imperfect): "${lastText}". Reply in one concise spoken paragraph.`,
+            knowledgeBase: kb,
+            meetingContext: ctxText.length > 0 ? `Recent transcript (imperfect):\n${ctxText}` : undefined,
+          })
+          const answer = r.reply.trim()
+          if (!answer) return
+          const audio = await hostAgentTts(code, { text: answer })
+          hostAgentAutopilotLastSpokenAtRef.current = now
+          await speakAudioBlobInMeeting(audio)
+        } catch (err: unknown) {
+          showToast(errorMessage(err))
+        } finally {
+          hostAgentAutopilotBusyRef.current = false
+        }
+      })()
+    }
+
+    mr.onstop = () => {
+      hostAgentAutopilotRecorderRef.current = null
+    }
+
+    try {
+      // timeslice → periodic dataavailable
+      mr.start(2200)
+      showToast('Autopilot is listening (audio STT)')
+    } catch {
+      hostAgentAutopilotRecorderRef.current = null
+      showToast('Autopilot: could not start audio recorder.')
+      return
+    }
+
+    return () => {
+      stopped = true
+      try {
+        mr.stop()
+      } catch {
+        /* ignore */
+      }
+      hostAgentAutopilotRecorderRef.current = null
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hostAgentAutopilotEnabled, callView, isHostInCall, liveCaptionsEnabled, code, meeting?.host?.name])
 
   async function switchSpeakerDevice(deviceId: string | null) {
     setActiveSpeakerDeviceId(deviceId)
