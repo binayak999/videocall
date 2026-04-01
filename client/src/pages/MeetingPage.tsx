@@ -31,7 +31,20 @@ import { useMeetingSpeechLanguage } from '../lib/meetingLanguages'
 import { useMeetingCaptionRecognition } from '../lib/useMeetingCaptionRecognition'
 import { classifyCameraFrame, preloadModerationModel } from '../lib/videoContentModeration'
 import type { Meeting, MeetingPollSaved } from '../lib/types'
-import { DefaultReconnectPolicy, Room, RoomEvent, VideoPresets, type RemoteParticipant, type RemoteTrack } from 'livekit-client'
+import {
+  DefaultReconnectPolicy,
+  DisconnectReason,
+  Room,
+  RoomEvent,
+  type RemoteParticipant,
+  type RemoteTrack,
+} from 'livekit-client'
+import { LIVEKIT_CAMERA_VIDEO_ENCODING } from '../lib/livekitCameraEncoding'
+import {
+  LIVEKIT_FULL_RECONNECT_MAX_ATTEMPTS,
+  liveKitFullReconnectDelayMs,
+  shouldAttemptFullLiveKitReconnect,
+} from '../lib/livekitReconnection'
 import { resolvedRtcMode, writeRtcModeToStorage, type RtcMode } from '../lib/rtcMode'
 
 type CallView = 'detail' | 'lobby' | 'call'
@@ -327,6 +340,8 @@ export function MeetingPage() {
 
   // call UI state
   const [callView, setCallView] = useState<CallView>('lobby')
+  const callViewRef = useRef<CallView>('lobby')
+  callViewRef.current = callView
   const [micEnabled, setMicEnabled] = useState(false)
   const [camEnabled, setCamEnabled] = useState(false)
   const [statusLine, setStatusLine] = useState('')
@@ -513,6 +528,11 @@ export function MeetingPage() {
     audio: null,
   })
   const pendingLiveKitTracksByUserIdRef = useRef<Map<string, RemoteTrack[]>>(new Map())
+  const liveKitPeerIdsRef = useRef<string[]>([])
+  const liveKitIntentionalDisconnectRef = useRef(false)
+  const liveKitReconnectTimerRef = useRef<number | null>(null)
+  const liveKitReconnectFailuresRef = useRef(0)
+  const liveKitReconnectInFlightRef = useRef(false)
   const mediaModeRef = useRef<'mesh' | 'livekit'>(resolvedRtcMode())
   mediaModeRef.current = resolvedRtcMode()
   const localPreviewRef = useRef<HTMLVideoElement>(null)
@@ -1250,7 +1270,7 @@ export function MeetingPage() {
           }
         }
         try {
-          await lp.publishTrack(videoTrack, { videoEncoding: VideoPresets.h720.encoding })
+          await lp.publishTrack(videoTrack, { videoEncoding: LIVEKIT_CAMERA_VIDEO_ENCODING })
           liveKitPublishedTracksRef.current.video = videoTrack
         } catch (e) {
           appendLog('livekit publish video', String(e))
@@ -1791,98 +1811,215 @@ export function MeetingPage() {
     for (const t of pending) attachLiveKitRemoteTrack(peerId, t)
   }
 
-  async function disconnectLiveKitMedia() {
+  function clearLiveKitReconnectTimer() {
+    const id = liveKitReconnectTimerRef.current
+    if (id != null) {
+      window.clearTimeout(id)
+      liveKitReconnectTimerRef.current = null
+    }
+  }
+
+  function scheduleLiveKitReconnect() {
+    if (liveKitReconnectTimerRef.current != null) return
+    if (liveKitReconnectInFlightRef.current) return
+    if (liveKitReconnectFailuresRef.current >= LIVEKIT_FULL_RECONNECT_MAX_ATTEMPTS) {
+      showToast('Could not reconnect to media server. Leave the call and join again.', 8000)
+      appendLog('livekit reconnect aborted', 'max attempts')
+      return
+    }
+    const delay = liveKitFullReconnectDelayMs(liveKitReconnectFailuresRef.current)
+    appendLog('livekit reconnect scheduled in ms', String(delay))
+    liveKitReconnectTimerRef.current = window.setTimeout(() => {
+      liveKitReconnectTimerRef.current = null
+      void (async () => {
+        if (liveKitReconnectInFlightRef.current) return
+        liveKitReconnectInFlightRef.current = true
+        try {
+          if (
+            callViewRef.current !== 'call' ||
+            mediaModeRef.current !== 'livekit' ||
+            !socketRef.current?.connected
+          ) {
+            liveKitReconnectFailuresRef.current = 0
+            return
+          }
+          const ok = await tryLiveKitFullReconnect()
+          if (ok) {
+            liveKitReconnectFailuresRef.current = 0
+            appendLog('livekit', 'full session reconnect ok')
+            showToast('Media connection restored', 3000)
+          } else if (
+            callViewRef.current === 'call' &&
+            mediaModeRef.current === 'livekit' &&
+            socketRef.current?.connected
+          ) {
+            liveKitReconnectFailuresRef.current++
+            scheduleLiveKitReconnect()
+          }
+        } finally {
+          liveKitReconnectInFlightRef.current = false
+        }
+      })()
+    }, delay)
+  }
+
+  async function abandonLiveKitSessionForReconnect() {
     const room = liveKitRoomRef.current
     liveKitRoomRef.current = null
     pendingLiveKitTracksByUserIdRef.current.clear()
     liveKitPublishedTracksRef.current = { video: null, audio: null }
     if (!room) return
     try {
-      const lp = room.localParticipant
-      const ls = localStreamRef.current
-      if (room.state === 'connected' && ls) {
-        for (const t of ls.getTracks()) {
-          try {
-            // false = do not stop the underlying MediaStreamTrack; MeetingPage owns the
-            // track lifecycle via localStreamRef, so LiveKit must not stop it.
-            await lp.unpublishTrack(t, false)
-          } catch {
-            // ignore
-          }
-        }
-      }
-      // false = do not stop local media tracks on disconnect; the tracks in
-      // localStreamRef.current are shared with the local preview and mesh WebRTC.
-      room.disconnect(false)
+      if (room.state !== 'disconnected') await room.disconnect(false)
     } catch {
       /* ignore */
     }
   }
 
+  async function tryLiveKitFullReconnect(): Promise<boolean> {
+    if (
+      callViewRef.current !== 'call' ||
+      mediaModeRef.current !== 'livekit' ||
+      !socketRef.current?.connected
+    ) {
+      return false
+    }
+    const peerIdsSnapshot = [...liveKitPeerIdsRef.current]
+    await abandonLiveKitSessionForReconnect()
+    try {
+      await establishLiveKitRoom(peerIdsSnapshot)
+      return true
+    } catch (e: unknown) {
+      appendLog('livekit reconnect error', String(e))
+      return false
+    }
+  }
+
+  async function establishLiveKitRoom(peerList: string[]) {
+    const { url, token } = await getLiveKitJoinToken(code)
+    await ensureStream()
+    const room = new Room({
+      adaptiveStream: true,
+      dynacast: true,
+      disconnectOnPageLeave: false,
+      reconnectPolicy: new DefaultReconnectPolicy(),
+    })
+    liveKitRoomRef.current = room
+    const onRemoteTrack = (track: RemoteTrack, participant: RemoteParticipant) => {
+      if (participant.identity === room.localParticipant.identity) return
+      const uid = participant.identity
+      const peerId = findPeerIdForUserId(participantRosterRef.current, uid)
+      if (!peerId) {
+        const cur = pendingLiveKitTracksByUserIdRef.current.get(uid) ?? []
+        cur.push(track)
+        pendingLiveKitTracksByUserIdRef.current.set(uid, cur)
+        return
+      }
+      attachLiveKitRemoteTrack(peerId, track)
+    }
+    room.on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
+      onRemoteTrack(track, participant)
+    })
+    room.on(RoomEvent.ParticipantDisconnected, p => {
+      const uid = p.identity
+      const peerId = findPeerIdForUserId(participantRosterRef.current, uid)
+      if (peerId) removeLiveKitPeerMedia(peerId)
+      pendingLiveKitTracksByUserIdRef.current.delete(uid)
+    })
+    room.on(RoomEvent.Reconnecting, () => {
+      appendLog('livekit', 'sdk reconnecting')
+      showToast('Restoring media connection…', 3500)
+    })
+    room.on(RoomEvent.Reconnected, () => {
+      liveKitReconnectFailuresRef.current = 0
+      appendLog('livekit', 'sdk reconnected')
+      showToast('Media connection restored', 2500)
+    })
+    room.on(RoomEvent.Disconnected, (reason?: DisconnectReason) => {
+      if (liveKitRoomRef.current !== room) return
+      if (liveKitIntentionalDisconnectRef.current) return
+      if (callViewRef.current !== 'call' || mediaModeRef.current !== 'livekit') return
+      if (!socketRef.current?.connected) return
+      if (!shouldAttemptFullLiveKitReconnect(reason)) {
+        appendLog('livekit disconnected (no retry)', String(reason ?? ''))
+        showToast('Disconnected from media server', 5000)
+        return
+      }
+      appendLog('livekit disconnected', String(reason ?? ''))
+      showToast('Media server interrupted — reconnecting…', 4500)
+      scheduleLiveKitReconnect()
+    })
+    await room.connect(url, token)
+    const ls = localStreamRef.current
+    if (!ls) throw new Error('No local stream')
+    const lp = room.localParticipant
+    for (const t of ls.getAudioTracks()) {
+      await lp.publishTrack(t)
+      liveKitPublishedTracksRef.current.audio = t
+    }
+    for (const t of ls.getVideoTracks()) {
+      await lp.publishTrack(t, { videoEncoding: LIVEKIT_CAMERA_VIDEO_ENCODING })
+      liveKitPublishedTracksRef.current.video = t
+    }
+    for (const p of room.remoteParticipants.values()) {
+      if (p.identity === lp.identity) continue
+      for (const pub of p.trackPublications.values()) {
+        if (pub.isSubscribed && pub.track) onRemoteTrack(pub.track, p)
+      }
+    }
+    for (const pid of peerList) {
+      const entry = participantRosterRef.current[pid]
+      if (entry?.userId) flushPendingLiveKitTracksForUser(entry.userId)
+    }
+    appendLog('livekit', 'connected')
+  }
+
+  async function disconnectLiveKitMedia() {
+    clearLiveKitReconnectTimer()
+    liveKitReconnectFailuresRef.current = 0
+    liveKitIntentionalDisconnectRef.current = true
+    const room = liveKitRoomRef.current
+    liveKitRoomRef.current = null
+    pendingLiveKitTracksByUserIdRef.current.clear()
+    liveKitPublishedTracksRef.current = { video: null, audio: null }
+    try {
+      if (room) {
+        const lp = room.localParticipant
+        const ls = localStreamRef.current
+        if (room.state === 'connected' && ls) {
+          for (const t of ls.getTracks()) {
+            try {
+              await lp.unpublishTrack(t, false)
+            } catch {
+              // ignore
+            }
+          }
+        }
+        room.disconnect(false)
+      }
+    } catch {
+      /* ignore */
+    } finally {
+      queueMicrotask(() => {
+        liveKitIntentionalDisconnectRef.current = false
+      })
+    }
+  }
+
   async function connectLiveKitMedia(peerList: string[]) {
+    liveKitPeerIdsRef.current = [...peerList]
+    clearLiveKitReconnectTimer()
+    liveKitReconnectFailuresRef.current = 0
     if (liveKitRoomRef.current) {
       await disconnectLiveKitMedia()
     }
     try {
-      const { url, token } = await getLiveKitJoinToken(code)
-      await ensureStream()
-      const room = new Room({
-        adaptiveStream: true,
-        dynacast: true,
-        disconnectOnPageLeave: false,
-        reconnectPolicy: new DefaultReconnectPolicy(),
-      })
-      liveKitRoomRef.current = room
-      const onRemoteTrack = (track: RemoteTrack, participant: RemoteParticipant) => {
-        if (participant.identity === room.localParticipant.identity) return
-        const uid = participant.identity
-        const peerId = findPeerIdForUserId(participantRosterRef.current, uid)
-        if (!peerId) {
-          const cur = pendingLiveKitTracksByUserIdRef.current.get(uid) ?? []
-          cur.push(track)
-          pendingLiveKitTracksByUserIdRef.current.set(uid, cur)
-          return
-        }
-        attachLiveKitRemoteTrack(peerId, track)
-      }
-      room.on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
-        onRemoteTrack(track, participant)
-      })
-      room.on(RoomEvent.ParticipantDisconnected, p => {
-        const uid = p.identity
-        const peerId = findPeerIdForUserId(participantRosterRef.current, uid)
-        if (peerId) removeLiveKitPeerMedia(peerId)
-        pendingLiveKitTracksByUserIdRef.current.delete(uid)
-      })
-      await room.connect(url, token)
-      const ls = localStreamRef.current
-      if (!ls) throw new Error('No local stream')
-      const lp = room.localParticipant
-      for (const t of ls.getAudioTracks()) {
-        await lp.publishTrack(t)
-        liveKitPublishedTracksRef.current.audio = t
-      }
-      for (const t of ls.getVideoTracks()) {
-        await lp.publishTrack(t, { videoEncoding: VideoPresets.h720.encoding })
-        liveKitPublishedTracksRef.current.video = t
-      }
-      for (const p of room.remoteParticipants.values()) {
-        if (p.identity === lp.identity) continue
-        for (const pub of p.trackPublications.values()) {
-          if (pub.isSubscribed && pub.track) onRemoteTrack(pub.track, p)
-        }
-      }
-      for (const pid of peerList) {
-        const entry = participantRosterRef.current[pid]
-        if (entry?.userId) flushPendingLiveKitTracksForUser(entry.userId)
-      }
-      appendLog('livekit', 'connected')
+      await establishLiveKitRoom(peerList)
     } catch (e: unknown) {
       appendLog('livekit error', String(e))
       showToast(errorMessage(e))
       const leaked = liveKitRoomRef.current
       liveKitRoomRef.current = null
-      // Disconnect any partially-connected room without stopping local tracks.
       if (leaked && leaked.state !== 'disconnected') {
         try { leaked.disconnect(false) } catch { /* ignore */ }
       }
@@ -1916,7 +2053,7 @@ export function MeetingPage() {
           // ignore
         }
       }
-      await lp.publishTrack(v, { videoEncoding: VideoPresets.h720.encoding })
+      await lp.publishTrack(v, { videoEncoding: LIVEKIT_CAMERA_VIDEO_ENCODING })
       liveKitPublishedTracksRef.current.video = v
     }
   }
@@ -1933,7 +2070,11 @@ export function MeetingPage() {
       delete next[peerId]
       return next
     })
-    setPeerIds(prev => prev.filter(id => id !== peerId))
+    setPeerIds(prev => {
+      const next = prev.filter(id => id !== peerId)
+      if (mediaModeRef.current === 'livekit') liveKitPeerIdsRef.current = next
+      return next
+    })
   }
 
   function removePeer(remoteId: string) {
@@ -1972,7 +2113,9 @@ export function MeetingPage() {
     peerVideoCallbackRefs.current.clear()
     peerStreamRefs.current.clear()
     void applyRemoteSpeakerTracks()
+    liveKitPeerIdsRef.current = []
     setPeerIds([])
+    participantRosterRef.current = {}
     setParticipantRoster({})
     setPeerShowVideoFallback({})
     setHandRaisedByPeerId({})
@@ -2051,10 +2194,16 @@ export function MeetingPage() {
       const userName = typeof p.userName === 'string' ? p.userName : 'Guest'
       const userId = typeof p.userId === 'string' ? p.userId : ''
       const userEmail = typeof p.userEmail === 'string' ? p.userEmail : undefined
-      setParticipantRoster(prev => ({
-        ...prev,
-        [peerId]: { userName, userId, ...(userEmail ? { userEmail } : {}) },
-      }))
+      setParticipantRoster(prev => {
+        const next = {
+          ...prev,
+          [peerId]: { userName, userId, ...(userEmail ? { userEmail } : {}) },
+        }
+        // Keep ref in sync immediately so LiveKit TrackSubscribed + flush see the new mapping
+        // (useEffect runs too late; otherwise tracks stay stuck in pendingLiveKitTracksByUserIdRef).
+        participantRosterRef.current = next
+        return next
+      })
       appendLog('peer-joined', shortId(peerId))
       playMeetingNotificationSound('join')
       showToast(`${userName} joined the call`)
@@ -2062,8 +2211,12 @@ export function MeetingPage() {
         void createAndSendOffer(peerId).catch(e => appendLog('offer error', String(e)))
       }
       if (mediaModeRef.current === 'livekit') {
-        setPeerIds(prev => (prev.includes(peerId) ? prev : [...prev, peerId]))
-        if (userId) queueMicrotask(() => flushPendingLiveKitTracksForUser(userId))
+        setPeerIds(prev => {
+          const next = prev.includes(peerId) ? prev : [...prev, peerId]
+          liveKitPeerIdsRef.current = next
+          return next
+        })
+        if (userId) flushPendingLiveKitTracksForUser(userId)
       }
       // Re-announce screen share so the newly joined peer learns the current state
       if (screenSharingRef.current) {
@@ -2427,6 +2580,7 @@ export function MeetingPage() {
         setParticipantRoster(prev => {
           const next = { ...prev }
           delete next[peerId]
+          participantRosterRef.current = next
           return next
         })
         setHandRaisedByPeerId(prev => {
@@ -2446,6 +2600,7 @@ export function MeetingPage() {
       } else {
         appendLog('peer-left (full reset)')
         resetAllPeers()
+        participantRosterRef.current = {}
         setParticipantRoster({})
         setHostMutedPeerIds({})
         setScreenSharingPeers(new Set())
@@ -2879,6 +3034,7 @@ export function MeetingPage() {
         if (shouldInitiateOffer(pid)) void createAndSendOffer(pid).catch(e => appendLog('offer error', String(e)))
       }
     } else {
+      liveKitPeerIdsRef.current = [...peerList]
       setPeerIds(peerList)
       void connectLiveKitMedia(peerList)
     }
@@ -3151,6 +3307,8 @@ export function MeetingPage() {
     setChatDraft('')
     setIsHostInCall(false)
     setHostPeerId(null)
+    participantRosterRef.current = {}
+    liveKitPeerIdsRef.current = []
     setParticipantRoster({})
     setAttentionRoster({})
     setAttentionWarning(null)
