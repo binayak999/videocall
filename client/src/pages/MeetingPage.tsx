@@ -2310,6 +2310,20 @@ export function MeetingPage() {
       playMeetingNotificationSound('joinRequest')
       showToast('Join request received')
     })
+    socket.on('meeting:live-collab-request', (payload: unknown) => {
+      if (!payload || typeof payload !== 'object') return
+      const p = payload as { requestId?: unknown; name?: unknown; userId?: unknown }
+      if (typeof p.requestId !== 'string') return
+      const requestId = p.requestId
+      const name = typeof p.name === 'string' ? p.name : 'Someone'
+      const userId = typeof p.userId === 'string' ? p.userId : ''
+      setHostLiveCollabRequests(prev => {
+        if (prev.some(r => r.requestId === requestId)) return prev
+        return [...prev, { requestId, name, userId }]
+      })
+      playMeetingNotificationSound('joinRequest')
+      showToast('Broadcast collaboration request')
+    })
     socket.on('meeting:join-approved', (payload: unknown) => {
       if (!payload || typeof payload !== 'object') return
       setWaitingForHost(false)
