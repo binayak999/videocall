@@ -186,6 +186,8 @@ export function useVoteGestureRecognition(options: {
     const thumbStreak = { kind: null as 'up' | 'down' | null, count: 0 }
     const palmStreak = { active: false, count: 0 }
     let lastVideoTime = -1
+    /** Same MediaStream object can keep a new video track after local vs remote camera swap — re-bind so MediaPipe sees frames. */
+    let lastAttachedVideoTrackId = ''
 
     const video = attachGestureVideoEl()
 
@@ -208,10 +210,19 @@ export function useVoteGestureRecognition(options: {
       const tick = () => {
         if (cancelled || !recognizer) return
         const stream = getStreamRef.current()
-        if (stream && video.srcObject !== stream) {
+        const vt =
+          stream?.getVideoTracks().find(t => t.readyState === 'live') ?? stream?.getVideoTracks()[0] ?? null
+        const trackId = vt?.id ?? ''
+        const mustRebind =
+          !!stream && (video.srcObject !== stream || trackId !== lastAttachedVideoTrackId)
+        if (mustRebind) {
           video.srcObject = stream
+          lastAttachedVideoTrackId = trackId
           void video.play().catch(() => {})
           lastVideoTime = -1
+        }
+        if (!stream) {
+          lastAttachedVideoTrackId = ''
         }
 
         const v = video

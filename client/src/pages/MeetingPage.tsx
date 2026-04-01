@@ -427,6 +427,7 @@ export function MeetingPage() {
   const activeVoteSessionIdRef = useRef<string | null>(null)
   const attentionBadPrevRef = useRef<Set<string>>(new Set())
   const [cameraBgMode, setCameraBgMode] = useState<CameraBackgroundUiMode>('none')
+  const cameraBgModeRef = useRef<CameraBackgroundUiMode>('none')
   const [localCameraDevices, setLocalCameraDevices] = useState<MediaDeviceInfo[]>([])
   const [localMicDevices, setLocalMicDevices] = useState<MediaDeviceInfo[]>([])
   const [localSpeakerDevices, setLocalSpeakerDevices] = useState<MediaDeviceInfo[]>([])
@@ -514,7 +515,6 @@ export function MeetingPage() {
   const liveStreamPublicRef = useRef(false)
   const liveViewerPeerIdsRef = useRef<Set<string>>(new Set())
   const broadcastCompositorRef = useRef<LiveBroadcastCompositor | null>(null)
-  const peerIdsRef = useRef<string[]>([])
   const liveBroadcastSyncTimerRef = useRef<number | null>(null)
   const syncLiveBroadcastCompositorFnRef = useRef<() => void>(() => {})
   const micLockedByHostRef = useRef(false)
@@ -1053,8 +1053,8 @@ export function MeetingPage() {
   }, [liveStreamPublic])
 
   useEffect(() => {
-    peerIdsRef.current = peerIds
-  }, [peerIds])
+    cameraBgModeRef.current = cameraBgMode
+  }, [cameraBgMode])
 
   const syncLiveBroadcastCompositor = useCallback(() => {
     const comp = broadcastCompositorRef.current
@@ -1072,7 +1072,18 @@ export function MeetingPage() {
         stream: localStreamRef.current,
       },
     ]
-    for (const id of [...peerIdsRef.current].sort()) {
+    // Use signaling roster (everyone in the meeting), not `peerIds`. In mesh mode `peerIds`
+    // fills only as WebRTC PCs are created; roster is complete at join and on peer-joined, so
+    // the public stream layout includes all participants (black tile until media connects).
+    const remoteSocketIds = Object.keys(roster).filter(id => id !== myId)
+    remoteSocketIds.sort((a, b) => {
+      const na = roster[a]?.userName ?? ''
+      const nb = roster[b]?.userName ?? ''
+      const c = na.localeCompare(nb, undefined, { sensitivity: 'base' })
+      if (c !== 0) return c
+      return a.localeCompare(b)
+    })
+    for (const id of remoteSocketIds) {
       tiles.push({
         key: `peer:${id}`,
         label: roster[id]?.userName?.trim() || 'Guest',
@@ -2670,9 +2681,10 @@ export function MeetingPage() {
             return new Map(prev).set(from, { ...entry, ready: true })
           })
           // If user already selected this camera, apply the track now that media flows
-          if (activeCameraIdRef.current === `remote:${from}`) {
+          if (activeCameraIdRef.current === `remote:${from}` && track.kind === 'video') {
             const ls = localStreamRef.current
             if (ls) {
+              teardownCameraBackgroundPipeline()
               for (const vt of [...ls.getVideoTracks()]) {
                 if (vt.id === track.id) continue
                 ls.removeTrack(vt)
@@ -2680,7 +2692,12 @@ export function MeetingPage() {
               }
               if (!ls.getVideoTracks().some(vt => vt.id === track.id)) ls.addTrack(track)
             }
-            void pushLocalVideoToPeersAndPreview(track)
+            const mode = cameraBgModeRef.current
+            if (isBlurMode(mode) || mode === 'image') {
+              void applyCameraWithBackgroundSettings(track, mode, cameraBgImageElRef.current)
+            } else {
+              void pushLocalVideoToPeersAndPreview(track)
+            }
           }
         }
         if (!track.muted) {
