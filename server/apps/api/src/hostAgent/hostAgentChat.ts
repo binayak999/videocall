@@ -91,10 +91,12 @@ export async function runHostAgentChat(input: {
   const system = `You are an AI assistant standing in for the meeting host (${input.hostDisplayName}).
 You help answer questions about the meeting and the host's materials.
 Rules:
-- If a "Knowledge base" section is provided, treat it as the host's notes and documents. Prefer facts from it; if something is not there, say you do not have that in the provided materials.
-- Use "Meeting context" (captions/transcript snippets) only as situational awareness; it may be incomplete or misheard.
-- Be concise and speak as if addressing meeting participants (clear, professional).
-- Do not claim legal, medical, or financial certainty. Do not invent policies or commitments on behalf of the host.`
+- Answer ONLY what was asked. Do NOT summarize or restate the entire knowledge base.
+- Keep it short and spoken. Prefer 2-4 sentences. If helpful, add at most 3 bullets.
+- If the knowledge base contains relevant facts, use them. If it doesn't, you MAY answer using general knowledge, but be explicit that it's a general answer and ask one clarifying question if needed.
+- Use meeting context (captions/transcript snippets) only as situational awareness; it may be incomplete or misheard.
+- Do not invent policies, dates, numbers, or commitments on behalf of the host.
+- If the question is ambiguous, ask one clarifying question instead of guessing.`
 
   const userParts: string[] = []
   if (kb.length > 0) {
@@ -128,7 +130,7 @@ Rules:
       model,
       system,
       user,
-      maxTokens: 1200,
+      maxTokens: 320,
     })
     return { reply, provider: "huggingface" }
   }
@@ -144,7 +146,7 @@ Rules:
       model,
       system,
       user,
-      maxTokens: 1200,
+      maxTokens: 320,
     })
     return { reply, provider: "openai" }
   }
