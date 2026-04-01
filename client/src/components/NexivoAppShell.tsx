@@ -64,9 +64,9 @@ export function NexivoAppShell({
       </header>
 
       <div className="relative z-10 flex min-h-0 w-full flex-1 justify-center overflow-hidden px-3 sm:px-4 lg:px-6">
-        <div className="flex min-h-0 w-full max-w-8xl flex-1 flex-col gap-4 overflow-y-auto pb-4 pt-1 lg:flex-row lg:items-center lg:justify-center lg:gap-6 lg:overflow-hidden lg:pt-0">
+        <div className="flex min-h-0 w-full max-w-8xl flex-1 flex-col gap-4 overflow-y-auto overscroll-y-auto pb-4 pt-1 [scrollbar-width:none] [-webkit-overflow-scrolling:touch] [&::-webkit-scrollbar]:hidden max-lg:touch-pan-y lg:flex-row lg:items-center lg:justify-center lg:gap-6 lg:overflow-hidden lg:pt-0">
           <div
-            className="flex w-full shrink-0 flex-col rounded-[22px] border border-(--nexivo-border-subtle) bg-(--nexivo-panel) p-5 shadow-none backdrop-blur-xl max-lg:max-h-[min(38vh,300px)] max-lg:overflow-y-auto lg:h-[60%] lg:w-64 lg:shrink-0"
+            className="flex w-full shrink-0 flex-col rounded-[22px] border border-(--nexivo-border-subtle) bg-(--nexivo-panel) p-5 shadow-none backdrop-blur-xl max-lg:max-h-max lg:h-[60%] lg:w-64 lg:shrink-0"
             style={leftPanelStyle}
             onMouseEnter={() => setLeftHovered(true)}
             onMouseLeave={() => setLeftHovered(false)}
@@ -74,8 +74,10 @@ export function NexivoAppShell({
             {sidebar}
           </div>
 
-          <div className="z-10 flex min-h-[min(52vh,440px)] w-full max-w-[880px] flex-1 flex-col overflow-hidden rounded-[22px] border border-(--nexivo-border-subtle) bg-(--nexivo-panel) shadow-none backdrop-blur-xl lg:h-[72%] lg:min-h-0 lg:shrink-0 lg:w-[880px] lg:max-w-none">
-            <div className="flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain">{children}</div>
+          <div className="z-10 flex min-h-[min(52vh,440px)] w-full max-w-[880px] flex-1 flex-col overflow-hidden rounded-[22px] border border-(--nexivo-border-subtle) bg-(--nexivo-panel) shadow-none backdrop-blur-xl max-lg:min-h-0 max-lg:flex-none max-lg:overflow-visible lg:h-[72%] lg:min-h-0 lg:shrink-0 lg:w-[880px] lg:max-w-none">
+            <div className="flex min-h-0 flex-1 flex-col max-lg:min-h-0 max-lg:flex-none max-lg:overflow-visible [scrollbar-width:none] [&::-webkit-scrollbar]:hidden lg:overflow-y-auto lg:overscroll-contain">
+              {children}
+            </div>
           </div>
 
           <NexivoFeaturesPanel

@@ -13,6 +13,7 @@ import {
   hostAgentChat,
   hostAgentTts,
   uploadMeetingRecordingViaApi,
+  type HostAgentChatTurn,
 } from '../lib/api'
 import { getToken } from '../lib/auth'
 import { getIceServers } from '../lib/ice'
@@ -396,7 +397,7 @@ export function MeetingPage() {
   /** Incremented to cancel in-flight autopilot STT/chat/TTS when new speech interrupts. */
   const hostAgentAutopilotGenRef = useRef(0)
   /** Prior user/assistant turns for autopilot LLM continuity (separate from Host AI panel). */
-  const hostAgentConversationRef = useRef<Array<{ role: 'user' | 'assistant'; content: string }>>([])
+  const hostAgentConversationRef = useRef<HostAgentChatTurn[]>([])
   const [callSettingsOpen, setCallSettingsOpen] = useState(false)
   const [callSettingsTab, setCallSettingsTab] = useState<'features' | 'settings'>('features')
   const [recordingActive, setRecordingActive] = useState(false)
@@ -1843,7 +1844,7 @@ export function MeetingPage() {
     if (hostAgentAutopilotLastKeyRef.current === last.key) return
 
     const now = Date.now()
-    if (now - hostAgentAutopilotLastAtRef.current < 4500) return
+    if (now - hostAgentAutopilotLastAtRef.current < 2200) return
 
     // Mark as seen even if we skip (prevents re-processing the same last line).
     hostAgentAutopilotLastKeyRef.current = last.key
@@ -1871,14 +1872,17 @@ export function MeetingPage() {
           meetingContext: ctx.length > 0 ? ctx : undefined,
           conversationHistory: history.length > 0 ? history : undefined,
           duoHostMode: duoHostAutopilot,
+          autopilotFast: true,
         })
         const answer = r.reply.trim()
         if (!answer) return
-        hostAgentConversationRef.current = [
-          ...history,
-          { role: 'user', content: userLine.slice(0, 4000) },
-          { role: 'assistant', content: answer.slice(0, 4000) },
-        ].slice(-24)
+        hostAgentConversationRef.current = (
+          [
+            ...history,
+            { role: 'user' as const, content: userLine.slice(0, 4000) },
+            { role: 'assistant' as const, content: answer.slice(0, 4000) },
+          ] satisfies HostAgentChatTurn[]
+        ).slice(-24)
         const audio = await hostAgentTts(code, { text: answer })
         await speakAudioBlobInMeeting(audio)
       } catch (e: unknown) {
@@ -2050,6 +2054,7 @@ export function MeetingPage() {
           meetingContext: `Latest utterance:\n${text}`,
           conversationHistory: history.length > 0 ? history : undefined,
           duoHostMode: duoHostAutopilot,
+          autopilotFast: true,
         })
         if (captureGen !== hostAgentAutopilotGenRef.current) return
         const answer = r.reply.trim()
@@ -2057,11 +2062,13 @@ export function MeetingPage() {
           listenState = 'idle'
           return
         }
-        hostAgentConversationRef.current = [
-          ...history,
-          { role: 'user', content: text.slice(0, 4000) },
-          { role: 'assistant', content: answer.slice(0, 4000) },
-        ].slice(-24)
+        hostAgentConversationRef.current = (
+          [
+            ...history,
+            { role: 'user' as const, content: text.slice(0, 4000) },
+            { role: 'assistant' as const, content: answer.slice(0, 4000) },
+          ] satisfies HostAgentChatTurn[]
+        ).slice(-24)
         const audio = await hostAgentTts(code, { text: answer })
         if (captureGen !== hostAgentAutopilotGenRef.current) return
         hostAgentAutopilotLastSpokenAtRef.current = Date.now()

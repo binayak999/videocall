@@ -70,7 +70,7 @@ export function HomePage() {
     'rounded-xl border border-(--nexivo-input-border) bg-(--nexivo-input-bg) text-sm text-(--nexivo-text) outline-none transition placeholder:text-(--nexivo-placeholder) focus:border-[#f59e0b]/50'
 
   return (
-    <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden max-lg:min-h-0 max-lg:flex-none">
       {selectedFeature && (() => {
         const f = NEXIVO_FEATURE_ITEMS.find(x => x.label === selectedFeature)
         if (!f) return null
@@ -145,7 +145,7 @@ export function HomePage() {
         )}
       </div>
 
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden px-4 pb-4 sm:px-5">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden px-4 pb-4 max-lg:flex-none max-lg:overflow-visible sm:px-5">
         {showNotesPanel ? (
           <NotesWorkspace />
         ) : tab === 'join' ? (

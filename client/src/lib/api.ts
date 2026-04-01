@@ -261,6 +261,8 @@ export async function hostAgentChat(
     meetingContext?: string
     conversationHistory?: HostAgentChatTurn[]
     duoHostMode?: boolean
+    /** Server uses shorter max_tokens + tighter prompt for lower autopilot latency. */
+    autopilotFast?: boolean
   },
 ): Promise<{ reply: string; provider: string }> {
   return await requestJson<{ reply: string; provider: string }>(

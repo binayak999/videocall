@@ -67,13 +67,13 @@ export function NexivoFeaturesPanel({
 }: NexivoFeaturesPanelProps) {
   return (
     <div
-      className="flex w-full shrink-0 flex-col rounded-[22px] border border-(--nexivo-border-subtle) bg-(--nexivo-panel) p-5 shadow-none backdrop-blur-xl max-lg:max-h-[min(42vh,340px)] max-lg:overflow-y-auto lg:h-[60%] lg:w-64 lg:shrink-0"
+      className="flex w-full shrink-0 flex-col rounded-[22px] border border-(--nexivo-border-subtle) bg-(--nexivo-panel) p-5 shadow-none backdrop-blur-xl max-lg:max-h-max lg:h-[60%] lg:w-64 lg:shrink-0"
       style={panelStyle}
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
     >
       <p className="mb-3 px-1 text-[0.6rem] font-bold uppercase tracking-[0.2em] text-(--nexivo-nav-label)">Features</p>
-      <div className="flex flex-col gap-0.5 overflow-y-auto">
+      <div className="flex flex-col gap-0.5 max-lg:overflow-visible [scrollbar-width:none] [&::-webkit-scrollbar]:hidden lg:min-h-0 lg:overflow-y-auto">
         {NEXIVO_FEATURE_ITEMS.map(({ label, detail, color, icon }) => {
           const active = selectedFeature === label
           return (
