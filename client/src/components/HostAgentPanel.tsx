@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { errorMessage, fetchMeetingCaptions, hostAgentChat, hostAgentTranscribe } from '../lib/api'
+import { errorMessage, fetchMeetingCaptions, hostAgentChat, hostAgentTranscribe, hostAgentTts } from '../lib/api'
 import { useSpeechDictation } from '../lib/useSpeechDictation'
 import { MeetingSpeechLanguageSelect } from './MeetingSpeechLanguageSelect'
 
@@ -18,12 +18,16 @@ export function HostAgentPanel({
   onClose,
   speechLang,
   onSpeechLangChange,
+  onSpeakInCall,
+  onAutopilotConfigChange,
 }: {
   meetingCode: string
   open: boolean
   onClose: () => void
   speechLang: string
   onSpeechLangChange: (bcp47: string) => void
+  onSpeakInCall: (audio: Blob) => Promise<void>
+  onAutopilotConfigChange: (cfg: { enabled: boolean; knowledgeBase: string }) => void
 }) {
   const [knowledgeBase, setKnowledgeBase] = useState('')
   const [meetingContext, setMeetingContext] = useState('')
@@ -33,7 +37,9 @@ export function HostAgentPanel({
   const [chatBusy, setChatBusy] = useState(false)
   const [captionsBusy, setCaptionsBusy] = useState(false)
   const [sttBusy, setSttBusy] = useState(false)
+  const [ttsBusy, setTtsBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
+  const [autopilotEnabled, setAutopilotEnabled] = useState(false)
 
   const { listening, err: speechErr, start, stop, speechOk } = useSpeechDictation(speechLang)
   const recRef = useRef<MediaRecorder | null>(null)
@@ -58,6 +64,10 @@ export function HostAgentPanel({
       setRecording(false)
     }
   }, [open, stop])
+
+  useEffect(() => {
+    onAutopilotConfigChange({ enabled: autopilotEnabled, knowledgeBase })
+  }, [autopilotEnabled, knowledgeBase, onAutopilotConfigChange])
 
   useEffect(() => {
     stop()
@@ -107,6 +117,24 @@ export function HostAgentPanel({
       setErr(errorMessage(e))
     } finally {
       setChatBusy(false)
+    }
+  }
+
+  const onSpeakReply = async () => {
+    setErr(null)
+    const text = reply.trim() || prompt.trim()
+    if (!text) {
+      setErr('Generate a reply (or type a short line) first.')
+      return
+    }
+    setTtsBusy(true)
+    try {
+      const audio = await hostAgentTts(meetingCode, { text })
+      await onSpeakInCall(audio)
+    } catch (e: unknown) {
+      setErr(errorMessage(e))
+    } finally {
+      setTtsBusy(false)
     }
   }
 
@@ -210,6 +238,17 @@ export function HostAgentPanel({
             onChange={e => setKnowledgeBase(e.target.value)}
             aria-label="Knowledge base"
           />
+          <label className="mt-2 flex cursor-pointer items-start gap-2.5 text-[12px] text-white/80">
+            <input
+              type="checkbox"
+              className="mt-0.5 h-4 w-4 shrink-0 rounded border-white/20 accent-emerald-500"
+              checked={autopilotEnabled}
+              onChange={e => setAutopilotEnabled(e.target.checked)}
+            />
+            <span>
+              Autopilot: listen to live captions and speak answers automatically (host only).
+            </span>
+          </label>
         </div>
 
         <div>
@@ -298,6 +337,15 @@ export function HostAgentPanel({
           className="w-full cursor-pointer rounded-xl border border-violet-500/40 bg-violet-600/28 py-2.5 text-[13px] font-semibold text-white transition hover:border-violet-400/55 hover:bg-violet-600/40 disabled:cursor-not-allowed disabled:opacity-45"
         >
           {chatBusy ? 'Thinking…' : 'Ask host agent'}
+        </button>
+
+        <button
+          type="button"
+          disabled={ttsBusy || chatBusy}
+          onClick={() => void onSpeakReply()}
+          className="w-full cursor-pointer rounded-xl border border-emerald-500/40 bg-emerald-600/22 py-2.5 text-[13px] font-semibold text-white transition hover:border-emerald-400/55 hover:bg-emerald-600/34 disabled:cursor-not-allowed disabled:opacity-45"
+        >
+          {ttsBusy ? 'Generating voice…' : 'Speak this in the meeting (AI voice)'}
         </button>
 
         {reply.length > 0 && (

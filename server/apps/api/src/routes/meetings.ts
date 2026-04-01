@@ -21,6 +21,7 @@ const TRANSCRIPT_MAX = 48_000
 const HOST_AGENT_KB_MAX = 32_000
 const HOST_AGENT_CONTEXT_MAX = 48_000
 const HOST_AGENT_MESSAGE_MAX = 8_000
+const HOST_AGENT_TTS_TEXT_MAX = 2_000
 
 function meetingCodeParam(raw: string | string[] | undefined): string {
   if (typeof raw === "string") {
@@ -380,6 +381,95 @@ router.post("/:code/host-agent/chat", authMiddleware, async (req, res) => {
       console.error("host-agent chat:", e);
       res.status(502).json({ error: "Host agent failed", detail: msg });
     }
+  } catch (err: unknown) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.post("/:code/host-agent/tts", authMiddleware, async (req, res) => {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  const code = meetingCodeParam(req.params.code);
+  if (!code) {
+    res.status(400).json({ error: "Invalid code" });
+    return;
+  }
+
+  const body = req.body as { text?: unknown; voice?: unknown };
+  const text = typeof body.text === "string" ? body.text.trim() : "";
+  const voice = typeof body.voice === "string" ? body.voice.trim() : "";
+  if (text.length === 0) {
+    res.status(400).json({ error: "text is required" });
+    return;
+  }
+  if (text.length > HOST_AGENT_TTS_TEXT_MAX) {
+    res.status(400).json({ error: `text too long (max ${HOST_AGENT_TTS_TEXT_MAX} characters)` });
+    return;
+  }
+
+  try {
+    const meeting = await prisma.meeting.findUnique({
+      where: { code },
+      select: { id: true, hostId: true },
+    });
+    if (!meeting) {
+      res.status(404).json({ error: "Meeting not found" });
+      return;
+    }
+    if (meeting.hostId !== userId) {
+      res.status(403).json({ error: "Only the meeting host can use host agent TTS" });
+      return;
+    }
+
+    const openaiKey = process.env.OPENAI_API_KEY?.trim();
+    if (!openaiKey) {
+      res.status(503).json({
+        error: "Host agent TTS is not configured",
+        detail: "Set OPENAI_API_KEY (TTS uses OpenAI for now).",
+      });
+      return;
+    }
+
+    const model =
+      process.env.OPENAI_TTS_MODEL?.trim() && process.env.OPENAI_TTS_MODEL.trim().length > 0
+        ? process.env.OPENAI_TTS_MODEL.trim()
+        : "tts-1";
+    const selectedVoice =
+      voice.length > 0
+        ? voice
+        : process.env.OPENAI_TTS_VOICE?.trim() && process.env.OPENAI_TTS_VOICE.trim().length > 0
+          ? process.env.OPENAI_TTS_VOICE.trim()
+          : "alloy";
+
+    const r = await fetch("https://api.openai.com/v1/audio/speech", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${openaiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        voice: selectedVoice,
+        format: "mp3",
+        input: text,
+      }),
+    });
+
+    if (!r.ok) {
+      const t = await r.text();
+      console.error("host-agent tts:", r.status, t);
+      res.status(502).json({ error: "Host agent TTS failed", detail: `HTTP ${r.status}` });
+      return;
+    }
+
+    const buf = Buffer.from(await r.arrayBuffer());
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "no-store");
+    res.status(200).send(buf);
   } catch (err: unknown) {
     console.error(err);
     res.status(500).json({ error: "Internal server error" });

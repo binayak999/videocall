@@ -9,6 +9,8 @@ import {
   fetchMeetingPolls,
   getLiveKitJoinToken,
   getMeeting,
+  hostAgentChat,
+  hostAgentTts,
   uploadMeetingRecordingViaApi,
 } from '../lib/api'
 import { getToken } from '../lib/auth'
@@ -373,6 +375,14 @@ export function MeetingPage() {
   const [notesOpen, setNotesOpen] = useState(false)
   const [agendaOpen, setAgendaOpen] = useState(false)
   const [hostAgentOpen, setHostAgentOpen] = useState(false)
+  const [_aiVoiceActive, setAiVoiceActive] = useState(false)
+  const aiVoiceTrackRef = useRef<MediaStreamTrack | null>(null)
+  const aiVoiceStopRef = useRef<(() => void) | null>(null)
+  const [hostAgentAutopilotEnabled, setHostAgentAutopilotEnabled] = useState(false)
+  const hostAgentKbRef = useRef('')
+  const hostAgentAutopilotBusyRef = useRef(false)
+  const hostAgentAutopilotLastKeyRef = useRef<string | null>(null)
+  const hostAgentAutopilotLastAtRef = useRef(0)
   const [callSettingsOpen, setCallSettingsOpen] = useState(false)
   const [callSettingsTab, setCallSettingsTab] = useState<'features' | 'settings'>('features')
   const [recordingActive, setRecordingActive] = useState(false)
@@ -1607,6 +1617,177 @@ export function MeetingPage() {
       showToast('Unable to switch microphone')
     }
   }
+
+  async function restoreLocalMicrophone(): Promise<void> {
+    if (micLockedByHostRef.current) {
+      showToast('The host has muted your microphone')
+      return
+    }
+    const localStream = localStreamRef.current ?? (await ensureStream())
+    const micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        deviceId: activeMicDeviceId ? { exact: activeMicDeviceId } : undefined,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+      video: false,
+    })
+    const newAudioTrack = micStream.getAudioTracks()[0] ?? null
+    if (!newAudioTrack) throw new Error('No microphone track available')
+
+    for (const t of [...localStream.getAudioTracks()]) {
+      localStream.removeTrack(t)
+      if (!isInboundRemoteCameraAudioTrack(t)) t.stop()
+    }
+    localStream.addTrack(newAudioTrack)
+    newAudioTrack.enabled = true
+    for (const [remoteId, { pc }] of peersRef.current.entries()) {
+      const sender = pc.getSenders().find(s => s.track?.kind === 'audio')
+      if (sender) {
+        await sender.replaceTrack(newAudioTrack)
+      } else {
+        pc.addTrack(newAudioTrack, localStream)
+        void renegotiate(remoteId)
+      }
+    }
+    await republishLiveKitLocalTracks()
+    setMicEnabled(true)
+    setRemoteMicCameraId(null)
+    showToast('Microphone restored')
+  }
+
+  async function speakAudioBlobInMeeting(audio: Blob): Promise<void> {
+    // Stop any existing AI voice playback.
+    aiVoiceStopRef.current?.()
+    aiVoiceStopRef.current = null
+    aiVoiceTrackRef.current = null
+
+    const localStream = localStreamRef.current ?? (await ensureStream())
+
+    const audioCtx = new AudioContext()
+    const arr = await audio.arrayBuffer()
+    const buf = await audioCtx.decodeAudioData(arr.slice(0))
+    const src = audioCtx.createBufferSource()
+    src.buffer = buf
+    const dest = audioCtx.createMediaStreamDestination()
+    src.connect(dest)
+    src.start(0)
+
+    const newTrack = dest.stream.getAudioTracks()[0] ?? null
+    if (!newTrack) {
+      try { audioCtx.close() } catch { /* ignore */ }
+      throw new Error('Could not create TTS audio track')
+    }
+
+    // Replace outgoing audio with TTS track (mesh + LiveKit).
+    for (const t of [...localStream.getAudioTracks()]) {
+      localStream.removeTrack(t)
+      // Don't stop inbound remote camera audio tracks; do stop previous local tracks.
+      if (!isInboundRemoteCameraAudioTrack(t)) t.stop()
+    }
+    localStream.addTrack(newTrack)
+    newTrack.enabled = true
+
+    for (const [remoteId, { pc }] of peersRef.current.entries()) {
+      const sender = pc.getSenders().find(s => s.track?.kind === 'audio')
+      if (sender) {
+        await sender.replaceTrack(newTrack)
+      } else {
+        pc.addTrack(newTrack, localStream)
+        void renegotiate(remoteId)
+      }
+    }
+    await republishLiveKitLocalTracks()
+
+    aiVoiceTrackRef.current = newTrack
+    setAiVoiceActive(true)
+    setMicEnabled(true)
+
+    const stopNow = () => {
+      try { src.stop() } catch { /* ignore */ }
+      try { newTrack.stop() } catch { /* ignore */ }
+      try { audioCtx.close() } catch { /* ignore */ }
+      setAiVoiceActive(false)
+      aiVoiceStopRef.current = null
+      aiVoiceTrackRef.current = null
+      // Best-effort restore mic.
+      void restoreLocalMicrophone().catch(() => {
+        showToast('AI voice stopped (mic restore failed)')
+      })
+    }
+    aiVoiceStopRef.current = stopNow
+
+    src.onended = () => {
+      stopNow()
+    }
+    showToast('AI voice is live (your mic is replaced)')
+  }
+
+  function isLikelyQuestionForHost(text: string): boolean {
+    const t = text.trim().toLowerCase()
+    if (!t) return false
+    if (t.endsWith('?')) return true
+    if (/^(can|could|would|should|do|does|did|are|is|was|were|will|what|why|how|when|where)\b/.test(t)) return true
+    if (t.includes('can you') || t.includes('could you') || t.includes('what do you think')) return true
+    return false
+  }
+
+  function buildRecentMeetingContext(lines: CaptionLine[], maxLines: number): string {
+    const finals = lines.filter(l => l.final && l.text.trim().length > 0)
+    const tail = finals.slice(-maxLines)
+    return tail.map(l => `[${l.speakerName}]: ${l.text}`).join('\n')
+  }
+
+  useEffect(() => {
+    if (!hostAgentAutopilotEnabled) return
+    if (callView !== 'call') return
+    if (!isHostInCall) return
+    if (!liveCaptionsEnabled) return
+    if (hostAgentAutopilotBusyRef.current) return
+
+    const last = captionLines.length > 0 ? captionLines[captionLines.length - 1] : null
+    if (!last || !last.final) return
+    if (last.userId === myUserIdRef.current) return
+    if (hostAgentAutopilotLastKeyRef.current === last.key) return
+
+    const now = Date.now()
+    if (now - hostAgentAutopilotLastAtRef.current < 4500) return
+
+    // Mark as seen even if it's not a question (prevents re-processing the same last line).
+    hostAgentAutopilotLastKeyRef.current = last.key
+    if (!isLikelyQuestionForHost(last.text)) return
+
+    hostAgentAutopilotBusyRef.current = true
+    hostAgentAutopilotLastAtRef.current = now
+
+    void (async () => {
+      try {
+        // If AI is already speaking, skip this turn.
+        if (aiVoiceStopRef.current) return
+        const kb = hostAgentKbRef.current.trim()
+        if (kb.length === 0) {
+          showToast('Autopilot needs a knowledge base (paste it in Host AI stand-in).')
+          return
+        }
+        const ctx = buildRecentMeetingContext(captionLines, 18)
+        const question = `${last.speakerName}: ${last.text}`
+        const r = await hostAgentChat(code, {
+          message: `You must respond as the host. Answer this question in one concise spoken paragraph:\\n${question}`,
+          knowledgeBase: kb,
+          meetingContext: ctx.length > 0 ? ctx : undefined,
+        })
+        const answer = r.reply.trim()
+        if (!answer) return
+        const audio = await hostAgentTts(code, { text: answer })
+        await speakAudioBlobInMeeting(audio)
+      } catch (e: unknown) {
+        showToast(errorMessage(e))
+      } finally {
+        hostAgentAutopilotBusyRef.current = false
+      }
+    })()
+  }, [captionLines, callView, code, hostAgentAutopilotEnabled, isHostInCall, liveCaptionsEnabled])
 
   async function switchSpeakerDevice(deviceId: string | null) {
     setActiveSpeakerDeviceId(deviceId)
@@ -5824,6 +6005,11 @@ export function MeetingPage() {
               onClose={() => setHostAgentOpen(false)}
               speechLang={speechLang}
               onSpeechLangChange={setSpeechLang}
+              onSpeakInCall={speakAudioBlobInMeeting}
+              onAutopilotConfigChange={(cfg) => {
+                hostAgentKbRef.current = cfg.knowledgeBase
+                setHostAgentAutopilotEnabled(cfg.enabled)
+              }}
             />
           )}
 

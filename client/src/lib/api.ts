@@ -294,6 +294,33 @@ export async function hostAgentTranscribe(
   return (await readJsonOrText(res)) as { text: string; provider: string }
 }
 
+/** Host only — returns audio/mpeg bytes for speaking in-call. */
+export async function hostAgentTts(
+  meetingCode: string,
+  body: { text: string; voice?: string },
+): Promise<Blob> {
+  const url = `${apiBase()}/api/meetings/${encodeURIComponent(meetingCode)}/host-agent/tts`
+  const token = getToken()
+  if (!token) {
+    throw new HttpError(401, { error: 'Not signed in' })
+  }
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      Accept: 'audio/mpeg',
+    },
+    body: JSON.stringify(body),
+    credentials: 'include',
+  })
+  if (!res.ok) {
+    const bodyUnknown = await readJsonOrText(res)
+    throw new HttpError(res.status, bodyUnknown)
+  }
+  return await res.blob()
+}
+
 export function errorMessage(err: unknown): string {
   if (err instanceof HttpError) {
     const body = err.body
