@@ -32,7 +32,9 @@ export default defineConfig(({ mode }) => {
       ],
     },
     server: {
-      allowedHosts: ['4de4-2400-1a00-4b4a-e691-f501-8199-c073-7299.ngrok-free.app'],
+      host: true,
+      port: 5173,
+      allowedHosts: ['4de4-2400-1a00-4b4a-e691-f501-8199-c073-7299.ngrok-free.app', 'video.upliftsolutions.com.np', '165.245.180.43'],
       proxy: {
         '/api': {
           target: proxyTarget,
