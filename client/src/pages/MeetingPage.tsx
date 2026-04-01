@@ -376,7 +376,7 @@ export function MeetingPage() {
   const [notesOpen, setNotesOpen] = useState(false)
   const [agendaOpen, setAgendaOpen] = useState(false)
   const [hostAgentOpen, setHostAgentOpen] = useState(false)
-  const [_aiVoiceActive, setAiVoiceActive] = useState(false)
+  const [, setAiVoiceActive] = useState(false)
   const aiVoiceTrackRef = useRef<MediaStreamTrack | null>(null)
   const aiVoiceStopRef = useRef<(() => void) | null>(null)
   const [hostAgentAutopilotEnabled, setHostAgentAutopilotEnabled] = useState(false)
@@ -1853,89 +1853,121 @@ export function MeetingPage() {
       return () => { stopSyncLoop() }
     }
 
-    let stopped = false
+    /**
+     * IMPORTANT: Don't use MediaRecorder timeslices for STT uploads.
+     * Timeslice chunks are often not valid standalone WebM files (missing headers),
+     * which makes OpenAI reject them as "Invalid file format".
+     *
+     * Instead, record short self-contained clips: start → stop → upload → repeat.
+     */
     const recorderMime =
       typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
         ? 'audio/webm;codecs=opus'
         : 'audio/webm'
 
-    let mr: MediaRecorder
-    try {
-      mr = new MediaRecorder(stream, { mimeType: recorderMime })
-    } catch {
-      showToast('Autopilot: audio recording is not supported in this browser.')
-      return
+    const CLIP_MS = 2200
+    let cancelled = false
+    let clipTimer: number | null = null
+
+    const scheduleNext = (ms: number) => {
+      if (cancelled) return
+      if (clipTimer != null) window.clearTimeout(clipTimer)
+      clipTimer = window.setTimeout(runClip, ms)
     }
 
-    hostAgentAutopilotRecorderRef.current = mr
+    const runClip = () => {
+      if (cancelled) return
+      if (!hostAgentAutopilotEnabled || callView !== 'call' || !isHostInCall || liveCaptionsEnabled) return
 
-    mr.ondataavailable = (e) => {
-      if (stopped) return
-      const blob = e.data
-      if (!blob || blob.size < 5000) return
+      // Avoid recording while AI is speaking (prevents feedback loops).
+      if (aiVoiceStopRef.current) {
+        scheduleNext(900)
+        return
+      }
 
-      // If AI is speaking, avoid feedback loops and unnecessary STT.
-      if (aiVoiceStopRef.current) return
+      let mr: MediaRecorder
+      try {
+        mr = new MediaRecorder(stream, { mimeType: recorderMime })
+      } catch {
+        showToast('Autopilot: audio recording is not supported in this browser.')
+        return
+      }
 
-      void (async () => {
-        try {
-          // STT
-          const stt = await hostAgentTranscribe(code, blob)
-          const chunk = stt.text.trim()
-          if (!chunk) return
-
-          const prev = hostAgentAutopilotTranscriptRef.current
-          const merged = `${prev}${prev.length > 0 ? ' ' : ''}${chunk}`.trim()
-          hostAgentAutopilotTranscriptRef.current = merged.slice(-6000)
-
-          const now = Date.now()
-          const lastText = chunk
-          if (!shouldAutopilotRespondTo(lastText)) return
-
-          // Throttle actual answers.
-          if (now - hostAgentAutopilotLastSpokenAtRef.current < 12_000) return
-          hostAgentAutopilotLastQuestionAtRef.current = now
-
-          hostAgentAutopilotBusyRef.current = true
-          const ctxText = hostAgentAutopilotTranscriptRef.current
-          const r = await hostAgentChat(code, {
-            message: `You must respond as the host. A participant addressed you (speech-to-text may be imperfect): "${lastText}". Reply in one concise spoken paragraph.`,
-            knowledgeBase: kb,
-            meetingContext: ctxText.length > 0 ? `Recent transcript (imperfect):\n${ctxText}` : undefined,
-          })
-          const answer = r.reply.trim()
-          if (!answer) return
-          const audio = await hostAgentTts(code, { text: answer })
-          hostAgentAutopilotLastSpokenAtRef.current = now
-          await speakAudioBlobInMeeting(audio)
-        } catch (err: unknown) {
-          showToast(errorMessage(err))
-        } finally {
-          hostAgentAutopilotBusyRef.current = false
+      hostAgentAutopilotRecorderRef.current = mr
+      const chunks: BlobPart[] = []
+      mr.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.push(e.data)
+      }
+      mr.onstop = () => {
+        hostAgentAutopilotRecorderRef.current = null
+        if (cancelled) return
+        const blob = new Blob(chunks, { type: recorderMime })
+        if (blob.size < 5000) {
+          scheduleNext(700)
+          return
         }
-      })()
+
+        void (async () => {
+          try {
+            const stt = await hostAgentTranscribe(code, blob)
+            const chunk = stt.text.trim()
+            if (!chunk) return
+
+            const prev = hostAgentAutopilotTranscriptRef.current
+            const merged = `${prev}${prev.length > 0 ? ' ' : ''}${chunk}`.trim()
+            hostAgentAutopilotTranscriptRef.current = merged.slice(-6000)
+
+            const now = Date.now()
+            const lastText = chunk
+            if (!shouldAutopilotRespondTo(lastText)) return
+
+            if (now - hostAgentAutopilotLastSpokenAtRef.current < 12_000) return
+            hostAgentAutopilotLastQuestionAtRef.current = now
+
+            hostAgentAutopilotBusyRef.current = true
+            const ctxText = hostAgentAutopilotTranscriptRef.current
+            const r = await hostAgentChat(code, {
+              message: `You must respond as the host. A participant addressed you (speech-to-text may be imperfect): "${lastText}". Reply in one concise spoken paragraph.`,
+              knowledgeBase: kb,
+              meetingContext: ctxText.length > 0 ? `Recent transcript (imperfect):\n${ctxText}` : undefined,
+            })
+            const answer = r.reply.trim()
+            if (!answer) return
+            const audio = await hostAgentTts(code, { text: answer })
+            hostAgentAutopilotLastSpokenAtRef.current = now
+            await speakAudioBlobInMeeting(audio)
+          } catch (err: unknown) {
+            showToast(errorMessage(err))
+          } finally {
+            hostAgentAutopilotBusyRef.current = false
+          }
+        })().finally(() => {
+          scheduleNext(650)
+        })
+      }
+
+      try {
+        mr.start()
+      } catch {
+        hostAgentAutopilotRecorderRef.current = null
+        scheduleNext(1200)
+        return
+      }
+
+      window.setTimeout(() => {
+        try { mr.stop() } catch { /* ignore */ }
+      }, CLIP_MS)
     }
 
-    mr.onstop = () => {
-      hostAgentAutopilotRecorderRef.current = null
-    }
-
-    try {
-      // timeslice → periodic dataavailable
-      mr.start(2200)
-      showToast('Autopilot is listening (audio STT)')
-    } catch {
-      hostAgentAutopilotRecorderRef.current = null
-      showToast('Autopilot: could not start audio recorder.')
-      stopSyncLoop()
-      return
-    }
+    showToast('Autopilot is listening (audio STT)')
+    runClip()
 
     return () => {
-      stopped = true
+      cancelled = true
       stopSyncLoop()
+      if (clipTimer != null) window.clearTimeout(clipTimer)
       try {
-        mr.stop()
+        hostAgentAutopilotRecorderRef.current?.stop()
       } catch {
         /* ignore */
       }
