@@ -29,7 +29,12 @@ export function preloadModerationModel(): void {
 
 async function getModerationModel(): Promise<NsfwModel> {
   if (!modelLoadPromise) {
-    modelLoadPromise = import('nsfwjs').then(ns => ns.load() as Promise<NsfwModel>)
+    modelLoadPromise = (async () => {
+      const { ensureTfjsPreferGpuBackend } = await import('./tfjsPreferGpuBackend')
+      await ensureTfjsPreferGpuBackend()
+      const ns = await import('nsfwjs')
+      return ns.load() as Promise<NsfwModel>
+    })()
   }
   return modelLoadPromise
 }

@@ -110,9 +110,9 @@ async function createGestureRecognizer(): Promise<GestureRecognizer> {
     })
 
   try {
-    return await withDelegate('CPU')
-  } catch {
     return await withDelegate('GPU')
+  } catch {
+    return await withDelegate('CPU')
   }
 }
 

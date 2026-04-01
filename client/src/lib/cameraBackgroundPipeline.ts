@@ -1,6 +1,8 @@
 import type { BodySegmenter } from '@tensorflow-models/body-segmentation'
 
-export type CameraBackgroundEffectMode = 'blur' | 'image'
+import type { CameraBackgroundEffectMode, CameraBackgroundPipeline } from './cameraBackgroundTypes'
+
+export type { CameraBackgroundEffectMode, CameraBackgroundPipeline }
 
 let segmenterPromise: Promise<BodySegmenter> | null = null
 
@@ -48,19 +50,8 @@ async function loadSegmenter(): Promise<BodySegmenter> {
       // Must load the mediapipe script (and have globalThis.SelfieSegmentation set)
       // BEFORE body-segmentation is imported, since the shim reads globalThis at eval time.
       await loadMediapipeScript()
-      const tf = await import('@tensorflow/tfjs')
-      // WebGL can be unavailable/blocked (private browsing, GPU denylist, older devices).
-      // Fall back to WASM/CPU so background effects still work (albeit slower).
-      try {
-        await tf.setBackend('webgl')
-      } catch {
-        try {
-          await tf.setBackend('wasm')
-        } catch {
-          await tf.setBackend('cpu')
-        }
-      }
-      await tf.ready()
+      const { ensureTfjsPreferGpuBackend } = await import('./tfjsPreferGpuBackend')
+      await ensureTfjsPreferGpuBackend()
       const bodySegmentation = await import('@tensorflow-models/body-segmentation')
       return bodySegmentation.createSegmenter(bodySegmentation.SupportedModels.MediaPipeSelfieSegmentation, {
         runtime: 'mediapipe',
@@ -85,24 +76,20 @@ function drawCover(ctx: CanvasRenderingContext2D, img: CanvasImageSource, cw: nu
   ctx.drawImage(img, ox, oy, dw, dh)
 }
 
-export interface CameraBackgroundPipeline {
-  getRawTrack: () => MediaStreamTrack
-  getProcessedTrack: () => MediaStreamTrack
-  setMode: (mode: CameraBackgroundEffectMode) => void
-  setBackgroundImage: (img: HTMLImageElement | null) => void
-  setBlurAmount: (amount: number) => void
-  stop: () => void
-}
-
 export async function startCameraBackgroundPipeline(
   rawTrack: MediaStreamTrack,
   initialMode: CameraBackgroundEffectMode,
   backgroundImage: HTMLImageElement | null,
   options?: { blurAmount?: number; onFrameError?: (err: unknown) => void },
 ): Promise<CameraBackgroundPipeline> {
-  await loadMediapipeScript()
-  const bodySegmentation = await import('@tensorflow-models/body-segmentation')
+  const engine = (import.meta.env.VITE_CAMERA_BG_ENGINE ?? 'legacy').trim().toLowerCase()
+  if (engine === 'tasks-worker') {
+    const { startCameraBackgroundPipelineTasksWorker } = await import('./cameraBackgroundPipelineTasks')
+    return startCameraBackgroundPipelineTasksWorker(rawTrack, initialMode, backgroundImage, options)
+  }
+
   const segmenter = await loadSegmenter()
+  const bodySegmentation = await import('@tensorflow-models/body-segmentation')
 
   const video = document.createElement('video')
   video.muted = true
@@ -131,6 +118,14 @@ export async function startCameraBackgroundPipeline(
   const maskCtx = maskCanvas.getContext('2d') as CanvasRenderingContext2D
   if (!maskCtx) throw new Error('Mask canvas not available')
 
+  const inferCanvas = document.createElement('canvas')
+  const inferCtxMaybe = inferCanvas.getContext('2d', { alpha: false })
+  if (inferCtxMaybe == null) throw new Error('Inference canvas not available')
+  const inferDrawCtx: CanvasRenderingContext2D = inferCtxMaybe
+
+  /** EMA buffer for temporal mask smoothing (same length as last mask `ImageData.data`). */
+  const maskSmoothState = { buffer: null as Uint8ClampedArray | null }
+
   const personCanvas = document.createElement('canvas')
   const personCtx = personCanvas.getContext('2d') as CanvasRenderingContext2D
   if (!personCtx) throw new Error('Person canvas not available')
@@ -147,8 +142,8 @@ export async function startCameraBackgroundPipeline(
   // Pre-size the canvas and draw the first raw frame so the captureStream track
   // starts at the correct resolution with real content instead of 300×150 blank.
   // This prevents WebRTC from negotiating/encoding a tiny black frame first.
-  // Cap at 640px — smaller size means much faster ML inference.
-  const MAX_W = 640
+  // Output / composite width — keep preview quality.
+  const MAX_W = 540
   {
     const vw = video.videoWidth
     const vh = video.videoHeight
@@ -162,9 +157,16 @@ export async function startCameraBackgroundPipeline(
     }
   }
 
-  const outputStream = canvas.captureStream(30)
+  /** Higher cadence helps WebRTC/preview feel closer to native camera; duplicate frames are cheap. */
+  const OUTPUT_FPS = 60
+  const outputStream = canvas.captureStream(OUTPUT_FPS)
   const processedTrack = outputStream.getVideoTracks()[0]
   if (!processedTrack) throw new Error('captureStream produced no video track')
+
+  /** Downscaled scratch for approximate background blur (full-res CSS blur is very expensive). */
+  const blurBgScratch = document.createElement('canvas')
+  const blurBgCtx = blurBgScratch.getContext('2d', { alpha: false }) as CanvasRenderingContext2D | null
+  const BLUR_DOWNSCALE = 2.5
 
   function resizeToVideo() {
     const vw = video.videoWidth
@@ -181,15 +183,44 @@ export async function startCameraBackgroundPipeline(
     }
   }
 
+  function drawBlurredBackgroundFast(w: number, h: number) {
+    const vw = video.videoWidth
+    const vh = video.videoHeight
+    if (vw < 16 || vh < 16) return
+
+    if (!blurBgCtx) {
+      const pad = blurAmount
+      ctx.filter = `blur(${blurAmount}px)`
+      ctx.drawImage(video, 0, 0, vw, vh, -pad, -pad, w + pad * 2, h + pad * 2)
+      ctx.filter = 'none'
+      return
+    }
+
+    const sw = Math.max(32, Math.round(w / BLUR_DOWNSCALE))
+    const sh = Math.max(32, Math.round(h / BLUR_DOWNSCALE))
+    const padS = Math.max(1, Math.ceil(blurAmount / BLUR_DOWNSCALE))
+    const blurRad = Math.max(1, blurAmount / BLUR_DOWNSCALE)
+
+    if (blurBgScratch.width !== sw || blurBgScratch.height !== sh) {
+      blurBgScratch.width = sw
+      blurBgScratch.height = sh
+    }
+    blurBgCtx.clearRect(0, 0, sw, sh)
+    blurBgCtx.imageSmoothingEnabled = true
+    blurBgCtx.imageSmoothingQuality = 'low'
+    blurBgCtx.filter = `blur(${blurRad}px)`
+    blurBgCtx.drawImage(video, 0, 0, vw, vh, -padS, -padS, sw + padS * 2, sh + padS * 2)
+    blurBgCtx.filter = 'none'
+    ctx.imageSmoothingEnabled = true
+    ctx.imageSmoothingQuality = 'medium'
+    ctx.drawImage(blurBgScratch, 0, 0, sw, sh, 0, 0, w, h)
+  }
+
   /**
-   * Render loop — runs every animation frame (~60fps), synchronous, no inference.
-   * Uses the last available mask from the inference loop to composite the frame.
-   * This keeps output smooth regardless of how long inference takes.
+   * Render one output frame (synchronous). Uses last mask from inference.
+   * Scheduled from requestVideoFrameCallback when available so we paint ~camera fps, not ~display fps.
    */
   function renderFrame() {
-    if (!running) return
-    raf = requestAnimationFrame(renderFrame)
-
     if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return
     resizeToVideo()
     const w = canvas.width
@@ -197,18 +228,12 @@ export async function startCameraBackgroundPipeline(
     if (w < 16 || h < 16) return
 
     if (!maskReady) {
-      // No mask yet — show raw video while first inference runs
       ctx.drawImage(video, 0, 0, w, h)
       return
     }
 
-    // Draw background layer
     if (mode === 'blur') {
-      // Draw oversized to prevent dark edges from blur kernel bleeding into the black canvas border
-      const pad = blurAmount
-      ctx.filter = `blur(${blurAmount}px)`
-      ctx.drawImage(video, -pad, -pad, w + pad * 2, h + pad * 2)
-      ctx.filter = 'none'
+      drawBlurredBackgroundFast(w, h)
     } else {
       ctx.fillStyle = '#1c1c1e'
       ctx.fillRect(0, 0, w, h)
@@ -238,52 +263,133 @@ export async function startCameraBackgroundPipeline(
     ctx.drawImage(personCanvas, 0, 0)
   }
 
-  /**
-   * Inference loop — runs as a separate async loop, continuously updating the mask.
-   * Decoupled from the render loop so a slow inference (~100ms) doesn't freeze frames.
-   * The render loop uses whatever mask was last computed.
-   */
-  async function inferenceLoop() {
-    while (running) {
-      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && canvas.width >= 16 && canvas.height >= 16) {
-        try {
-          const segmentation = await segmenter.segmentPeople(video, { flipHorizontal: false })
+  let inferBusy = false
+  /** Pending `requestVideoFrameCallback` id so we can cancel on stop(). */
+  let pendingVfcHandle: number | undefined
 
-          // Get person mask — lower threshold captures more uncertain edge pixels (hair, etc.)
-          const maskImage = await bodySegmentation.toBinaryMask(
-            segmentation,
-            { r: 255, g: 255, b: 255, a: 255 },
-            { r: 0, g: 0, b: 0, a: 0 },
-            false,
-            0.35,
-          )
-          if (maskImage) {
-            if (maskCanvas.width !== maskImage.width || maskCanvas.height !== maskImage.height) {
-              maskCanvas.width = maskImage.width
-              maskCanvas.height = maskImage.height
-            }
-            maskCtx.putImageData(maskImage, 0, 0)
-            maskReady = true
-          }
-        } catch (e: unknown) {
-          if (!frameErrorReported) {
-            frameErrorReported = true
-            try {
-              options?.onFrameError?.(e)
-            } catch {
-              // ignore
-            }
-          }
+  /** Reused so `ImageData` keeps a stable `ArrayBuffer` type for TypeScript / `putImageData`. */
+  let smoothedMaskImage: ImageData | null = null
+
+  function applyTemporalMaskSmooth(maskImage: ImageData): ImageData {
+    const MASK_TEMPORAL_BLEND = 0.38
+    const { data, width, height } = maskImage
+    const len = data.length
+    let buf = maskSmoothState.buffer
+    if (!buf || buf.length !== len) {
+      buf = new Uint8ClampedArray(len)
+      buf.set(data)
+      maskSmoothState.buffer = buf
+      smoothedMaskImage = new ImageData(buf as ImageData['data'], width, height)
+      return smoothedMaskImage
+    }
+    const inv = 1 - MASK_TEMPORAL_BLEND
+    const b = MASK_TEMPORAL_BLEND
+    for (let i = 0; i < len; i++) {
+      buf[i] = (buf[i] * inv + data[i] * b) | 0
+    }
+    if (!smoothedMaskImage || smoothedMaskImage.width !== width || smoothedMaskImage.height !== height) {
+      smoothedMaskImage = new ImageData(buf as ImageData['data'], width, height)
+    }
+    return smoothedMaskImage
+  }
+
+  async function runSegmentationOnce() {
+    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || canvas.width < 16 || canvas.height < 16) {
+      return
+    }
+    const vw = video.videoWidth
+    const vh = video.videoHeight
+    if (vw < 16 || vh < 16) return
+
+    /** Segmentation runs on a smaller surface so each frame finishes sooner (smoother mask updates). */
+    const INFER_MAX_W = 416
+    const inferScale = vw > INFER_MAX_W ? INFER_MAX_W / vw : 1
+    const iw = Math.max(16, Math.round(vw * inferScale))
+    const ih = Math.max(16, Math.round(vh * inferScale))
+    if (inferCanvas.width !== iw || inferCanvas.height !== ih) {
+      inferCanvas.width = iw
+      inferCanvas.height = ih
+      maskSmoothState.buffer = null
+      smoothedMaskImage = null
+    }
+    inferDrawCtx.drawImage(video, 0, 0, iw, ih)
+
+    try {
+      const segmentation = await segmenter.segmentPeople(inferCanvas, { flipHorizontal: false })
+      const maskImage = await bodySegmentation.toBinaryMask(
+        segmentation,
+        { r: 255, g: 255, b: 255, a: 255 },
+        { r: 0, g: 0, b: 0, a: 0 },
+        false,
+        0.35,
+      )
+      if (maskImage) {
+        const smoothed = applyTemporalMaskSmooth(maskImage)
+        if (maskCanvas.width !== smoothed.width || maskCanvas.height !== smoothed.height) {
+          maskCanvas.width = smoothed.width
+          maskCanvas.height = smoothed.height
+        }
+        maskCtx.putImageData(smoothed, 0, 0)
+        maskReady = true
+      }
+    } catch (e: unknown) {
+      if (!frameErrorReported) {
+        frameErrorReported = true
+        try {
+          options?.onFrameError?.(e)
+        } catch {
+          // ignore
         }
       }
-      // Yield to the event loop so the render loop (RAF) can run between inferences.
-      // If inference is fast this keeps it running continuously; if slow it just loops again.
-      await new Promise<void>(r => setTimeout(r, 0))
     }
   }
 
+  /**
+   * Drive output + inference from decoded camera frames (~15–30fps).
+   * Avoids painting ~60×/s when captureStream is 30fps (wasted work + jank).
+   * Skips a new inference if the previous is still running (reuse last mask).
+   */
+  function scheduleVideoFrameCallbackLoop() {
+    if (!running) return
+    pendingVfcHandle = video.requestVideoFrameCallback(() => {
+      pendingVfcHandle = undefined
+      if (!running) return
+      scheduleVideoFrameCallbackLoop()
+      renderFrame()
+      if (!inferBusy) {
+        inferBusy = true
+        void runSegmentationOnce().finally(() => {
+          inferBusy = false
+        })
+      }
+    })
+  }
+
+  let lastInferAt = 0
+  const INFER_MIN_MS = 1000 / OUTPUT_FPS
+
+  function renderLoopRaf() {
+    if (!running) return
+    raf = requestAnimationFrame(renderLoopRaf)
+    renderFrame()
+    const now = performance.now()
+    if (!inferBusy && now - lastInferAt >= INFER_MIN_MS) {
+      lastInferAt = now
+      inferBusy = true
+      void runSegmentationOnce().finally(() => {
+        inferBusy = false
+      })
+    }
+  }
+
+  resizeToVideo()
   renderFrame()
-  void inferenceLoop()
+
+  if (typeof video.requestVideoFrameCallback === 'function') {
+    scheduleVideoFrameCallbackLoop()
+  } else {
+    renderLoopRaf()
+  }
 
   return {
     getRawTrack: () => rawTrack,
@@ -293,6 +399,10 @@ export async function startCameraBackgroundPipeline(
     setBlurAmount: (amount) => { blurAmount = Math.min(20, Math.max(1, amount)) },
     stop: () => {
       running = false
+      if (pendingVfcHandle != null && typeof video.cancelVideoFrameCallback === 'function') {
+        video.cancelVideoFrameCallback(pendingVfcHandle)
+        pendingVfcHandle = undefined
+      }
       cancelAnimationFrame(raf)
       processedTrack.stop()
       video.srcObject = null
