@@ -1729,23 +1729,26 @@ export function MeetingPage() {
     showToast('AI voice is live (your mic is replaced)')
   }
 
-  /** Autopilot only fires when someone addresses the host by name (meeting host profile, else JWT name). */
-  function textMentionsHostName(text: string, hostName: string): boolean {
-    const name = hostName.trim()
+  /**
+   * Autopilot trigger: only respond to questions that sound directed at the host,
+   * not general questions in the room.
+   */
+  function shouldAutopilotRespondTo(text: string): boolean {
     const raw = text.trim()
-    if (!name || !raw) return false
-    const lower = raw.toLowerCase()
-    const lowerFull = name.toLowerCase()
-    if (lowerFull.length >= 2 && lower.includes(lowerFull)) return true
-    const parts = name.split(/\s+/).filter(p => p.length >= 2)
-    for (const p of parts) {
-      const escaped = p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      try {
-        if (new RegExp(`\\b${escaped}\\b`, 'i').test(raw)) return true
-      } catch {
-        /* ignore */
-      }
-    }
+    if (!raw) return false
+    const t = raw.toLowerCase()
+
+    // Strong signals
+    if (t.includes('@host') || t.includes('host,')) return true
+
+    // Questions directed at "you"
+    if (t.includes('can you') || t.includes('could you') || t.includes('would you') || t.includes('will you')) return true
+    if (t.includes('do you') || t.includes('did you') || t.includes('are you') || t.includes('is it ok if we')) return true
+    if (t.includes('what do you think') || t.includes('should we') || t.includes('do we want to')) return true
+
+    // Fallback: question mark + direct-address hint.
+    if (t.endsWith('?') && (t.includes('you') || t.includes('your') || t.includes('we'))) return true
+
     return false
   }
 
@@ -1762,10 +1765,6 @@ export function MeetingPage() {
     if (!liveCaptionsEnabled) return
     if (hostAgentAutopilotBusyRef.current) return
 
-    const hostName =
-      meeting?.host?.name?.trim() || getJwtProfile(getToken() ?? '').name.trim()
-    if (!hostName) return
-
     const last = captionLines.length > 0 ? captionLines[captionLines.length - 1] : null
     if (!last || !last.final) return
     if (last.userId === myUserIdRef.current) return
@@ -1776,7 +1775,7 @@ export function MeetingPage() {
 
     // Mark as seen even if it's not a question (prevents re-processing the same last line).
     hostAgentAutopilotLastKeyRef.current = last.key
-    if (!textMentionsHostName(last.text, hostName)) return
+    if (!shouldAutopilotRespondTo(last.text)) return
 
     hostAgentAutopilotBusyRef.current = true
     hostAgentAutopilotLastAtRef.current = now
@@ -1792,7 +1791,7 @@ export function MeetingPage() {
         const ctx = buildRecentMeetingContext(captionLines, 18)
         const question = `${last.speakerName}: ${last.text}`
         const r = await hostAgentChat(code, {
-          message: `You must respond as the host. They addressed you by name. Answer in one concise spoken paragraph:\\n${question}`,
+          message: `You must respond as the host. Answer this question in one concise spoken paragraph:\\n${question}`,
           knowledgeBase: kb,
           meetingContext: ctx.length > 0 ? ctx : undefined,
         })
@@ -1806,15 +1805,7 @@ export function MeetingPage() {
         hostAgentAutopilotBusyRef.current = false
       }
     })()
-  }, [
-    captionLines,
-    callView,
-    code,
-    hostAgentAutopilotEnabled,
-    isHostInCall,
-    liveCaptionsEnabled,
-    meeting?.host?.name,
-  ])
+  }, [captionLines, callView, code, hostAgentAutopilotEnabled, isHostInCall, liveCaptionsEnabled])
 
   // Autopilot without captions: mix remote audio → chunked STT → detect questions → respond with TTS.
   useEffect(() => {
@@ -1823,13 +1814,6 @@ export function MeetingPage() {
     if (!isHostInCall) return
     if (liveCaptionsEnabled) return
 
-    const hostName =
-      meeting?.host?.name?.trim() || getJwtProfile(getToken() ?? '').name.trim()
-    if (!hostName) {
-      showToast('Autopilot needs your display name (host profile or account name).')
-      return
-    }
-
     // Must have a knowledge base to answer "as host".
     const kb = hostAgentKbRef.current.trim()
     if (kb.length === 0) {
@@ -1837,19 +1821,36 @@ export function MeetingPage() {
       return
     }
 
+    // Keep the remote-audio mix updated as peer tracks arrive.
+    let syncTimer: number | null = null
+    const startSyncLoop = () => {
+      if (syncTimer != null) return
+      syncTimer = window.setInterval(() => {
+        try { syncSpeakerMixInputs() } catch { /* ignore */ }
+      }, 1500)
+    }
+    const stopSyncLoop = () => {
+      if (syncTimer == null) return
+      window.clearInterval(syncTimer)
+      syncTimer = null
+    }
+
     // Start (or keep) a recorder on the remote-audio mix graph.
     const { dest } = ensureSpeakerMixGraph()
     const track = syncSpeakerMixInputs()
     try { void speakerMixCtxRef.current?.resume() } catch { /* ignore */ }
+    startSyncLoop()
 
     const stream = dest.stream
     if (!track || stream.getAudioTracks().length === 0) {
       showToast('Autopilot: waiting for participant audio…')
+      stopSyncLoop()
       return
     }
 
     if (hostAgentAutopilotRecorderRef.current) {
-      return
+      // Already listening; keep syncing inputs while enabled.
+      return () => { stopSyncLoop() }
     }
 
     let stopped = false
@@ -1889,7 +1890,7 @@ export function MeetingPage() {
 
           const now = Date.now()
           const lastText = chunk
-          if (!textMentionsHostName(lastText, hostName)) return
+          if (!shouldAutopilotRespondTo(lastText)) return
 
           // Throttle actual answers.
           if (now - hostAgentAutopilotLastSpokenAtRef.current < 12_000) return
@@ -1898,7 +1899,7 @@ export function MeetingPage() {
           hostAgentAutopilotBusyRef.current = true
           const ctxText = hostAgentAutopilotTranscriptRef.current
           const r = await hostAgentChat(code, {
-            message: `You must respond as the host. They said your name (speech-to-text may be imperfect): "${lastText}". Reply in one concise spoken paragraph.`,
+            message: `You must respond as the host. A participant addressed you (speech-to-text may be imperfect): "${lastText}". Reply in one concise spoken paragraph.`,
             knowledgeBase: kb,
             meetingContext: ctxText.length > 0 ? `Recent transcript (imperfect):\n${ctxText}` : undefined,
           })
@@ -1926,11 +1927,13 @@ export function MeetingPage() {
     } catch {
       hostAgentAutopilotRecorderRef.current = null
       showToast('Autopilot: could not start audio recorder.')
+      stopSyncLoop()
       return
     }
 
     return () => {
       stopped = true
+      stopSyncLoop()
       try {
         mr.stop()
       } catch {
@@ -1939,7 +1942,7 @@ export function MeetingPage() {
       hostAgentAutopilotRecorderRef.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hostAgentAutopilotEnabled, callView, isHostInCall, liveCaptionsEnabled, code, meeting?.host?.name])
+  }, [hostAgentAutopilotEnabled, callView, isHostInCall, liveCaptionsEnabled, code, meeting?.host?.name, peerIds])
 
   async function switchSpeakerDevice(deviceId: string | null) {
     setActiveSpeakerDeviceId(deviceId)

@@ -246,7 +246,7 @@ export function HostAgentPanel({
               onChange={e => setAutopilotEnabled(e.target.checked)}
             />
             <span>
-              Autopilot: when someone says your name (host profile), answer from your knowledge base — with captions on, or via audio when captions are off (host only).
+              Autopilot: answer only when someone addresses you (not every question). Works with captions on, or via audio when captions are off (host only).
             </span>
           </label>
         </div>
