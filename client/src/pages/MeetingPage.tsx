@@ -1918,16 +1918,20 @@ export function MeetingPage() {
             hostAgentAutopilotTranscriptRef.current = merged.slice(-6000)
 
             const now = Date.now()
-            const lastText = chunk
-            if (!shouldAutopilotRespondTo(lastText)) return
+            // Autopilot trigger: check a small rolling window, not just the last clip.
+            // STT clip boundaries can cut a question in half, so last chunk alone is unreliable.
+            const rolling = hostAgentAutopilotTranscriptRef.current
+            const windowText = rolling.slice(Math.max(0, rolling.length - 280)).trim()
+            if (!shouldAutopilotRespondTo(windowText)) return
 
             if (now - hostAgentAutopilotLastSpokenAtRef.current < 12_000) return
             hostAgentAutopilotLastQuestionAtRef.current = now
 
             hostAgentAutopilotBusyRef.current = true
             const ctxText = hostAgentAutopilotTranscriptRef.current
+            showToast('Autopilot: speaking…')
             const r = await hostAgentChat(code, {
-              message: `You must respond as the host. A participant addressed you (speech-to-text may be imperfect): "${lastText}". Reply in one concise spoken paragraph.`,
+              message: `You must respond as the host. A participant addressed you (speech-to-text may be imperfect). Respond in one concise spoken paragraph.\n\nHeard:\n"${windowText}"`,
               knowledgeBase: kb,
               meetingContext: ctxText.length > 0 ? `Recent transcript (imperfect):\n${ctxText}` : undefined,
             })
