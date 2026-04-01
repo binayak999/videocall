@@ -22,6 +22,28 @@ const HOST_AGENT_KB_MAX = 32_000
 const HOST_AGENT_CONTEXT_MAX = 48_000
 const HOST_AGENT_MESSAGE_MAX = 8_000
 const HOST_AGENT_TTS_TEXT_MAX = 2_000
+const HOST_AGENT_HISTORY_MAX_MESSAGES = 24
+const HOST_AGENT_HISTORY_ENTRY_MAX = 4_000
+
+type HostAgentChatTurn = { role: "user" | "assistant"; content: string }
+
+function parseHostAgentConversationHistory(raw: unknown): HostAgentChatTurn[] {
+  if (!Array.isArray(raw)) return []
+  const out: HostAgentChatTurn[] = []
+  for (const item of raw) {
+    if (out.length >= HOST_AGENT_HISTORY_MAX_MESSAGES) break
+    if (typeof item !== "object" || item === null) continue
+    const o = item as Record<string, unknown>
+    const role = o.role
+    const content = o.content
+    if (role !== "user" && role !== "assistant") continue
+    if (typeof content !== "string") continue
+    const c = content.trim()
+    if (c.length === 0) continue
+    out.push({ role, content: c.slice(0, HOST_AGENT_HISTORY_ENTRY_MAX) })
+  }
+  return out
+}
 
 function meetingCodeParam(raw: string | string[] | undefined): string {
   if (typeof raw === "string") {
@@ -316,12 +338,16 @@ router.post("/:code/host-agent/chat", authMiddleware, async (req, res) => {
     message?: unknown;
     knowledgeBase?: unknown;
     meetingContext?: unknown;
+    conversationHistory?: unknown;
+    duoHostMode?: unknown;
   };
   const message = typeof body.message === "string" ? body.message.trim() : "";
   const knowledgeBase =
     typeof body.knowledgeBase === "string" ? body.knowledgeBase.trim() : "";
   const meetingContext =
     typeof body.meetingContext === "string" ? body.meetingContext.trim() : "";
+  const conversationHistory = parseHostAgentConversationHistory(body.conversationHistory);
+  const duoHostMode = body.duoHostMode === true;
 
   if (message.length === 0) {
     res.status(400).json({ error: "message is required" });
@@ -366,6 +392,8 @@ router.post("/:code/host-agent/chat", authMiddleware, async (req, res) => {
         userMessage: message,
         knowledgeBase,
         meetingContext,
+        conversationHistory,
+        duoHostMode,
       });
       res.json({ reply, provider });
     } catch (e: unknown) {

@@ -251,9 +251,17 @@ export async function analyzeMeetingAgenda(
   )
 }
 
+export type HostAgentChatTurn = { role: 'user' | 'assistant'; content: string }
+
 export async function hostAgentChat(
   meetingCode: string,
-  body: { message: string; knowledgeBase?: string; meetingContext?: string },
+  body: {
+    message: string
+    knowledgeBase?: string
+    meetingContext?: string
+    conversationHistory?: HostAgentChatTurn[]
+    duoHostMode?: boolean
+  },
 ): Promise<{ reply: string; provider: string }> {
   return await requestJson<{ reply: string; provider: string }>(
     `/api/meetings/${encodeURIComponent(meetingCode)}/host-agent/chat`,

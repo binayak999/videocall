@@ -27,22 +27,28 @@ function errorMessageFromProviderBody(data: unknown, fallback: string): string {
   return fallback
 }
 
+type ChatTurn = { role: "user" | "assistant"; content: string }
+
 async function runChatCompletion(opts: {
   url: string
   apiKey: string
   model: string
   system: string
-  user: string
+  priorMessages: ChatTurn[]
+  userMessage: string
   maxTokens: number
 }): Promise<string> {
+  const messages: Array<{ role: string; content: string }> = [
+    { role: "system", content: opts.system },
+    ...opts.priorMessages.map((m) => ({ role: m.role, content: m.content })),
+    { role: "user", content: opts.userMessage },
+  ]
+
   const body: Record<string, unknown> = {
     model: opts.model,
     temperature: 0.35,
     max_tokens: opts.maxTokens,
-    messages: [
-      { role: "system", content: opts.system },
-      { role: "user", content: opts.user },
-    ],
+    messages,
   }
 
   const res = await fetch(opts.url, {
@@ -70,6 +76,42 @@ async function runChatCompletion(opts: {
   return content.trim()
 }
 
+function buildHostAgentSystem(input: {
+  hostDisplayName: string
+  knowledgeBase: string
+  meetingContext: string
+  duoHostMode: boolean
+}): string {
+  const kb = input.knowledgeBase.trim()
+  const ctx = input.meetingContext.trim()
+  const kbBlock =
+    kb.length > 0 ? `Knowledge base:\n${kb}` : "Knowledge base: (none provided)"
+  const ctxBlock =
+    ctx.length > 0 ? `Meeting context (captions / notes; may be partial):\n${ctx}` : "Meeting context: (none provided)"
+
+  const duoBlock = input.duoHostMode
+    ? `
+Duo / 1:1 mode: Only the host (you) and one participant are in this call. Respond like a capable human host: acknowledge what they say, keep the conversation moving, answer questions, offer concise follow-ups, and handle brief or informal utterances—not only explicit questions. Skip responding only to pure filler ("mm", "uh-huh") with nothing to act on.`
+    : ""
+
+  return `You are an AI assistant standing in for the meeting host (${input.hostDisplayName}).
+You help participants using the host's materials and the conversation so far.
+${duoBlock}
+
+${kbBlock}
+
+${ctxBlock}
+
+Rules:
+- Use the prior conversation turns for continuity; the latest user message is what you must address now.
+- Answer ONLY what the latest message calls for. Do NOT dump or summarize the entire knowledge base unless they ask.
+- Keep replies short and spoken: usually 2–4 sentences; in duo mode you may stretch slightly when guiding the conversation. At most 3 bullets if lists help.
+- If the knowledge base has relevant facts, use them. If not, you may use general knowledge but say so, and ask one clarifying question if needed (except in duo mode for casual back-and-forth, where a light acknowledgment is enough).
+- Meeting context may be incomplete or misheard—treat it as hints only.
+- Do not invent policies, dates, numbers, or commitments for the host.
+${input.duoHostMode ? "- In duo mode, prefer helpful continuity over interrogating with clarifying questions." : "- If the latest message is ambiguous, ask one clarifying question instead of guessing."}`
+}
+
 export function isHostAgentLlmNotConfiguredError(e: unknown): boolean {
   return e instanceof Error && e.message.includes(NOT_CONFIGURED)
 }
@@ -79,6 +121,8 @@ export async function runHostAgentChat(input: {
   userMessage: string
   knowledgeBase: string
   meetingContext: string
+  conversationHistory?: ChatTurn[]
+  duoHostMode?: boolean
 }): Promise<{ reply: string; provider: "huggingface" | "openai" }> {
   const msg = input.userMessage.trim()
   if (!msg) {
@@ -87,31 +131,15 @@ export async function runHostAgentChat(input: {
 
   const kb = input.knowledgeBase.trim()
   const ctx = input.meetingContext.trim()
+  const duoHostMode = Boolean(input.duoHostMode)
+  const priorMessages = Array.isArray(input.conversationHistory) ? input.conversationHistory : []
 
-  const system = `You are an AI assistant standing in for the meeting host (${input.hostDisplayName}).
-You help answer questions about the meeting and the host's materials.
-Rules:
-- Answer ONLY what was asked. Do NOT summarize or restate the entire knowledge base.
-- Keep it short and spoken. Prefer 2-4 sentences. If helpful, add at most 3 bullets.
-- If the knowledge base contains relevant facts, use them. If it doesn't, you MAY answer using general knowledge, but be explicit that it's a general answer and ask one clarifying question if needed.
-- Use meeting context (captions/transcript snippets) only as situational awareness; it may be incomplete or misheard.
-- Do not invent policies, dates, numbers, or commitments on behalf of the host.
-- If the question is ambiguous, ask one clarifying question instead of guessing.`
-
-  const userParts: string[] = []
-  if (kb.length > 0) {
-    userParts.push(`Knowledge base:\n${kb}`)
-  } else {
-    userParts.push("Knowledge base: (none provided)")
-  }
-  if (ctx.length > 0) {
-    userParts.push(`Meeting context:\n${ctx}`)
-  } else {
-    userParts.push("Meeting context: (none provided)")
-  }
-  userParts.push(`Host request or question to answer:\n${msg}`)
-
-  const user = userParts.join("\n\n")
+  const system = buildHostAgentSystem({
+    hostDisplayName: input.hostDisplayName,
+    knowledgeBase: kb,
+    meetingContext: ctx,
+    duoHostMode,
+  })
 
   const hfToken =
     process.env.HUGGINGFACE_API_TOKEN?.trim() || process.env.HF_TOKEN?.trim()
@@ -129,8 +157,9 @@ Rules:
       apiKey: hfToken,
       model,
       system,
-      user,
-      maxTokens: 320,
+      priorMessages,
+      userMessage: msg,
+      maxTokens: duoHostMode ? 420 : 320,
     })
     return { reply, provider: "huggingface" }
   }
@@ -145,8 +174,9 @@ Rules:
       apiKey: openaiKey,
       model,
       system,
-      user,
-      maxTokens: 320,
+      priorMessages,
+      userMessage: msg,
+      maxTokens: duoHostMode ? 420 : 320,
     })
     return { reply, provider: "openai" }
   }

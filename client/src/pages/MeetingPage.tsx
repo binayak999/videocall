@@ -395,6 +395,8 @@ export function MeetingPage() {
   const hostAgentAutopilotLastSpokenAtRef = useRef(0)
   /** Incremented to cancel in-flight autopilot STT/chat/TTS when new speech interrupts. */
   const hostAgentAutopilotGenRef = useRef(0)
+  /** Prior user/assistant turns for autopilot LLM continuity (separate from Host AI panel). */
+  const hostAgentConversationRef = useRef<Array<{ role: 'user' | 'assistant'; content: string }>>([])
   const [callSettingsOpen, setCallSettingsOpen] = useState(false)
   const [callSettingsTab, setCallSettingsTab] = useState<'features' | 'settings'>('features')
   const [recordingActive, setRecordingActive] = useState(false)
@@ -1789,12 +1791,13 @@ export function MeetingPage() {
   }
 
   /**
-   * Autopilot trigger: only respond to questions that sound directed at the host,
-   * not general questions in the room.
+   * Autopilot trigger: in a 1:1 call (host + one remote), respond to almost every remark.
+   * In larger calls, only respond when the utterance seems directed at the host.
    */
-  function shouldAutopilotRespondTo(text: string): boolean {
+  function shouldAutopilotRespondTo(text: string, duoOneOnOne = false): boolean {
     const raw = text.trim()
     if (!raw) return false
+    if (duoOneOnOne) return raw.length >= 3
     const t = raw.toLowerCase()
 
     // Strong signals
@@ -1818,11 +1821,21 @@ export function MeetingPage() {
   }
 
   useEffect(() => {
+    hostAgentConversationRef.current = []
+  }, [code])
+
+  useEffect(() => {
+    if (!hostAgentAutopilotEnabled) hostAgentConversationRef.current = []
+  }, [hostAgentAutopilotEnabled])
+
+  useEffect(() => {
     if (!hostAgentAutopilotEnabled) return
     if (callView !== 'call') return
     if (!isHostInCall) return
     if (!liveCaptionsEnabled) return
     if (hostAgentAutopilotBusyRef.current) return
+
+    const duoHostAutopilot = peerIds.length === 1
 
     const last = captionLines.length > 0 ? captionLines[captionLines.length - 1] : null
     if (!last || !last.final) return
@@ -1832,9 +1845,9 @@ export function MeetingPage() {
     const now = Date.now()
     if (now - hostAgentAutopilotLastAtRef.current < 4500) return
 
-    // Mark as seen even if it's not a question (prevents re-processing the same last line).
+    // Mark as seen even if we skip (prevents re-processing the same last line).
     hostAgentAutopilotLastKeyRef.current = last.key
-    if (!shouldAutopilotRespondTo(last.text)) return
+    if (!shouldAutopilotRespondTo(last.text, duoHostAutopilot)) return
 
     hostAgentAutopilotBusyRef.current = true
     hostAgentAutopilotLastAtRef.current = now
@@ -1848,14 +1861,24 @@ export function MeetingPage() {
           return
         }
         const ctx = buildRecentMeetingContext(captionLines, 18)
-        const question = `${last.speakerName}: ${last.text}`
+        const userLine = `${last.speakerName}: ${last.text}`
+        const history = [...hostAgentConversationRef.current]
         const r = await hostAgentChat(code, {
-          message: `You must respond as the host. Answer this question in one concise spoken paragraph:\\n${question}`,
+          message: duoHostAutopilot
+            ? `The participant said:\n${userLine}`
+            : `You must respond as the host. Answer this question in one concise spoken paragraph:\n${userLine}`,
           knowledgeBase: kb,
           meetingContext: ctx.length > 0 ? ctx : undefined,
+          conversationHistory: history.length > 0 ? history : undefined,
+          duoHostMode: duoHostAutopilot,
         })
         const answer = r.reply.trim()
         if (!answer) return
+        hostAgentConversationRef.current = [
+          ...history,
+          { role: 'user', content: userLine.slice(0, 4000) },
+          { role: 'assistant', content: answer.slice(0, 4000) },
+        ].slice(-24)
         const audio = await hostAgentTts(code, { text: answer })
         await speakAudioBlobInMeeting(audio)
       } catch (e: unknown) {
@@ -1864,7 +1887,7 @@ export function MeetingPage() {
         hostAgentAutopilotBusyRef.current = false
       }
     })()
-  }, [captionLines, callView, code, hostAgentAutopilotEnabled, isHostInCall, liveCaptionsEnabled])
+  }, [captionLines, callView, code, hostAgentAutopilotEnabled, isHostInCall, liveCaptionsEnabled, peerIds])
 
   // Autopilot without captions: VAD on remote mix → record utterance → STT → reply; barge-in interrupts TTS / pending work.
   useEffect(() => {
@@ -2010,17 +2033,23 @@ export function MeetingPage() {
         }
         hostAgentAutopilotTranscriptRef.current = text.slice(-6000)
 
-        if (!shouldAutopilotRespondTo(text)) {
+        const duoHostAutopilot = peerIds.length === 1
+        if (!shouldAutopilotRespondTo(text, duoHostAutopilot)) {
           listenState = 'idle'
           return
         }
 
         if (captureGen !== hostAgentAutopilotGenRef.current) return
         showToast('Autopilot: speaking…')
+        const history = [...hostAgentConversationRef.current]
         const r = await hostAgentChat(code, {
-          message: `You must respond as the host. Respond in one concise spoken paragraph.\n\nHeard:\n"${text}"`,
+          message: duoHostAutopilot
+            ? `The participant said:\n"${text}"`
+            : `You must respond as the host. Respond in one concise spoken paragraph.\n\nHeard:\n"${text}"`,
           knowledgeBase: kb,
-          meetingContext: `Transcript:\n${text}`,
+          meetingContext: `Latest utterance:\n${text}`,
+          conversationHistory: history.length > 0 ? history : undefined,
+          duoHostMode: duoHostAutopilot,
         })
         if (captureGen !== hostAgentAutopilotGenRef.current) return
         const answer = r.reply.trim()
@@ -2028,6 +2057,11 @@ export function MeetingPage() {
           listenState = 'idle'
           return
         }
+        hostAgentConversationRef.current = [
+          ...history,
+          { role: 'user', content: text.slice(0, 4000) },
+          { role: 'assistant', content: answer.slice(0, 4000) },
+        ].slice(-24)
         const audio = await hostAgentTts(code, { text: answer })
         if (captureGen !== hostAgentAutopilotGenRef.current) return
         hostAgentAutopilotLastSpokenAtRef.current = Date.now()

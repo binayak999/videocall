@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { errorMessage, fetchMeetingCaptions, hostAgentChat, hostAgentTranscribe, hostAgentTts } from '../lib/api'
+import {
+  errorMessage,
+  fetchMeetingCaptions,
+  hostAgentChat,
+  hostAgentTranscribe,
+  hostAgentTts,
+  type HostAgentChatTurn,
+} from '../lib/api'
 import { useSpeechDictation } from '../lib/useSpeechDictation'
 import { MeetingSpeechLanguageSelect } from './MeetingSpeechLanguageSelect'
 
@@ -40,6 +47,7 @@ export function HostAgentPanel({
   const [ttsBusy, setTtsBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [autopilotEnabled, setAutopilotEnabled] = useState(false)
+  const [conversationHistory, setConversationHistory] = useState<HostAgentChatTurn[]>([])
 
   const { listening, err: speechErr, start, stop, speechOk } = useSpeechDictation(speechLang)
   const recRef = useRef<MediaRecorder | null>(null)
@@ -68,6 +76,10 @@ export function HostAgentPanel({
   useEffect(() => {
     onAutopilotConfigChange({ enabled: autopilotEnabled, knowledgeBase })
   }, [autopilotEnabled, knowledgeBase, onAutopilotConfigChange])
+
+  useEffect(() => {
+    setConversationHistory([])
+  }, [meetingCode])
 
   useEffect(() => {
     stop()
@@ -110,8 +122,16 @@ export function HostAgentPanel({
         message: m,
         knowledgeBase: knowledgeBase.trim() || undefined,
         meetingContext: meetingContext.trim() || undefined,
+        conversationHistory: conversationHistory.length > 0 ? conversationHistory : undefined,
       })
       setReply(r.reply)
+      setConversationHistory(prev =>
+        [
+          ...prev,
+          { role: 'user' as const, content: m },
+          { role: 'assistant' as const, content: r.reply.trim() },
+        ].slice(-24),
+      )
       setProviderLabel(r.provider === 'openai' ? 'OpenAI' : 'Hugging Face')
     } catch (e: unknown) {
       setErr(errorMessage(e))
@@ -246,7 +266,7 @@ export function HostAgentPanel({
               onChange={e => setAutopilotEnabled(e.target.checked)}
             />
             <span>
-              Autopilot: answer only when someone addresses you (not every question). With captions on, it follows captions; with captions off, it listens for speech, transcribes each utterance, replies, and can interrupt its reply if someone speaks again.
+              Autopilot: in group calls, answers when someone seems to address the host; in a 1:1 call (you + one guest), it replies to their remarks continuously like a host. With captions on, it follows captions; with captions off, it listens, transcribes, replies, and can interrupt if someone speaks again.
             </span>
           </label>
         </div>
@@ -330,14 +350,29 @@ export function HostAgentPanel({
 
         {err && <p className="text-[11px] text-red-300">{err}</p>}
 
-        <button
-          type="button"
-          disabled={chatBusy}
-          onClick={() => void onAsk()}
-          className="w-full cursor-pointer rounded-xl border border-violet-500/40 bg-violet-600/28 py-2.5 text-[13px] font-semibold text-white transition hover:border-violet-400/55 hover:bg-violet-600/40 disabled:cursor-not-allowed disabled:opacity-45"
-        >
-          {chatBusy ? 'Thinking…' : 'Ask host agent'}
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            disabled={chatBusy}
+            onClick={() => void onAsk()}
+            className="min-w-0 flex-1 cursor-pointer rounded-xl border border-violet-500/40 bg-violet-600/28 py-2.5 text-[13px] font-semibold text-white transition hover:border-violet-400/55 hover:bg-violet-600/40 disabled:cursor-not-allowed disabled:opacity-45"
+          >
+            {chatBusy ? 'Thinking…' : 'Ask host agent'}
+          </button>
+          <button
+            type="button"
+            disabled={chatBusy || conversationHistory.length === 0}
+            onClick={() => setConversationHistory([])}
+            className="shrink-0 rounded-xl border border-white/14 bg-white/6 px-3 py-2.5 text-[11px] font-semibold text-white/70 transition hover:border-white/22 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-35"
+          >
+            Clear thread
+          </button>
+        </div>
+        {conversationHistory.length > 0 && (
+          <p className="text-[10px] text-white/35">
+            Agent remembers {Math.floor(conversationHistory.length / 2)} turn(s) in this session (sent with each ask).
+          </p>
+        )}
 
         <button
           type="button"
