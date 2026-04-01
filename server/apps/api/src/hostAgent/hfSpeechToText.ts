@@ -116,9 +116,14 @@ async function transcribeOpenAI(audio: Buffer, contentType: string): Promise<str
   const ext =
     ct.includes("wav") ? "wav" : ct.includes("mp3") ? "mp3" : ct.includes("mpeg") ? "mp3" : "webm"
 
-  const blob = new Blob([new Uint8Array(audio)], { type: ct })
+  const bytes = new Uint8Array(audio)
+  // OpenAI validates format by content + filename; `File` is more consistently recognized than `Blob` in Node.
+  const file =
+    typeof File !== "undefined"
+      ? new File([bytes], `audio.${ext}`, { type: ct })
+      : new Blob([bytes], { type: ct })
   const form = new FormData()
-  form.append("file", blob, `audio.${ext}`)
+  form.append("file", file, `audio.${ext}`)
   form.append("model", "whisper-1")
 
   const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
