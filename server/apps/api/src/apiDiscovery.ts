@@ -214,6 +214,36 @@ export function buildApiManifest(req: Request): Record<string, unknown> {
         },
         {
           method: "POST",
+          path: "/api/meetings/:code/host-agent/chat",
+          auth: "Bearer JWT",
+          description:
+            "Host only: RAG-style reply using knowledgeBase + meetingContext + message. LLM: HF router (default) or OpenAI.",
+          body: {
+            message: "string",
+            knowledgeBase: "string | optional",
+            meetingContext: "string | optional",
+          },
+          responses: {
+            200: { reply: "string", provider: "huggingface | openai" },
+            403: { error: "Only the meeting host can use the host agent" },
+            503: { error: "Host agent LLM not configured" },
+          },
+        },
+        {
+          method: "POST",
+          path: "/api/meetings/:code/host-agent/transcribe",
+          auth: "Bearer JWT",
+          description:
+            "Host only: raw audio body (Content-Type = audio mime). STT: Hugging Face Whisper by default; HOST_AGENT_STT_PROVIDER=openai uses OpenAI.",
+          body: "binary (not JSON)",
+          responses: {
+            200: { text: "string", provider: "huggingface | openai" },
+            403: { error: "Only the meeting host can transcribe" },
+            503: { error: "STT not configured" },
+          },
+        },
+        {
+          method: "POST",
           path: "/api/translate",
           auth: "Bearer JWT",
           description:
@@ -761,6 +791,126 @@ export function buildOpenApi(req: Request): Record<string, unknown> {
             },
             "503": {
               description: "No Hugging Face or OpenAI API key configured",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+          },
+        },
+      },
+      "/api/meetings/{code}/host-agent/chat": {
+        post: {
+          tags: ["Meetings"],
+          summary: "Host agent chat (HF router or OpenAI)",
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            {
+              name: "code",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  required: ["message"],
+                  properties: {
+                    message: { type: "string" },
+                    knowledgeBase: { type: "string" },
+                    meetingContext: { type: "string" },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            "200": {
+              description: "Model reply",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    required: ["reply", "provider"],
+                    properties: {
+                      reply: { type: "string" },
+                      provider: { type: "string", enum: ["huggingface", "openai"] },
+                    },
+                  },
+                },
+              },
+            },
+            "403": {
+              description: "Not the meeting host",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+            "503": {
+              description: "LLM not configured",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+          },
+        },
+      },
+      "/api/meetings/{code}/host-agent/transcribe": {
+        post: {
+          tags: ["Meetings"],
+          summary: "Host agent audio transcription (HF Whisper or OpenAI)",
+          security: [{ bearerAuth: [] }],
+          parameters: [
+            {
+              name: "code",
+              in: "path",
+              required: true,
+              schema: { type: "string" },
+            },
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              "audio/wav": { schema: { type: "string", format: "binary" } },
+              "audio/webm": { schema: { type: "string", format: "binary" } },
+              "audio/mp4": { schema: { type: "string", format: "binary" } },
+            },
+          },
+          responses: {
+            "200": {
+              description: "Transcript text",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    required: ["text", "provider"],
+                    properties: {
+                      text: { type: "string" },
+                      provider: { type: "string", enum: ["huggingface", "openai"] },
+                    },
+                  },
+                },
+              },
+            },
+            "403": {
+              description: "Not the meeting host",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/Error" },
+                },
+              },
+            },
+            "503": {
+              description: "STT not configured",
               content: {
                 "application/json": {
                   schema: { $ref: "#/components/schemas/Error" },

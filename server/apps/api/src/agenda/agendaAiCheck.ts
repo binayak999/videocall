@@ -1,3 +1,5 @@
+import { normalizeHfInferenceBaseUrl } from "../hf/normalizeHfInferenceBaseUrl";
+
 export type AgendaCheckItem = {
   label: string
   met: boolean
@@ -150,8 +152,7 @@ export async function runAgendaAiCheck(
   const openaiKey = process.env.OPENAI_API_KEY?.trim()
 
   if (hfToken) {
-    const base =
-      process.env.HF_INFERENCE_BASE_URL?.trim() || "https://router.huggingface.co/v1"
+    const base = normalizeHfInferenceBaseUrl(process.env.HF_INFERENCE_BASE_URL)
     const model =
       process.env.HF_AGENDA_MODEL?.trim() || "google/gemma-2-2b-it"
     const url = chatCompletionsUrl(base)

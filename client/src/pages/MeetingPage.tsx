@@ -20,6 +20,7 @@ import {
   primeMeetingNotificationAudio,
 } from '../lib/meetingNotificationSounds'
 import { HostAgendaPanel } from '../components/HostAgendaPanel'
+import { HostAgentPanel } from '../components/HostAgentPanel'
 import { MeetingAttentionWarningModal } from '../components/MeetingAttentionWarningModal'
 import { MeetingVoteOverlay, type MeetingVoteChoice } from '../components/MeetingVoteOverlay'
 import { useVoteGestureRecognition } from '../lib/useVoteGestureRecognition'
@@ -371,6 +372,7 @@ export function MeetingPage() {
   const [chatOpen, setChatOpen] = useState(false)
   const [notesOpen, setNotesOpen] = useState(false)
   const [agendaOpen, setAgendaOpen] = useState(false)
+  const [hostAgentOpen, setHostAgentOpen] = useState(false)
   const [callSettingsOpen, setCallSettingsOpen] = useState(false)
   const [callSettingsTab, setCallSettingsTab] = useState<'features' | 'settings'>('features')
   const [recordingActive, setRecordingActive] = useState(false)
@@ -3294,6 +3296,8 @@ export function MeetingPage() {
     } else if (focus === 'Screen Share') {
       queueMicrotask(() => { void toggleScreenShare() })
     } else if (focus === 'Note Taker') {
+      setHostAgentOpen(false)
+      setAgendaOpen(false)
       setNotesOpen(true)
     }
   }
@@ -3472,6 +3476,7 @@ export function MeetingPage() {
     setChatOpen(false)
     setNotesOpen(false)
     setAgendaOpen(false)
+    setHostAgentOpen(false)
     setCallSettingsOpen(false)
     setChatDraft('')
     setIsHostInCall(false)
@@ -5324,6 +5329,7 @@ export function MeetingPage() {
                         )}
                         onClick={() => {
                           setAgendaOpen(false)
+                          setHostAgentOpen(false)
                           setCallSettingsOpen(false)
                           setNotesOpen(prev => !prev)
                         }}
@@ -5487,11 +5493,39 @@ export function MeetingPage() {
                           )}
                           onClick={() => {
                             setNotesOpen(false)
+                            setHostAgentOpen(false)
                             setCallSettingsOpen(false)
                             setAgendaOpen(prev => !prev)
                           }}
                         >
                           {agendaOpen ? 'Close agenda & AI' : 'Open agenda & AI check'}
+                        </button>
+                      </div>
+                    )}
+                    {isHostInCall && (
+                      <div className="border-t border-white/10 pt-4">
+                        <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">
+                          Host AI stand-in
+                        </p>
+                        <p className="mb-2.5 text-[12px] leading-snug text-white/45">
+                          Free-tier Hugging Face LLM + Whisper STT: paste a knowledge base, pull captions, then ask for a suggested reply. Voice into the room comes later.
+                        </p>
+                        <button
+                          type="button"
+                          className={cx(
+                            'w-full cursor-pointer rounded-xl border py-2.5 text-[13px] font-semibold transition',
+                            hostAgentOpen
+                              ? 'border-violet-400/50 bg-violet-600/30 text-white'
+                              : 'border-white/12 bg-white/8 text-white/90 hover:border-violet-500/40 hover:bg-white/12',
+                          )}
+                          onClick={() => {
+                            setNotesOpen(false)
+                            setAgendaOpen(false)
+                            setCallSettingsOpen(false)
+                            setHostAgentOpen(prev => !prev)
+                          }}
+                        >
+                          {hostAgentOpen ? 'Close host AI stand-in' : 'Open host AI stand-in'}
                         </button>
                       </div>
                     )}
@@ -5778,6 +5812,16 @@ export function MeetingPage() {
               meetingCode={code}
               open={agendaOpen}
               onClose={() => setAgendaOpen(false)}
+              speechLang={speechLang}
+              onSpeechLangChange={setSpeechLang}
+            />
+          )}
+
+          {isHostInCall && (
+            <HostAgentPanel
+              meetingCode={code}
+              open={hostAgentOpen}
+              onClose={() => setHostAgentOpen(false)}
               speechLang={speechLang}
               onSpeechLangChange={setSpeechLang}
             />

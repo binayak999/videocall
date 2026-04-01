@@ -16,6 +16,7 @@ import { meetingRecordingUploadHandler } from "./routes/meetingRecordingUpload";
 import { meetingsRouter } from "./routes/meetings";
 import { recordingsListRouter } from "./routes/recordings";
 import { translateRouter } from "./routes/translate";
+import { hostAgentTranscribeHandler } from "./routes/hostAgentTranscribe";
 
 /**
  * Resolve `apps/api/public` whether we run from `src/` (ts-node) or `dist/` (node),
@@ -143,6 +144,13 @@ app.post(
   express.raw({ type: () => true, limit: "512mb" }),
   authMiddleware,
   meetingRecordingUploadHandler,
+);
+
+app.post(
+  "/api/meetings/:code/host-agent/transcribe",
+  express.raw({ type: () => true, limit: "25mb" }),
+  authMiddleware,
+  hostAgentTranscribeHandler,
 );
 
 app.use(express.json({ limit: "1mb" }));

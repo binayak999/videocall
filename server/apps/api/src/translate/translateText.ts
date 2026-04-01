@@ -1,3 +1,5 @@
+import { normalizeHfInferenceBaseUrl } from "../hf/normalizeHfInferenceBaseUrl";
+
 const NOT_CONFIGURED = "TRANSLATE_AI_NOT_CONFIGURED"
 
 function chatCompletionsUrl(base: string): string {
@@ -92,8 +94,7 @@ Output only the translation — no quotes, no "Here is the translation" preamble
   const openaiKey = process.env.OPENAI_API_KEY?.trim()
 
   if (hfToken) {
-    const base =
-      process.env.HF_INFERENCE_BASE_URL?.trim() || "https://router.huggingface.co/v1"
+    const base = normalizeHfInferenceBaseUrl(process.env.HF_INFERENCE_BASE_URL)
     const model =
       process.env.HF_TRANSLATE_MODEL?.trim() ||
       process.env.HF_AGENDA_MODEL?.trim() ||

@@ -12,11 +12,15 @@ import {
 } from "../meetingRecordingR2";
 import { authMiddleware } from "../middleware/auth";
 import { isAgendaAiNotConfiguredError, runAgendaAiCheck } from "../agenda/agendaAiCheck";
+import { isHostAgentLlmNotConfiguredError, runHostAgentChat } from "../hostAgent/hostAgentChat";
 
 const router = Router();
 
 const AGENDA_MAX = 12_000
 const TRANSCRIPT_MAX = 48_000
+const HOST_AGENT_KB_MAX = 32_000
+const HOST_AGENT_CONTEXT_MAX = 48_000
+const HOST_AGENT_MESSAGE_MAX = 8_000
 
 function meetingCodeParam(raw: string | string[] | undefined): string {
   if (typeof raw === "string") {
@@ -288,6 +292,93 @@ router.post("/:code/agenda/analyze", authMiddleware, async (req, res) => {
       }
       console.error("agenda analyze:", e);
       res.status(502).json({ error: "Agenda analysis failed", detail: msg });
+    }
+  } catch (err: unknown) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.post("/:code/host-agent/chat", authMiddleware, async (req, res) => {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  const code = meetingCodeParam(req.params.code);
+  if (!code) {
+    res.status(400).json({ error: "Invalid code" });
+    return;
+  }
+
+  const body = req.body as {
+    message?: unknown;
+    knowledgeBase?: unknown;
+    meetingContext?: unknown;
+  };
+  const message = typeof body.message === "string" ? body.message.trim() : "";
+  const knowledgeBase =
+    typeof body.knowledgeBase === "string" ? body.knowledgeBase.trim() : "";
+  const meetingContext =
+    typeof body.meetingContext === "string" ? body.meetingContext.trim() : "";
+
+  if (message.length === 0) {
+    res.status(400).json({ error: "message is required" });
+    return;
+  }
+  if (message.length > HOST_AGENT_MESSAGE_MAX) {
+    res.status(400).json({ error: `message too long (max ${HOST_AGENT_MESSAGE_MAX} characters)` });
+    return;
+  }
+  if (knowledgeBase.length > HOST_AGENT_KB_MAX) {
+    res.status(400).json({ error: `knowledgeBase too long (max ${HOST_AGENT_KB_MAX} characters)` });
+    return;
+  }
+  if (meetingContext.length > HOST_AGENT_CONTEXT_MAX) {
+    res
+      .status(400)
+      .json({ error: `meetingContext too long (max ${HOST_AGENT_CONTEXT_MAX} characters)` });
+    return;
+  }
+
+  try {
+    const meeting = await prisma.meeting.findUnique({
+      where: { code },
+      select: {
+        id: true,
+        hostId: true,
+        host: { select: { name: true } },
+      },
+    });
+    if (!meeting) {
+      res.status(404).json({ error: "Meeting not found" });
+      return;
+    }
+    if (meeting.hostId !== userId) {
+      res.status(403).json({ error: "Only the meeting host can use the host agent" });
+      return;
+    }
+
+    try {
+      const { reply, provider } = await runHostAgentChat({
+        hostDisplayName: meeting.host.name,
+        userMessage: message,
+        knowledgeBase,
+        meetingContext,
+      });
+      res.json({ reply, provider });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Host agent failed";
+      if (isHostAgentLlmNotConfiguredError(e)) {
+        res.status(503).json({
+          error: "Host agent LLM is not configured",
+          detail:
+            "Set HUGGINGFACE_API_TOKEN (or HF_TOKEN) for Hugging Face router models, or OPENAI_API_KEY. See apps/api/.env.example.",
+        });
+        return;
+      }
+      console.error("host-agent chat:", e);
+      res.status(502).json({ error: "Host agent failed", detail: msg });
     }
   } catch (err: unknown) {
     console.error(err);

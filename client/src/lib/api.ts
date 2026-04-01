@@ -251,6 +251,49 @@ export async function analyzeMeetingAgenda(
   )
 }
 
+export async function hostAgentChat(
+  meetingCode: string,
+  body: { message: string; knowledgeBase?: string; meetingContext?: string },
+): Promise<{ reply: string; provider: string }> {
+  return await requestJson<{ reply: string; provider: string }>(
+    `/api/meetings/${encodeURIComponent(meetingCode)}/host-agent/chat`,
+    {
+      method: 'POST',
+      auth: true,
+      body: JSON.stringify(body),
+    },
+  )
+}
+
+/** Host only — raw audio body; same auth as recording upload. */
+export async function hostAgentTranscribe(
+  meetingCode: string,
+  blob: Blob,
+): Promise<{ text: string; provider: string }> {
+  const url = `${apiBase()}/api/meetings/${encodeURIComponent(meetingCode)}/host-agent/transcribe`
+  const token = getToken()
+  if (!token) {
+    throw new HttpError(401, { error: 'Not signed in' })
+  }
+  const rawType = blob.type && blob.type.length > 0 ? blob.type : 'audio/webm'
+  const ct = rawType.split(';')[0]!.trim()
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': ct,
+      Accept: 'application/json',
+    },
+    body: blob,
+    credentials: 'include',
+  })
+  if (!res.ok) {
+    const bodyUnknown = await readJsonOrText(res)
+    throw new HttpError(res.status, bodyUnknown)
+  }
+  return (await readJsonOrText(res)) as { text: string; provider: string }
+}
+
 export function errorMessage(err: unknown): string {
   if (err instanceof HttpError) {
     const body = err.body
