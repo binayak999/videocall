@@ -348,6 +348,8 @@ export function MeetingPage() {
   const callViewRef = useRef<CallView>('lobby')
   callViewRef.current = callView
   const [micEnabled, setMicEnabled] = useState(false)
+  const micEnabledRef = useRef(micEnabled)
+  micEnabledRef.current = micEnabled
   const [camEnabled, setCamEnabled] = useState(false)
   const [statusLine, setStatusLine] = useState('')
   const [peerIds, setPeerIds] = useState<string[]>([])
@@ -379,6 +381,10 @@ export function MeetingPage() {
   const [, setAiVoiceActive] = useState(false)
   const aiVoiceTrackRef = useRef<MediaStreamTrack | null>(null)
   const aiVoiceStopRef = useRef<(() => void) | null>(null)
+  /** Mic UI / caption STT should treat mic as off during AI TTS; restore after. */
+  const micEnabledBeforeAiVoiceRef = useRef<boolean | null>(null)
+  /** Bumped on each new AI playback so a superseded session does not restore the mic. */
+  const aiVoiceSessionGenRef = useRef(0)
   const [hostAgentAutopilotEnabled, setHostAgentAutopilotEnabled] = useState(false)
   const hostAgentKbRef = useRef('')
   const hostAgentAutopilotBusyRef = useRef(false)
@@ -1624,12 +1630,52 @@ export function MeetingPage() {
     }
   }
 
-  async function restoreLocalMicrophone(): Promise<void> {
-    if (micLockedByHostRef.current) {
-      showToast('The host has muted your microphone')
+  async function restoreLocalMicrophone(expectedGen?: number): Promise<void> {
+    if (expectedGen !== undefined && expectedGen !== aiVoiceSessionGenRef.current) return
+
+    const wantEnabled = micEnabledBeforeAiVoiceRef.current
+    micEnabledBeforeAiVoiceRef.current = null
+
+    const localStream = localStreamRef.current ?? (await ensureStream())
+
+    for (const t of [...localStream.getAudioTracks()]) {
+      localStream.removeTrack(t)
+      if (!isInboundRemoteCameraAudioTrack(t)) t.stop()
+    }
+
+    async function clearOutboundAudio(): Promise<void> {
+      for (const [, { pc }] of peersRef.current.entries()) {
+        const sender = pc.getSenders().find(s => s.track?.kind === 'audio')
+        if (sender) await sender.replaceTrack(null).catch(() => {})
+      }
+      const room = liveKitRoomRef.current
+      if (room?.state === 'connected' && liveKitPublishedTracksRef.current.audio) {
+        try {
+          await room.localParticipant.unpublishTrack(liveKitPublishedTracksRef.current.audio, false)
+        } catch {
+          /* ignore */
+        }
+        liveKitPublishedTracksRef.current = {
+          ...liveKitPublishedTracksRef.current,
+          audio: null,
+        }
+      }
+      void applyRemoteSpeakerTracks()
+    }
+
+    if (!wantEnabled) {
+      setMicEnabled(false)
+      await clearOutboundAudio()
       return
     }
-    const localStream = localStreamRef.current ?? (await ensureStream())
+
+    if (micLockedByHostRef.current) {
+      showToast('The host has muted your microphone')
+      setMicEnabled(false)
+      await clearOutboundAudio()
+      return
+    }
+
     const micStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         deviceId: activeMicDeviceId ? { exact: activeMicDeviceId } : undefined,
@@ -1642,10 +1688,6 @@ export function MeetingPage() {
     const newAudioTrack = micStream.getAudioTracks()[0] ?? null
     if (!newAudioTrack) throw new Error('No microphone track available')
 
-    for (const t of [...localStream.getAudioTracks()]) {
-      localStream.removeTrack(t)
-      if (!isInboundRemoteCameraAudioTrack(t)) t.stop()
-    }
     localStream.addTrack(newAudioTrack)
     newAudioTrack.enabled = true
     for (const [remoteId, { pc }] of peersRef.current.entries()) {
@@ -1668,6 +1710,13 @@ export function MeetingPage() {
     aiVoiceStopRef.current?.()
     aiVoiceStopRef.current = null
     aiVoiceTrackRef.current = null
+
+    const sessionGen = ++aiVoiceSessionGenRef.current
+    if (micEnabledBeforeAiVoiceRef.current === null) {
+      micEnabledBeforeAiVoiceRef.current = micEnabledRef.current
+    }
+    // Keep mic "off" in UI / caption pipeline while AI speaks (TTS is not the host mic).
+    setMicEnabled(false)
 
     const localStream = localStreamRef.current ?? (await ensureStream())
 
@@ -1708,7 +1757,6 @@ export function MeetingPage() {
 
     aiVoiceTrackRef.current = newTrack
     setAiVoiceActive(true)
-    setMicEnabled(true)
 
     return new Promise<void>((resolve) => {
       let settled = false
@@ -1726,7 +1774,7 @@ export function MeetingPage() {
         aiVoiceStopRef.current = null
         aiVoiceTrackRef.current = null
         // Best-effort restore mic.
-        void restoreLocalMicrophone().catch(() => {
+        void restoreLocalMicrophone(sessionGen).catch(() => {
           showToast('AI voice stopped (mic restore failed)')
         })
         settle()

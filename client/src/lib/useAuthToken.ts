@@ -1,21 +1,23 @@
 import { useEffect, useState } from 'react'
-import { getToken } from './auth'
+import { AUTH_CHANGE_EVENT, getToken } from './auth'
 
 export function useAuthToken(): string | null {
-  const [token, setToken] = useState<string | null>(() => getToken())
+  const [token, setTokenState] = useState<string | null>(() => getToken())
 
   useEffect(() => {
-    const onStorage = (e: StorageEvent) => {
-      if (e.key === 'nexivo.token') setToken(getToken())
-    }
-    window.addEventListener('storage', onStorage)
+    const sync = () => setTokenState(getToken())
 
-    const onFocus = () => setToken(getToken())
-    window.addEventListener('focus', onFocus)
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === 'nexivo.token' || e.key === null) sync()
+    }
+    window.addEventListener(AUTH_CHANGE_EVENT, sync)
+    window.addEventListener('storage', onStorage)
+    window.addEventListener('focus', sync)
 
     return () => {
+      window.removeEventListener(AUTH_CHANGE_EVENT, sync)
       window.removeEventListener('storage', onStorage)
-      window.removeEventListener('focus', onFocus)
+      window.removeEventListener('focus', sync)
     }
   }, [])
 

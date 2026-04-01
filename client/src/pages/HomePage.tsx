@@ -70,31 +70,33 @@ export function HomePage() {
     'rounded-xl border border-(--nexivo-input-border) bg-(--nexivo-input-bg) text-sm text-(--nexivo-text) outline-none transition placeholder:text-(--nexivo-placeholder) focus:border-[#f59e0b]/50'
 
   return (
-    <>
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-x-hidden">
       {selectedFeature && (() => {
         const f = NEXIVO_FEATURE_ITEMS.find(x => x.label === selectedFeature)
         if (!f) return null
         return (
           <div
-            className="flex shrink-0 items-center gap-3 border-b border-(--nexivo-border-subtle) px-5 py-3"
+            className="flex shrink-0 flex-col gap-2 border-b border-(--nexivo-border-subtle) px-4 py-3 sm:flex-row sm:items-center sm:gap-3 sm:px-5"
             style={{ background: `linear-gradient(90deg, ${f.color}14 0%, transparent 100%)` }}
           >
-            <div
-              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl"
-              style={{ backgroundColor: `${f.color}28` }}
-            >
-              <svg viewBox="0 0 24 24" fill={f.color} width="18" height="18">
-                {f.icon}
-              </svg>
-            </div>
-            <div className="min-w-0 flex-1">
-              <p className="text-xs font-semibold text-(--nexivo-text)">Starting with {f.label}</p>
-              <p className="text-[0.65rem] text-(--nexivo-text-muted)">Opens when you join the call.</p>
+            <div className="flex min-w-0 items-start gap-3 sm:flex-1 sm:items-center">
+              <div
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl"
+                style={{ backgroundColor: `${f.color}28` }}
+              >
+                <svg viewBox="0 0 24 24" fill={f.color} width="18" height="18">
+                  {f.icon}
+                </svg>
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="wrap-break-word text-xs font-semibold text-(--nexivo-text)">Starting with {f.label}</p>
+                <p className="text-[0.65rem] text-(--nexivo-text-muted)">Opens when you join the call.</p>
+              </div>
             </div>
             <button
               type="button"
               onClick={() => setSelectedFeature(null)}
-              className="shrink-0 rounded-lg px-2 py-1 text-[0.65rem] font-medium text-(--nexivo-text-subtle) transition hover:bg-(--nexivo-nav-hover) hover:text-(--nexivo-text)"
+              className="self-start rounded-lg px-2 py-1 text-[0.65rem] font-medium text-(--nexivo-text-subtle) transition hover:bg-(--nexivo-nav-hover) hover:text-(--nexivo-text) sm:self-auto"
             >
               Clear
             </button>
@@ -102,11 +104,11 @@ export function HomePage() {
         )
       })()}
 
-      <div className="flex flex-wrap items-center gap-2 px-5 pt-4 pb-3">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-2 px-4 pt-4 pb-3 sm:px-5">
         <Link
           to={{ pathname: '/', search: '?tab=join' }}
           className={cx(
-            'rounded-full px-4 py-1.5 text-sm font-semibold transition no-underline',
+            'rounded-full px-3 py-1.5 text-xs font-semibold transition no-underline sm:px-4 sm:text-sm',
             !showNotesPanel && tab === 'join' ? 'bg-[#f59e0b] text-black' : pillInactive,
           )}
         >
@@ -115,7 +117,7 @@ export function HomePage() {
         <Link
           to={{ pathname: '/', search: '?tab=create' }}
           className={cx(
-            'rounded-full px-4 py-1.5 text-sm font-semibold transition no-underline',
+            'rounded-full px-3 py-1.5 text-xs font-semibold transition no-underline sm:px-4 sm:text-sm',
             !showNotesPanel && tab === 'create' ? 'bg-[#f59e0b] text-black' : pillInactive,
           )}
         >
@@ -124,7 +126,7 @@ export function HomePage() {
         <Link
           to={{ pathname: '/', search: '?panel=notes' }}
           className={cx(
-            'rounded-full px-4 py-1.5 text-sm font-semibold transition no-underline',
+            'rounded-full px-3 py-1.5 text-xs font-semibold transition no-underline sm:px-4 sm:text-sm',
             showNotesPanel ? 'bg-[#f59e0b] text-black' : pillInactive,
           )}
         >
@@ -133,32 +135,35 @@ export function HomePage() {
         {authed && (
           <Link
             to="/recordings"
-            className={cx('rounded-full px-4 py-1.5 text-sm font-semibold transition no-underline', pillInactive)}
+            className={cx(
+              'rounded-full px-3 py-1.5 text-xs font-semibold transition no-underline sm:px-4 sm:text-sm',
+              pillInactive,
+            )}
           >
             Recordings
           </Link>
         )}
       </div>
 
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden px-5 pb-4">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden px-4 pb-4 sm:px-5">
         {showNotesPanel ? (
           <NotesWorkspace />
         ) : tab === 'join' ? (
-          <div className="flex min-h-0 flex-1 flex-col gap-2">
-            <p className="text-xl font-bold tracking-tight text-(--nexivo-text)">Join a meeting</p>
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-2">
+            <p className="text-lg font-bold tracking-tight text-(--nexivo-text) sm:text-xl">Join a meeting</p>
             <p className="text-sm text-(--nexivo-text-secondary)">Enter the code shared by your host.</p>
 
-            <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-xl bg-(--nexivo-hero-tile)">
+            <div className="flex min-h-0 min-w-0 max-h-[min(38vh,260px)] flex-1 flex-col items-center justify-center overflow-hidden rounded-xl bg-(--nexivo-hero-tile) sm:max-h-none">
               <img
                 src={heroImg}
                 alt=""
                 aria-hidden
                 draggable={false}
-                className="h-full w-auto max-w-full select-none object-contain opacity-40 p-4"
+                className="h-full w-full max-w-full select-none object-contain p-3 opacity-40 sm:p-4"
               />
             </div>
 
-            <div className="mt-1 flex flex-col gap-2 sm:flex-row">
+            <div className="mt-1 flex min-w-0 flex-col gap-2 sm:flex-row">
               <input
                 value={code}
                 onChange={e => setCode(e.target.value)}
@@ -173,7 +178,7 @@ export function HomePage() {
                 type="button"
                 onClick={() => void onJoin()}
                 disabled={joinBusy || !code.trim()}
-                className="shrink-0 rounded-xl bg-[#f59e0b] px-5 py-2.5 text-sm font-semibold text-black transition hover:bg-[#fbbf24] disabled:opacity-30 sm:w-auto"
+                className="w-full shrink-0 rounded-xl bg-[#f59e0b] px-5 py-2.5 text-sm font-semibold text-black transition hover:bg-[#fbbf24] disabled:opacity-30 sm:w-auto"
               >
                 {joinBusy ? '…' : 'Join'}
               </button>
@@ -181,27 +186,27 @@ export function HomePage() {
             {joinError && <p className="text-xs text-red-400">{joinError}</p>}
           </div>
         ) : (
-          <div className="flex min-h-0 flex-1 flex-col gap-2">
-            <p className="text-xl font-bold tracking-tight text-(--nexivo-text)">Start a video call</p>
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-2">
+            <p className="text-lg font-bold tracking-tight text-(--nexivo-text) sm:text-xl">Start a video call</p>
             <p className="text-sm text-(--nexivo-text-muted)">Create a room and share the code instantly.</p>
 
-            <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden rounded-xl bg-(--nexivo-hero-tile-2)">
+            <div className="flex min-h-0 min-w-0 max-h-[min(38vh,260px)] flex-1 flex-col items-center justify-center overflow-hidden rounded-xl bg-(--nexivo-hero-tile-2) sm:max-h-none">
               <img
                 src={heroImg}
                 alt=""
                 aria-hidden
                 draggable={false}
-                className="h-full w-auto max-w-full select-none object-contain opacity-70 p-4"
+                className="h-full w-full max-w-full select-none object-contain p-3 opacity-70 sm:p-4"
               />
             </div>
 
             {authed ? (
-              <div className="mt-1 flex flex-col gap-2">
+              <div className="mt-1 flex min-w-0 flex-col gap-2">
                 <input
                   value={title}
                   onChange={e => setTitle(e.target.value)}
                   placeholder="Meeting title (optional)"
-                  className={cx('w-full px-4 py-2.5', inputClass)}
+                  className={cx('w-full min-w-0 px-4 py-2.5', inputClass)}
                 />
                 {createError && <p className="text-xs text-red-400">{createError}</p>}
                 <button
@@ -214,16 +219,16 @@ export function HomePage() {
                 </button>
               </div>
             ) : (
-              <div className="mt-1 flex gap-2">
+              <div className="mt-1 flex min-w-0 flex-col gap-2 sm:flex-row">
                 <Link
                   to="/login"
-                  className="flex-1 rounded-xl border border-(--nexivo-input-border) bg-(--nexivo-muted-surface) py-2.5 text-center text-sm font-medium text-(--nexivo-text-muted) transition hover:bg-(--nexivo-nav-hover) hover:text-(--nexivo-text-secondary)"
+                  className="w-full flex-1 rounded-xl border border-(--nexivo-input-border) bg-(--nexivo-muted-surface) py-2.5 text-center text-sm font-medium text-(--nexivo-text-muted) transition hover:bg-(--nexivo-nav-hover) hover:text-(--nexivo-text-secondary) sm:w-auto"
                 >
                   Sign in
                 </Link>
                 <Link
                   to="/register"
-                  className="flex-1 rounded-xl bg-[#f59e0b] py-2.5 text-center text-sm font-semibold text-black transition hover:bg-[#fbbf24]"
+                  className="w-full flex-1 rounded-xl bg-[#f59e0b] py-2.5 text-center text-sm font-semibold text-black transition hover:bg-[#fbbf24] sm:w-auto"
                 >
                   Register
                 </Link>
@@ -232,6 +237,6 @@ export function HomePage() {
           </div>
         )}
       </div>
-    </>
+    </div>
   )
 }
