@@ -46,6 +46,7 @@ import {
   shouldAttemptFullLiveKitReconnect,
 } from '../lib/livekitReconnection'
 import { resolvedRtcMode, writeRtcModeToStorage, type RtcMode } from '../lib/rtcMode'
+import { LiveBroadcastCompositor } from '../lib/liveBroadcastCompositor'
 
 type CallView = 'detail' | 'lobby' | 'call'
 
@@ -512,6 +513,10 @@ export function MeetingPage() {
   const isHostInCallRef = useRef(false)
   const liveStreamPublicRef = useRef(false)
   const liveViewerPeerIdsRef = useRef<Set<string>>(new Set())
+  const broadcastCompositorRef = useRef<LiveBroadcastCompositor | null>(null)
+  const peerIdsRef = useRef<string[]>([])
+  const liveBroadcastSyncTimerRef = useRef<number | null>(null)
+  const syncLiveBroadcastCompositorFnRef = useRef<() => void>(() => {})
   const micLockedByHostRef = useRef(false)
   const micWasEnabledBeforeHostMuteRef = useRef<boolean | null>(null)
   const collabAutoConnectDoneRef = useRef(false)
@@ -1046,6 +1051,120 @@ export function MeetingPage() {
   useEffect(() => {
     liveStreamPublicRef.current = liveStreamPublic
   }, [liveStreamPublic])
+
+  useEffect(() => {
+    peerIdsRef.current = peerIds
+  }, [peerIds])
+
+  const syncLiveBroadcastCompositor = useCallback(() => {
+    const comp = broadcastCompositorRef.current
+    if (!comp || !liveStreamPublicRef.current || !isHostInCallRef.current) return
+    const myId = mySocketIdRef.current
+    const roster = participantRosterRef.current
+    const selfLabel =
+      (myId && roster[myId]?.userName?.trim()) ||
+      meeting?.host?.name?.trim() ||
+      'You'
+    const tiles: { key: string; label: string; stream: MediaStream | null }[] = [
+      {
+        key: `local:${myId || 'self'}`,
+        label: selfLabel,
+        stream: localStreamRef.current,
+      },
+    ]
+    for (const id of [...peerIdsRef.current].sort()) {
+      tiles.push({
+        key: `peer:${id}`,
+        label: roster[id]?.userName?.trim() || 'Guest',
+        stream: peerStreamRefs.current.get(id) ?? null,
+      })
+    }
+    const screen =
+      screenSharingRef.current && screenStreamRef.current
+        ? { stream: screenStreamRef.current, label: 'Screen share' }
+        : null
+    comp.setSources(tiles, screen)
+  }, [meeting?.host?.name])
+
+  async function upgradeLiveViewerToCompositeTracks(viewerId: string) {
+    const outbound = broadcastCompositorRef.current?.getStream()
+    const vIn = outbound?.getVideoTracks()[0]
+    const aIn = outbound?.getAudioTracks()[0]
+    if (!outbound || !vIn || !aIn) return
+    if (!liveViewerPeerIdsRef.current.has(viewerId)) return
+    const state = peersRef.current.get(viewerId)
+    if (!state || !socketRef.current?.connected) return
+    try {
+      const vClone = vIn.clone()
+      const aClone = aIn.clone()
+      for (const s of state.pc.getSenders()) {
+        if (s.track?.kind === 'video') await s.replaceTrack(vClone)
+        else if (s.track?.kind === 'audio') await s.replaceTrack(aClone)
+      }
+      await renegotiate(viewerId)
+    } catch (e) {
+      appendLog('live viewer composite upgrade failed', String(e))
+    }
+  }
+
+  useEffect(() => {
+    syncLiveBroadcastCompositorFnRef.current = syncLiveBroadcastCompositor
+  }, [syncLiveBroadcastCompositor])
+
+  const scheduleLiveBroadcastCompositorSyncRef = useRef<() => void>(() => {})
+  useEffect(() => {
+    scheduleLiveBroadcastCompositorSyncRef.current = () => {
+      if (!liveStreamPublicRef.current || !isHostInCallRef.current) return
+      if (liveBroadcastSyncTimerRef.current != null) {
+        window.clearTimeout(liveBroadcastSyncTimerRef.current)
+      }
+      liveBroadcastSyncTimerRef.current = window.setTimeout(() => {
+        liveBroadcastSyncTimerRef.current = null
+        syncLiveBroadcastCompositorFnRef.current()
+      }, 100)
+    }
+  }, [syncLiveBroadcastCompositor])
+
+  useEffect(() => {
+    if (!liveStreamPublic || !isHostInCall || callView !== 'call') {
+      if (liveBroadcastSyncTimerRef.current != null) {
+        window.clearTimeout(liveBroadcastSyncTimerRef.current)
+        liveBroadcastSyncTimerRef.current = null
+      }
+      broadcastCompositorRef.current?.stop()
+      broadcastCompositorRef.current = null
+      return
+    }
+    const comp = new LiveBroadcastCompositor()
+    comp.start()
+    broadcastCompositorRef.current = comp
+    syncLiveBroadcastCompositorFnRef.current()
+    for (const vid of [...liveViewerPeerIdsRef.current]) {
+      void upgradeLiveViewerToCompositeTracks(vid)
+    }
+    return () => {
+      if (liveBroadcastSyncTimerRef.current != null) {
+        window.clearTimeout(liveBroadcastSyncTimerRef.current)
+        liveBroadcastSyncTimerRef.current = null
+      }
+      comp.stop()
+      broadcastCompositorRef.current = null
+    }
+  }, [liveStreamPublic, isHostInCall, callView])
+
+  useEffect(() => {
+    if (!liveStreamPublic || !isHostInCall || callView !== 'call') return
+    scheduleLiveBroadcastCompositorSyncRef.current()
+  }, [
+    liveStreamPublic,
+    isHostInCall,
+    callView,
+    peerIds,
+    screenSharing,
+    participantRoster,
+    camEnabled,
+    micEnabled,
+  ])
 
   useEffect(() => {
     collabAutoConnectDoneRef.current = false
@@ -1681,7 +1800,23 @@ export function MeetingPage() {
     const pendingIce: RTCIceCandidateInit[] = []
     const pc = new RTCPeerConnection({ iceServers: iceServersRef.current })
 
-    if (localStreamRef.current) {
+    let usedLiveBroadcastComposite = false
+    if (opts?.omitFromCallGrid && liveStreamPublicRef.current) {
+      const outbound = broadcastCompositorRef.current?.getStream()
+      const ov = outbound?.getVideoTracks()[0]
+      const oa = outbound?.getAudioTracks()[0]
+      if (outbound && ov && oa) {
+        for (const t of outbound.getTracks()) {
+          try {
+            pc.addTrack(t.clone(), outbound)
+          } catch (e) {
+            appendLog('live broadcast clone/add failed', String(e))
+          }
+        }
+        usedLiveBroadcastComposite = true
+      }
+    }
+    if (!usedLiveBroadcastComposite && localStreamRef.current) {
       if (screenSharingRef.current && screenStreamRef.current) {
         // Screen share is active — send screen video to the new peer instead of camera
         for (const t of localStreamRef.current.getAudioTracks()) {
@@ -1716,6 +1851,9 @@ export function MeetingPage() {
       } else if (activeSpeakerIdRef.current === remoteId && speakerMainVideoRef.current) {
         speakerMainVideoRef.current.srcObject = s
         void speakerMainVideoRef.current.play().catch(() => {})
+      }
+      if (!opts?.omitFromCallGrid) {
+        scheduleLiveBroadcastCompositorSyncRef.current()
       }
     }
 
@@ -1800,6 +1938,7 @@ export function MeetingPage() {
       mst.addEventListener('mute', () => syncPeerCameraOverlayRef.current(peerId))
       mst.addEventListener('unmute', () => syncPeerCameraOverlayRef.current(peerId))
     }
+    scheduleLiveBroadcastCompositorSyncRef.current()
   }
 
   function flushPendingLiveKitTracksForUser(userId: string) {
@@ -2100,6 +2239,7 @@ export function MeetingPage() {
       return next
     })
     setPeerIds(prev => prev.filter(id => id !== remoteId))
+    scheduleLiveBroadcastCompositorSyncRef.current()
   }
 
   function resetAllPeers() {
@@ -2264,7 +2404,6 @@ export function MeetingPage() {
       const p = payload as { peerId?: unknown }
       if (typeof p.peerId !== 'string') return
       if (!isHostInCallRef.current) return
-      if (mediaModeRef.current === 'livekit') return
       const peerId = p.peerId
       liveViewerPeerIdsRef.current.add(peerId)
       void createAndSendOffer(peerId, { omitFromCallGrid: true }).catch(e =>
@@ -2276,7 +2415,6 @@ export function MeetingPage() {
       const peerId = (payload as { peerId?: unknown }).peerId
       if (typeof peerId !== 'string') return
       if (!isHostInCallRef.current) return
-      if (mediaModeRef.current === 'livekit') return
       if (!liveViewerPeerIdsRef.current.has(peerId)) return
       const state = peersRef.current.get(peerId)
       if (state) void iceRestart(peerId)
@@ -3891,7 +4029,7 @@ export function MeetingPage() {
   }
 
   async function iceRestart(remoteId: string) {
-    if (mediaModeRef.current === 'livekit') return
+    if (mediaModeRef.current === 'livekit' && !liveViewerPeerIdsRef.current.has(remoteId)) return
     const state = peersRef.current.get(remoteId)
     if (!state || !socketRef.current?.connected) return
     setHasWeakNetwork(true)
@@ -3927,7 +4065,7 @@ export function MeetingPage() {
   }
 
   async function renegotiate(remoteId: string) {
-    if (mediaModeRef.current === 'livekit') return
+    if (mediaModeRef.current === 'livekit' && !liveViewerPeerIdsRef.current.has(remoteId)) return
     const state = peersRef.current.get(remoteId)
     if (!state || !socketRef.current?.connected) return
     try {
@@ -3948,12 +4086,20 @@ export function MeetingPage() {
     socketRef.current?.emit('meeting:screenshare', { sharing: false })
     const cameraTrack = localStreamRef.current?.getVideoTracks()[0] ?? null
     for (const [remoteId, { pc }] of peersRef.current.entries()) {
+      if (
+        liveViewerPeerIdsRef.current.has(remoteId) &&
+        liveStreamPublicRef.current &&
+        broadcastCompositorRef.current?.getStream()
+      ) {
+        continue
+      }
       const sender = pc.getSenders().find(s => s.track?.kind === 'video')
       if (sender) {
         await sender.replaceTrack(cameraTrack)
         void renegotiate(remoteId)
       }
     }
+    scheduleLiveBroadcastCompositorSyncRef.current()
     if (localPipRef.current && localStreamRef.current) {
       localPipRef.current.srcObject = localStreamRef.current
     }
@@ -3984,6 +4130,13 @@ export function MeetingPage() {
       screenSharingRef.current = true
       socketRef.current?.emit('meeting:screenshare', { sharing: true })
       for (const [remoteId, { pc }] of peersRef.current.entries()) {
+        if (
+          liveViewerPeerIdsRef.current.has(remoteId) &&
+          liveStreamPublicRef.current &&
+          broadcastCompositorRef.current?.getStream()
+        ) {
+          continue
+        }
         const sender = pc.getSenders().find(s => s.track?.kind === 'video')
         if (sender) {
           await sender.replaceTrack(screenTrack)
@@ -3994,6 +4147,7 @@ export function MeetingPage() {
           void renegotiate(remoteId)
         }
       }
+      scheduleLiveBroadcastCompositorSyncRef.current()
       if (localPipRef.current) {
         const pipStream = new MediaStream([screenTrack])
         for (const t of (localStreamRef.current?.getAudioTracks() ?? [])) pipStream.addTrack(t)
@@ -5164,7 +5318,7 @@ export function MeetingPage() {
                       <div className="border-t border-white/10 pt-4">
                         <p className="mb-2 text-[0.65rem] font-semibold uppercase tracking-wider text-white/35">Public live stream</p>
                         <p className="mb-2.5 text-[12px] leading-snug text-white/45">
-                          Share a public watch link: anyone can view without an account (like TikTok Live). They only need to log in if they want to comment, react, vote, or ask to join the broadcast — you approve each collaboration request. Chat is filtered; your outgoing camera is checked locally for unsafe content.
+                          Share a public watch link: anyone can watch a combined view of everyone in the call (grid, or your screen share with participant thumbnails). Viewers don’t need an account unless they comment, react, vote, or ask to join — you approve collaboration requests. Chat is filtered; your outgoing camera is checked locally for unsafe content.
                         </p>
                         <button
                           type="button"
