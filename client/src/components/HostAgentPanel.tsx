@@ -246,7 +246,7 @@ export function HostAgentPanel({
               onChange={e => setAutopilotEnabled(e.target.checked)}
             />
             <span>
-              Autopilot: answer only when someone addresses you (not every question). Works with captions on, or via audio when captions are off (host only).
+              Autopilot: answer only when someone addresses you (not every question). With captions on, it follows captions; with captions off, it listens for speech, transcribes each utterance, replies, and can interrupt its reply if someone speaks again.
             </span>
           </label>
         </div>

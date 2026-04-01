@@ -386,8 +386,9 @@ export function MeetingPage() {
   const hostAgentAutopilotLastAtRef = useRef(0)
   const hostAgentAutopilotRecorderRef = useRef<MediaRecorder | null>(null)
   const hostAgentAutopilotTranscriptRef = useRef('')
-  const hostAgentAutopilotLastQuestionAtRef = useRef(0)
   const hostAgentAutopilotLastSpokenAtRef = useRef(0)
+  /** Incremented to cancel in-flight autopilot STT/chat/TTS when new speech interrupts. */
+  const hostAgentAutopilotGenRef = useRef(0)
   const [callSettingsOpen, setCallSettingsOpen] = useState(false)
   const [callSettingsTab, setCallSettingsTab] = useState<'features' | 'settings'>('features')
   const [recordingActive, setRecordingActive] = useState(false)
@@ -1709,24 +1710,34 @@ export function MeetingPage() {
     setAiVoiceActive(true)
     setMicEnabled(true)
 
-    const stopNow = () => {
-      try { src.stop() } catch { /* ignore */ }
-      try { newTrack.stop() } catch { /* ignore */ }
-      try { audioCtx.close() } catch { /* ignore */ }
-      setAiVoiceActive(false)
-      aiVoiceStopRef.current = null
-      aiVoiceTrackRef.current = null
-      // Best-effort restore mic.
-      void restoreLocalMicrophone().catch(() => {
-        showToast('AI voice stopped (mic restore failed)')
-      })
-    }
-    aiVoiceStopRef.current = stopNow
+    return new Promise<void>((resolve) => {
+      let settled = false
+      const settle = () => {
+        if (settled) return
+        settled = true
+        resolve()
+      }
 
-    src.onended = () => {
-      stopNow()
-    }
-    showToast('AI voice is live (your mic is replaced)')
+      const stopNow = () => {
+        try { src.stop() } catch { /* ignore */ }
+        try { newTrack.stop() } catch { /* ignore */ }
+        try { audioCtx.close() } catch { /* ignore */ }
+        setAiVoiceActive(false)
+        aiVoiceStopRef.current = null
+        aiVoiceTrackRef.current = null
+        // Best-effort restore mic.
+        void restoreLocalMicrophone().catch(() => {
+          showToast('AI voice stopped (mic restore failed)')
+        })
+        settle()
+      }
+      aiVoiceStopRef.current = stopNow
+
+      src.onended = () => {
+        stopNow()
+      }
+      showToast('AI voice is live (your mic is replaced)')
+    })
   }
 
   /**
@@ -1807,21 +1818,19 @@ export function MeetingPage() {
     })()
   }, [captionLines, callView, code, hostAgentAutopilotEnabled, isHostInCall, liveCaptionsEnabled])
 
-  // Autopilot without captions: mix remote audio → chunked STT → detect questions → respond with TTS.
+  // Autopilot without captions: VAD on remote mix → record utterance → STT → reply; barge-in interrupts TTS / pending work.
   useEffect(() => {
     if (!hostAgentAutopilotEnabled) return
     if (callView !== 'call') return
     if (!isHostInCall) return
     if (liveCaptionsEnabled) return
 
-    // Must have a knowledge base to answer "as host".
     const kb = hostAgentKbRef.current.trim()
     if (kb.length === 0) {
       showToast('Autopilot needs a knowledge base (paste it in Host AI stand-in).')
       return
     }
 
-    // Keep the remote-audio mix updated as peer tracks arrive.
     let syncTimer: number | null = null
     const startSyncLoop = () => {
       if (syncTimer != null) return
@@ -1835,147 +1844,203 @@ export function MeetingPage() {
       syncTimer = null
     }
 
-    // Start (or keep) a recorder on the remote-audio mix graph.
     const { dest } = ensureSpeakerMixGraph()
     const track = syncSpeakerMixInputs()
-    try { void speakerMixCtxRef.current?.resume() } catch { /* ignore */ }
+    const ctx = speakerMixCtxRef.current
+    try { void ctx?.resume() } catch { /* ignore */ }
     startSyncLoop()
 
     const stream = dest.stream
-    if (!track || stream.getAudioTracks().length === 0) {
+    const mixTrack = stream.getAudioTracks()[0]
+    if (!track || !mixTrack || !ctx) {
       showToast('Autopilot: waiting for participant audio…')
       stopSyncLoop()
       return
     }
 
-    if (hostAgentAutopilotRecorderRef.current) {
-      // Already listening; keep syncing inputs while enabled.
-      return () => { stopSyncLoop() }
-    }
-
-    /**
-     * IMPORTANT: Don't use MediaRecorder timeslices for STT uploads.
-     * Timeslice chunks are often not valid standalone WebM files (missing headers),
-     * which makes OpenAI reject them as "Invalid file format".
-     *
-     * Instead, record short self-contained clips: start → stop → upload → repeat.
-     */
     const recorderMime =
       typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
         ? 'audio/webm;codecs=opus'
         : 'audio/webm'
 
-    const CLIP_MS = 2200
-    let cancelled = false
-    let clipTimer: number | null = null
+    // VAD thresholds (RMS 0–1 from getByteRms).
+    const THRESH_ON = 0.022
+    const THRESH_OFF = 0.014
+    const SPEECH_START_MS = 140
+    const SILENCE_END_MS = 520
+    const MIN_UTTER_MS = 420
+    const MAX_UTTER_MS = 28_000
+    const BARGE_IN_COOLDOWN_MS = 320
 
-    const scheduleNext = (ms: number) => {
-      if (cancelled) return
-      if (clipTimer != null) window.clearTimeout(clipTimer)
-      clipTimer = window.setTimeout(runClip, ms)
+    let cancelled = false
+    type ListenState = 'idle' | 'recording' | 'busy'
+    let listenState: ListenState = 'idle'
+    let mr: MediaRecorder | null = null
+    let recordChunks: BlobPart[] = []
+    let recordStartAt = 0
+    let loudMs = 0
+    let quietMs = 0
+    let vadRaf: number | null = null
+    let lastVadTs = performance.now()
+    let bargeInCooldownUntil = 0
+
+    const vadAnalyser = ctx.createAnalyser()
+    vadAnalyser.fftSize = 512
+    vadAnalyser.smoothingTimeConstant = 0.35
+    const vadSrc = ctx.createMediaStreamSource(new MediaStream([mixTrack]))
+    vadSrc.connect(vadAnalyser)
+    const vadBuf = new Uint8Array(new ArrayBuffer(vadAnalyser.frequencyBinCount))
+
+    function stopCurrentRecorder() {
+      if (!mr) return
+      try { mr.stop() } catch { /* ignore */ }
+      mr = null
+      hostAgentAutopilotRecorderRef.current = null
     }
 
-    const runClip = () => {
-      if (cancelled) return
-      if (!hostAgentAutopilotEnabled || callView !== 'call' || !isHostInCall || liveCaptionsEnabled) return
-
-      // Avoid recording while AI is speaking (prevents feedback loops).
-      if (aiVoiceStopRef.current) {
-        scheduleNext(900)
-        return
+    function startRecording(fromInterrupt: boolean) {
+      if (fromInterrupt) {
+        hostAgentAutopilotGenRef.current += 1
+        if (aiVoiceStopRef.current) {
+          try { aiVoiceStopRef.current() } catch { /* ignore */ }
+          aiVoiceStopRef.current = null
+          bargeInCooldownUntil = performance.now() + BARGE_IN_COOLDOWN_MS
+        }
       }
-
-      let mr: MediaRecorder
+      stopCurrentRecorder()
+      recordChunks = []
+      let next: MediaRecorder
       try {
-        mr = new MediaRecorder(stream, { mimeType: recorderMime })
+        next = new MediaRecorder(stream, { mimeType: recorderMime })
       } catch {
         showToast('Autopilot: audio recording is not supported in this browser.')
         return
       }
-
-      hostAgentAutopilotRecorderRef.current = mr
-      const chunks: BlobPart[] = []
-      mr.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) chunks.push(e.data)
+      mr = next
+      hostAgentAutopilotRecorderRef.current = next
+      next.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) recordChunks.push(e.data)
       }
-      mr.onstop = () => {
+      next.onstop = () => {
         hostAgentAutopilotRecorderRef.current = null
+        mr = null
         if (cancelled) return
-        const blob = new Blob(chunks, { type: recorderMime })
-        if (blob.size < 5000) {
-          scheduleNext(700)
+        const blob = new Blob(recordChunks, { type: recorderMime })
+        recordChunks = []
+        const captureGen = hostAgentAutopilotGenRef.current
+        listenState = 'busy'
+        void processUtterance(blob, captureGen)
+      }
+      try {
+        next.start()
+        listenState = 'recording'
+        recordStartAt = performance.now()
+        loudMs = 0
+        quietMs = 0
+      } catch {
+        mr = null
+        hostAgentAutopilotRecorderRef.current = null
+        listenState = 'idle'
+        showToast('Autopilot: could not start recording.')
+      }
+    }
+
+    async function processUtterance(blob: Blob, captureGen: number) {
+      if (blob.size < 2000) {
+        listenState = 'idle'
+        return
+      }
+      try {
+        showToast('Autopilot: transcribing…')
+        hostAgentAutopilotBusyRef.current = true
+        const stt = await hostAgentTranscribe(code, blob)
+        if (captureGen !== hostAgentAutopilotGenRef.current) return
+        const text = stt.text.trim()
+        if (!text) {
+          listenState = 'idle'
+          return
+        }
+        hostAgentAutopilotTranscriptRef.current = text.slice(-6000)
+
+        if (!shouldAutopilotRespondTo(text)) {
+          listenState = 'idle'
           return
         }
 
-        void (async () => {
-          try {
-            const stt = await hostAgentTranscribe(code, blob)
-            const chunk = stt.text.trim()
-            if (!chunk) return
-
-            const prev = hostAgentAutopilotTranscriptRef.current
-            const merged = `${prev}${prev.length > 0 ? ' ' : ''}${chunk}`.trim()
-            hostAgentAutopilotTranscriptRef.current = merged.slice(-6000)
-
-            const now = Date.now()
-            // Autopilot trigger: check a small rolling window, not just the last clip.
-            // STT clip boundaries can cut a question in half, so last chunk alone is unreliable.
-            const rolling = hostAgentAutopilotTranscriptRef.current
-            const windowText = rolling.slice(Math.max(0, rolling.length - 280)).trim()
-            if (!shouldAutopilotRespondTo(windowText)) return
-
-            if (now - hostAgentAutopilotLastSpokenAtRef.current < 12_000) return
-            hostAgentAutopilotLastQuestionAtRef.current = now
-
-            hostAgentAutopilotBusyRef.current = true
-            const ctxText = hostAgentAutopilotTranscriptRef.current
-            showToast('Autopilot: speaking…')
-            const r = await hostAgentChat(code, {
-              message: `You must respond as the host. A participant addressed you (speech-to-text may be imperfect). Respond in one concise spoken paragraph.\n\nHeard:\n"${windowText}"`,
-              knowledgeBase: kb,
-              meetingContext: ctxText.length > 0 ? `Recent transcript (imperfect):\n${ctxText}` : undefined,
-            })
-            const answer = r.reply.trim()
-            if (!answer) return
-            const audio = await hostAgentTts(code, { text: answer })
-            hostAgentAutopilotLastSpokenAtRef.current = now
-            await speakAudioBlobInMeeting(audio)
-          } catch (err: unknown) {
-            showToast(errorMessage(err))
-          } finally {
-            hostAgentAutopilotBusyRef.current = false
-          }
-        })().finally(() => {
-          scheduleNext(650)
+        if (captureGen !== hostAgentAutopilotGenRef.current) return
+        showToast('Autopilot: speaking…')
+        const r = await hostAgentChat(code, {
+          message: `You must respond as the host. Respond in one concise spoken paragraph.\n\nHeard:\n"${text}"`,
+          knowledgeBase: kb,
+          meetingContext: `Transcript:\n${text}`,
         })
+        if (captureGen !== hostAgentAutopilotGenRef.current) return
+        const answer = r.reply.trim()
+        if (!answer) {
+          listenState = 'idle'
+          return
+        }
+        const audio = await hostAgentTts(code, { text: answer })
+        if (captureGen !== hostAgentAutopilotGenRef.current) return
+        hostAgentAutopilotLastSpokenAtRef.current = Date.now()
+        await speakAudioBlobInMeeting(audio)
+      } catch (err: unknown) {
+        if (captureGen === hostAgentAutopilotGenRef.current) showToast(errorMessage(err))
+      } finally {
+        hostAgentAutopilotBusyRef.current = false
+        if (captureGen === hostAgentAutopilotGenRef.current) listenState = 'idle'
       }
-
-      try {
-        mr.start()
-      } catch {
-        hostAgentAutopilotRecorderRef.current = null
-        scheduleNext(1200)
-        return
-      }
-
-      window.setTimeout(() => {
-        try { mr.stop() } catch { /* ignore */ }
-      }, CLIP_MS)
     }
 
-    showToast('Autopilot is listening (audio STT)')
-    runClip()
+    function tick() {
+      if (cancelled) return
+      const now = performance.now()
+      const dt = Math.min(now - lastVadTs, 80)
+      lastVadTs = now
+
+      const rms = getByteRms(vadAnalyser, vadBuf)
+      if (rms > THRESH_ON) {
+        loudMs += dt
+        quietMs = 0
+      } else if (rms < THRESH_OFF) {
+        quietMs += dt
+        loudMs = 0
+      } else {
+        loudMs = 0
+        quietMs = 0
+      }
+
+      const speechStart = loudMs >= SPEECH_START_MS && now >= bargeInCooldownUntil
+
+      if (listenState === 'idle' && speechStart) {
+        startRecording(false)
+      } else if (listenState === 'recording') {
+        const elapsed = now - recordStartAt
+        if (elapsed >= MAX_UTTER_MS) {
+          stopCurrentRecorder()
+        } else if (elapsed >= MIN_UTTER_MS && quietMs >= SILENCE_END_MS) {
+          stopCurrentRecorder()
+        }
+      } else if (listenState === 'busy' && speechStart) {
+        showToast('Autopilot: new speech — stopping reply…')
+        startRecording(true)
+      }
+
+      vadRaf = requestAnimationFrame(tick)
+    }
+
+    showToast('Autopilot: listening for participants (audio)')
+    vadRaf = requestAnimationFrame(tick)
 
     return () => {
       cancelled = true
+      hostAgentAutopilotGenRef.current += 1
+      if (vadRaf != null) cancelAnimationFrame(vadRaf)
+      vadRaf = null
+      try { vadSrc.disconnect() } catch { /* ignore */ }
+      try { vadAnalyser.disconnect() } catch { /* ignore */ }
       stopSyncLoop()
-      if (clipTimer != null) window.clearTimeout(clipTimer)
-      try {
-        hostAgentAutopilotRecorderRef.current?.stop()
-      } catch {
-        /* ignore */
-      }
-      hostAgentAutopilotRecorderRef.current = null
+      stopCurrentRecorder()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostAgentAutopilotEnabled, callView, isHostInCall, liveCaptionsEnabled, code, meeting?.host?.name, peerIds])
