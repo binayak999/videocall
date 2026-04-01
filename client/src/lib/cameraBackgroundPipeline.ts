@@ -4,6 +4,20 @@ export type CameraBackgroundEffectMode = 'blur' | 'image'
 
 let segmenterPromise: Promise<BodySegmenter> | null = null
 
+/**
+ * Same-origin Mediapipe assets (see `public/mediapipe/selfie_segmentation/`).
+ * Loading WASM / .tflite from cdn.jsdelivr.net works on many dev machines but is often blocked
+ * in production (CSP, corporate firewall, ad blockers).
+ */
+function mediapipeSelfieSegmentationSolutionPath(): string {
+  const base = import.meta.env.BASE_URL
+  const prefix = base.endsWith('/') ? base.slice(0, -1) : base
+  if (typeof window === 'undefined') {
+    return 'https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation'
+  }
+  return `${window.location.origin}${prefix}/mediapipe/selfie_segmentation`
+}
+
 async function loadSegmenter(): Promise<BodySegmenter> {
   if (!segmenterPromise) {
     segmenterPromise = (async () => {
@@ -24,7 +38,7 @@ async function loadSegmenter(): Promise<BodySegmenter> {
       return bodySegmentation.createSegmenter(bodySegmentation.SupportedModels.MediaPipeSelfieSegmentation, {
         runtime: 'mediapipe',
         modelType: 'general',
-        solutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation',
+        solutionPath: mediapipeSelfieSegmentationSolutionPath(),
       })
     })()
   }
