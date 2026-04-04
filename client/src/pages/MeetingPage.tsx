@@ -41,6 +41,7 @@ import {
   DisconnectReason,
   Room,
   RoomEvent,
+  Track,
   type RemoteParticipant,
   type RemoteTrack,
 } from 'livekit-client'
@@ -177,11 +178,11 @@ function defaultSignalingUrl() {
   return window.location.origin
 }
 
-function getCompanionBridgeBaseUrl(): string {
+function getCompanionBridgeBaseUrl(): string | null {
   const env = import.meta.env as Record<string, string | undefined>
   const configured = env.VITE_COMPANION_BRIDGE_URL?.trim()
   if (configured) return configured.replace(/\/$/, '')
-  return 'http://127.0.0.1:7830'
+  return null
 }
 
 function companionBridgeWsUrl(httpBase: string): string {
@@ -555,9 +556,10 @@ export function MeetingPage() {
   const peerStreamRefs = useRef<Map<string, MediaStream>>(new Map())
   const participantRosterRef = useRef<Record<string, ParticipantRosterEntry>>({})
   const liveKitRoomRef = useRef<Room | null>(null)
-  const liveKitPublishedTracksRef = useRef<{ video: MediaStreamTrack | null; audio: MediaStreamTrack | null }>({
+  const liveKitPublishedTracksRef = useRef<{ video: MediaStreamTrack | null; audio: MediaStreamTrack | null; screen: MediaStreamTrack | null }>({
     video: null,
     audio: null,
+    screen: null,
   })
   const pendingLiveKitTracksByUserIdRef = useRef<Map<string, RemoteTrack[]>>(new Map())
   const liveKitPeerIdsRef = useRef<string[]>([])
@@ -997,8 +999,9 @@ export function MeetingPage() {
   // Detect companion app and open WebSocket bridge
   useEffect(() => {
     if (callView !== 'call') return
-    let ws: WebSocket | null = null
     const bridgeHttpBase = getCompanionBridgeBaseUrl()
+    if (!bridgeHttpBase) return
+    let ws: WebSocket | null = null
     const bridgeWsBase = companionBridgeWsUrl(bridgeHttpBase)
     const detect = async () => {
       try {
@@ -2545,7 +2548,7 @@ export function MeetingPage() {
     const room = liveKitRoomRef.current
     liveKitRoomRef.current = null
     pendingLiveKitTracksByUserIdRef.current.clear()
-    liveKitPublishedTracksRef.current = { video: null, audio: null }
+    liveKitPublishedTracksRef.current = { video: null, audio: null, screen: null }
     if (!room) return
     try {
       if (room.state !== 'disconnected') await room.disconnect(false)
@@ -2597,6 +2600,19 @@ export function MeetingPage() {
     }
     room.on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
       onRemoteTrack(track, participant)
+    })
+    room.on(RoomEvent.TrackUnsubscribed, (track: RemoteTrack, _pub, participant: RemoteParticipant) => {
+      if (track.source !== Track.Source.ScreenShare) return
+      // Screen share ended — reattach the camera track for this peer if still available
+      const uid = participant.identity
+      const peerId = findPeerIdForUserId(participantRosterRef.current, uid)
+      if (!peerId) return
+      for (const pub of participant.trackPublications.values()) {
+        if (pub.source === Track.Source.Camera && pub.isSubscribed && pub.track) {
+          attachLiveKitRemoteTrack(peerId, pub.track as RemoteTrack)
+          break
+        }
+      }
     })
     room.on(RoomEvent.ParticipantDisconnected, p => {
       const uid = p.identity
@@ -2659,7 +2675,7 @@ export function MeetingPage() {
     const room = liveKitRoomRef.current
     liveKitRoomRef.current = null
     pendingLiveKitTracksByUserIdRef.current.clear()
-    liveKitPublishedTracksRef.current = { video: null, audio: null }
+    liveKitPublishedTracksRef.current = { video: null, audio: null, screen: null }
     try {
       if (room) {
         const lp = room.localParticipant
@@ -4632,26 +4648,40 @@ export function MeetingPage() {
     screenStreamRef.current = null
     screenSharingRef.current = false
     socketRef.current?.emit('meeting:screenshare', { sharing: false })
-    const cameraTrack = localStreamRef.current?.getVideoTracks()[0] ?? null
-    for (const [remoteId, { pc }] of peersRef.current.entries()) {
-      if (
-        liveViewerPeerIdsRef.current.has(remoteId) &&
-        liveStreamPublicRef.current &&
-        broadcastCompositorRef.current?.getStream()
-      ) {
-        continue
+    if (mediaModeRef.current === 'livekit') {
+      // LiveKit: unpublish the screen share track
+      const screenTrack = liveKitPublishedTracksRef.current.screen
+      const room = liveKitRoomRef.current
+      if (room?.state === 'connected' && screenTrack) {
+        try {
+          await room.localParticipant.unpublishTrack(screenTrack, false)
+        } catch {
+          /* ignore */
+        }
       }
-      const sender = pc.getSenders().find(s => s.track?.kind === 'video')
-      if (sender) {
-        await sender.replaceTrack(cameraTrack)
-        void renegotiate(remoteId)
+      liveKitPublishedTracksRef.current.screen = null
+    } else {
+      const cameraTrack = localStreamRef.current?.getVideoTracks()[0] ?? null
+      for (const [remoteId, { pc }] of peersRef.current.entries()) {
+        if (
+          liveViewerPeerIdsRef.current.has(remoteId) &&
+          liveStreamPublicRef.current &&
+          broadcastCompositorRef.current?.getStream()
+        ) {
+          continue
+        }
+        const sender = pc.getSenders().find(s => s.track?.kind === 'video')
+        if (sender) {
+          await sender.replaceTrack(cameraTrack)
+          void renegotiate(remoteId)
+        }
       }
+      setPipCamOff(!cameraTrack)
     }
     scheduleLiveBroadcastCompositorSyncRef.current()
     if (localPipRef.current && localStreamRef.current) {
       localPipRef.current.srcObject = localStreamRef.current
     }
-    setPipCamOff(!cameraTrack)
     setScreenSharing(false)
     if (!opts?.silent) {
       playMeetingNotificationSound('screenShareEnd')
@@ -4660,10 +4690,6 @@ export function MeetingPage() {
   }
 
   async function toggleScreenShare() {
-    if (mediaModeRef.current === 'livekit') {
-      showToast('Screen sharing is not available in LiveKit mode yet')
-      return
-    }
     if (screenSharingRef.current) { void stopScreenShare(); return }
     if (!navigator.mediaDevices?.getDisplayMedia) {
       showToast('Screen share is not supported on this browser/device')
@@ -4677,22 +4703,31 @@ export function MeetingPage() {
       screenStreamRef.current = screenStream
       screenSharingRef.current = true
       socketRef.current?.emit('meeting:screenshare', { sharing: true })
-      for (const [remoteId, { pc }] of peersRef.current.entries()) {
-        if (
-          liveViewerPeerIdsRef.current.has(remoteId) &&
-          liveStreamPublicRef.current &&
-          broadcastCompositorRef.current?.getStream()
-        ) {
-          continue
+      if (mediaModeRef.current === 'livekit') {
+        // LiveKit: publish screen share as a separate track
+        const room = liveKitRoomRef.current
+        if (room?.state === 'connected') {
+          await room.localParticipant.publishTrack(screenTrack, { source: Track.Source.ScreenShare })
+          liveKitPublishedTracksRef.current.screen = screenTrack
         }
-        const sender = pc.getSenders().find(s => s.track?.kind === 'video')
-        if (sender) {
-          await sender.replaceTrack(screenTrack)
-          void renegotiate(remoteId)
-        } else {
-          // No video sender yet (camera was off) — add the track and negotiate
-          pc.addTrack(screenTrack, localStreamRef.current!)
-          void renegotiate(remoteId)
+      } else {
+        for (const [remoteId, { pc }] of peersRef.current.entries()) {
+          if (
+            liveViewerPeerIdsRef.current.has(remoteId) &&
+            liveStreamPublicRef.current &&
+            broadcastCompositorRef.current?.getStream()
+          ) {
+            continue
+          }
+          const sender = pc.getSenders().find(s => s.track?.kind === 'video')
+          if (sender) {
+            await sender.replaceTrack(screenTrack)
+            void renegotiate(remoteId)
+          } else {
+            // No video sender yet (camera was off) — add the track and negotiate
+            pc.addTrack(screenTrack, localStreamRef.current!)
+            void renegotiate(remoteId)
+          }
         }
       }
       scheduleLiveBroadcastCompositorSyncRef.current()
