@@ -46,7 +46,11 @@ import {
   type RemoteParticipant,
   type RemoteTrack,
 } from 'livekit-client'
-import { LIVEKIT_CAMERA_VIDEO_ENCODING, LIVEKIT_SCREEN_SHARE_PUBLISH_OPTIONS } from '../lib/livekitCameraEncoding'
+import {
+  LIVEKIT_CAMERA_VIDEO_ENCODING,
+  LIVEKIT_SCREEN_SHARE_CAPTURE_OPTIONS,
+  LIVEKIT_SCREEN_SHARE_PUBLISH_OPTIONS,
+} from '../lib/livekitCameraEncoding'
 import {
   LIVEKIT_FULL_RECONNECT_MAX_ATTEMPTS,
   liveKitFullReconnectDelayMs,
@@ -2709,17 +2713,6 @@ export function MeetingPage() {
       await lp.publishTrack(t, { videoEncoding: LIVEKIT_CAMERA_VIDEO_ENCODING })
       liveKitPublishedTracksRef.current.video = t
     }
-    if (screenSharingRef.current && screenStreamRef.current && !liveKitPublishedScreenRef.current) {
-      const st = screenStreamRef.current.getVideoTracks()[0]
-      if (st?.readyState === 'live') {
-        try {
-          await lp.publishTrack(st, { ...LIVEKIT_SCREEN_SHARE_PUBLISH_OPTIONS })
-          liveKitPublishedScreenRef.current = st
-        } catch (e) {
-          appendLog('livekit publish pending screen share', String(e))
-        }
-      }
-    }
     for (const p of room.remoteParticipants.values()) {
       if (p.identity === lp.identity) continue
       for (const pub of p.trackPublications.values()) {
@@ -2748,16 +2741,15 @@ export function MeetingPage() {
       if (room) {
         const lp = room.localParticipant
         const ls = localStreamRef.current
-        if (room.state === 'connected') {
+        if (room.state === ConnectionState.Connected) {
+          try {
+            await lp.setScreenShareEnabled(false)
+          } catch {
+            /* ignore */
+          }
           // Unpublish camera/mic tracks
           if (ls) {
             for (const t of ls.getTracks()) {
-              try { await lp.unpublishTrack(t, false) } catch { /* ignore */ }
-            }
-          }
-          // Unpublish screen track if active
-          if (screenStreamRef.current) {
-            for (const t of screenStreamRef.current.getVideoTracks()) {
               try { await lp.unpublishTrack(t, false) } catch { /* ignore */ }
             }
           }
@@ -4730,21 +4722,21 @@ export function MeetingPage() {
   }
 
   async function stopScreenShare(opts?: { silent?: boolean }) {
-    const stream = screenStreamRef.current
-    if (stream) stream.getTracks().forEach(t => t.stop())
-    screenStreamRef.current = null
-    screenSharingRef.current = false
     socketRef.current?.emit('meeting:screenshare', { sharing: false })
 
     if (mediaModeRef.current === 'livekit') {
       const room = liveKitRoomRef.current
-      if (room?.state === 'connected') {
-        const screenTrack = liveKitPublishedScreenRef.current
-        if (screenTrack) {
-          try { await room.localParticipant.unpublishTrack(screenTrack, false) } catch { /* ignore */ }
+      if (room?.state === ConnectionState.Connected) {
+        try {
+          await room.localParticipant.setScreenShareEnabled(false)
+        } catch {
+          /* ignore */
         }
       }
+      screenStreamRef.current?.getTracks().forEach(t => t.stop())
+      screenStreamRef.current = null
       liveKitPublishedScreenRef.current = null
+      screenSharingRef.current = false
       scheduleLiveBroadcastCompositorSyncRef.current()
       const cameraTrack = localStreamRef.current?.getVideoTracks()[0] ?? null
       if (localPipRef.current && localStreamRef.current) {
@@ -4758,6 +4750,11 @@ export function MeetingPage() {
       }
       return
     }
+
+    const stream = screenStreamRef.current
+    if (stream) stream.getTracks().forEach(t => t.stop())
+    screenStreamRef.current = null
+    screenSharingRef.current = false
 
     const cameraTrack = localStreamRef.current?.getVideoTracks()[0] ?? null
     for (const [remoteId, { pc }] of peersRef.current.entries()) {
@@ -4792,20 +4789,9 @@ export function MeetingPage() {
       showToast('Screen share is not supported on this browser/device')
       return
     }
-    try {
-      const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
-      const screenTrack = screenStream.getVideoTracks()[0]
-      if (!screenTrack) return
-      // Mesh + live-watch use `contentHint` to tell screen vs camera; LiveKit uses `Track.Source` instead.
-      // Setting `detail` here can confuse VP9/SVC screen encoding in the LiveKit client.
-      if (mediaModeRef.current !== 'livekit') {
-        screenTrack.contentHint = 'detail'
-      }
-      screenStreamRef.current = screenStream
-      screenSharingRef.current = true
-      socketRef.current?.emit('meeting:screenshare', { sharing: true })
 
-      if (mediaModeRef.current === 'livekit') {
+    if (mediaModeRef.current === 'livekit') {
+      try {
         let room = liveKitRoomRef.current
         if (!room || room.state !== ConnectionState.Connected) {
           showToast('Connecting to media server…', 4000)
@@ -4814,23 +4800,24 @@ export function MeetingPage() {
           if (!ok || !room || room.state !== ConnectionState.Connected) {
             appendLog('livekit screen share', 'room not connected in time')
             showToast('Still connecting — try screen share again in a moment')
-            screenSharingRef.current = false
-            screenStreamRef.current = null
-            screenStream.getTracks().forEach(t => t.stop())
             return
           }
         }
-        try {
-          await room.localParticipant.publishTrack(screenTrack, { ...LIVEKIT_SCREEN_SHARE_PUBLISH_OPTIONS })
-          liveKitPublishedScreenRef.current = screenTrack
-        } catch (e) {
-          appendLog('livekit screen share publish error', String(e))
+        const pub = await room.localParticipant.setScreenShareEnabled(
+          true,
+          { ...LIVEKIT_SCREEN_SHARE_CAPTURE_OPTIONS },
+          { ...LIVEKIT_SCREEN_SHARE_PUBLISH_OPTIONS },
+        )
+        const screenTrack = pub?.track?.mediaStreamTrack
+        if (!screenTrack) {
+          appendLog('livekit screen share', 'no publication track')
           showToast('Unable to share screen')
-          screenSharingRef.current = false
-          screenStreamRef.current = null
-          screenStream.getTracks().forEach(t => t.stop())
           return
         }
+        screenStreamRef.current = new MediaStream([screenTrack])
+        screenSharingRef.current = true
+        liveKitPublishedScreenRef.current = screenTrack
+        socketRef.current?.emit('meeting:screenshare', { sharing: true })
         scheduleLiveBroadcastCompositorSyncRef.current()
         if (localPipRef.current) {
           const pipStream = new MediaStream([screenTrack])
@@ -4841,8 +4828,33 @@ export function MeetingPage() {
         playMeetingNotificationSound('screenShare')
         showToast('Screen sharing started')
         screenTrack.onended = () => { void stopScreenShare() }
-        return
+      } catch (e: unknown) {
+        screenSharingRef.current = false
+        screenStreamRef.current = null
+        liveKitPublishedScreenRef.current = null
+        const err = e as DOMException
+        if (err.name === 'NotAllowedError') {
+          showToast('Screen share permission was denied')
+          return
+        }
+        if (err.name === 'NotSupportedError') {
+          showToast('Screen share is not supported on this browser/device')
+          return
+        }
+        appendLog('livekit screen share error', String(e))
+        showToast('Unable to share screen')
       }
+      return
+    }
+
+    try {
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
+      const screenTrack = screenStream.getVideoTracks()[0]
+      if (!screenTrack) return
+      screenTrack.contentHint = 'detail'
+      screenStreamRef.current = screenStream
+      screenSharingRef.current = true
+      socketRef.current?.emit('meeting:screenshare', { sharing: true })
 
       for (const [remoteId, { pc }] of peersRef.current.entries()) {
         if (

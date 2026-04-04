@@ -17,3 +17,9 @@ export const LIVEKIT_SCREEN_SHARE_PUBLISH_OPTIONS = {
   simulcast: false,
   screenShareEncoding: ScreenSharePresets.h720fps30.encoding,
 } as const
+
+/** Passed to `LocalParticipant.setScreenShareEnabled` so capture + publish use LiveKit defaults. */
+export const LIVEKIT_SCREEN_SHARE_CAPTURE_OPTIONS = {
+  audio: false,
+  resolution: ScreenSharePresets.h720fps30.resolution,
+} as const
