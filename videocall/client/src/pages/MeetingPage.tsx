@@ -46,7 +46,7 @@ import {
   type RemoteParticipant,
   type RemoteTrack,
 } from 'livekit-client'
-import { LIVEKIT_CAMERA_VIDEO_ENCODING } from '../lib/livekitCameraEncoding'
+import { LIVEKIT_CAMERA_VIDEO_ENCODING, LIVEKIT_SCREEN_SHARE_PUBLISH_OPTIONS } from '../lib/livekitCameraEncoding'
 import {
   LIVEKIT_FULL_RECONNECT_MAX_ATTEMPTS,
   liveKitFullReconnectDelayMs,
@@ -2713,7 +2713,7 @@ export function MeetingPage() {
       const st = screenStreamRef.current.getVideoTracks()[0]
       if (st?.readyState === 'live') {
         try {
-          await lp.publishTrack(st, { source: Track.Source.ScreenShare })
+          await lp.publishTrack(st, { ...LIVEKIT_SCREEN_SHARE_PUBLISH_OPTIONS })
           liveKitPublishedScreenRef.current = st
         } catch (e) {
           appendLog('livekit publish pending screen share', String(e))
@@ -4796,7 +4796,11 @@ export function MeetingPage() {
       const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
       const screenTrack = screenStream.getVideoTracks()[0]
       if (!screenTrack) return
-      screenTrack.contentHint = 'detail'
+      // Mesh + live-watch use `contentHint` to tell screen vs camera; LiveKit uses `Track.Source` instead.
+      // Setting `detail` here can confuse VP9/SVC screen encoding in the LiveKit client.
+      if (mediaModeRef.current !== 'livekit') {
+        screenTrack.contentHint = 'detail'
+      }
       screenStreamRef.current = screenStream
       screenSharingRef.current = true
       socketRef.current?.emit('meeting:screenshare', { sharing: true })
@@ -4817,7 +4821,7 @@ export function MeetingPage() {
           }
         }
         try {
-          await room.localParticipant.publishTrack(screenTrack, { source: Track.Source.ScreenShare })
+          await room.localParticipant.publishTrack(screenTrack, { ...LIVEKIT_SCREEN_SHARE_PUBLISH_OPTIONS })
           liveKitPublishedScreenRef.current = screenTrack
         } catch (e) {
           appendLog('livekit screen share publish error', String(e))
@@ -6889,7 +6893,7 @@ export function MeetingPage() {
               type="button"
               onClick={() => void toggleScreenShare()}
               className={cx(
-                'flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border-0 transition active:scale-95 max-sm:hidden',
+                'flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border-0 transition active:scale-95',
                 screenSharing ? 'bg-red-500 hover:bg-[#d33828]' : 'bg-[#3c4043] hover:bg-[#4a4d50]',
               )}
               title={screenSharing ? 'Stop sharing' : 'Share screen'}

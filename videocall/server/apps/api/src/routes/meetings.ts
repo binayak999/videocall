@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { nanoid } from "nanoid";
-import { AccessToken } from "livekit-server-sdk";
+import { AccessToken, TrackSource } from "livekit-server-sdk";
 import { prisma } from "@bandr/db";
 import {
   buildRecordingObjectKey,
@@ -674,6 +674,13 @@ router.post("/:code/livekit/token", authMiddleware, async (req, res) => {
       canPublish: true,
       canSubscribe: true,
       canPublishData: true,
+      /** Explicit sources so screen share is never blocked by a restrictive default grant. */
+      canPublishSources: [
+        TrackSource.MICROPHONE,
+        TrackSource.CAMERA,
+        TrackSource.SCREEN_SHARE,
+        TrackSource.SCREEN_SHARE_AUDIO,
+      ],
     });
     const token = await at.toJwt();
     res.json({ url, token });
