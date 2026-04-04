@@ -37,6 +37,7 @@ import { useMeetingCaptionRecognition } from '../lib/useMeetingCaptionRecognitio
 import { classifyCameraFrame, preloadModerationModel } from '../lib/videoContentModeration'
 import type { Meeting, MeetingPollSaved } from '../lib/types'
 import {
+  ConnectionState,
   DefaultReconnectPolicy,
   DisconnectReason,
   Room,
@@ -2708,6 +2709,17 @@ export function MeetingPage() {
       await lp.publishTrack(t, { videoEncoding: LIVEKIT_CAMERA_VIDEO_ENCODING })
       liveKitPublishedTracksRef.current.video = t
     }
+    if (screenSharingRef.current && screenStreamRef.current && !liveKitPublishedScreenRef.current) {
+      const st = screenStreamRef.current.getVideoTracks()[0]
+      if (st?.readyState === 'live') {
+        try {
+          await lp.publishTrack(st, { source: Track.Source.ScreenShare })
+          liveKitPublishedScreenRef.current = st
+        } catch (e) {
+          appendLog('livekit publish pending screen share', String(e))
+        }
+      }
+    }
     for (const p of room.remoteParticipants.values()) {
       if (p.identity === lp.identity) continue
       for (const pub of p.trackPublications.values()) {
@@ -2759,6 +2771,18 @@ export function MeetingPage() {
         liveKitIntentionalDisconnectRef.current = false
       })
     }
+  }
+
+  /** Screen share can start before `room.connect` finishes (e.g. join focus “Screen Share”). */
+  async function waitForLiveKitRoomConnected(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      if (mediaModeRef.current !== 'livekit') return false
+      const room = liveKitRoomRef.current
+      if (room?.state === ConnectionState.Connected) return true
+      await new Promise<void>(r => setTimeout(r, 50))
+    }
+    return liveKitRoomRef.current?.state === ConnectionState.Connected
   }
 
   async function connectLiveKitMedia(peerList: string[]) {
@@ -4778,19 +4802,30 @@ export function MeetingPage() {
       socketRef.current?.emit('meeting:screenshare', { sharing: true })
 
       if (mediaModeRef.current === 'livekit') {
-        const room = liveKitRoomRef.current
-        if (room?.state === 'connected') {
-          try {
-            await room.localParticipant.publishTrack(screenTrack, { source: Track.Source.ScreenShare })
-            liveKitPublishedScreenRef.current = screenTrack
-          } catch (e) {
-            appendLog('livekit screen share publish error', String(e))
-            showToast('Unable to share screen')
+        let room = liveKitRoomRef.current
+        if (!room || room.state !== ConnectionState.Connected) {
+          showToast('Connecting to media server…', 4000)
+          const ok = await waitForLiveKitRoomConnected(25_000)
+          room = liveKitRoomRef.current
+          if (!ok || !room || room.state !== ConnectionState.Connected) {
+            appendLog('livekit screen share', 'room not connected in time')
+            showToast('Still connecting — try screen share again in a moment')
             screenSharingRef.current = false
             screenStreamRef.current = null
             screenStream.getTracks().forEach(t => t.stop())
             return
           }
+        }
+        try {
+          await room.localParticipant.publishTrack(screenTrack, { source: Track.Source.ScreenShare })
+          liveKitPublishedScreenRef.current = screenTrack
+        } catch (e) {
+          appendLog('livekit screen share publish error', String(e))
+          showToast('Unable to share screen')
+          screenSharingRef.current = false
+          screenStreamRef.current = null
+          screenStream.getTracks().forEach(t => t.stop())
+          return
         }
         scheduleLiveBroadcastCompositorSyncRef.current()
         if (localPipRef.current) {
