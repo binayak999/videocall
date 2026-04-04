@@ -41,6 +41,7 @@ import {
   DisconnectReason,
   Room,
   RoomEvent,
+  Track,
   type RemoteParticipant,
   type RemoteTrack,
 } from 'livekit-client'
@@ -560,6 +561,10 @@ export function MeetingPage() {
     audio: null,
   })
   const pendingLiveKitTracksByUserIdRef = useRef<Map<string, RemoteTrack[]>>(new Map())
+  /** Published screen-share MediaStreamTrack in LiveKit mode (separate from camera video). */
+  const liveKitPublishedScreenRef = useRef<MediaStreamTrack | null>(null)
+  /** Camera video track saved per peer when a screen-share track replaces it in the display stream. */
+  const peerCameraTracksRef = useRef<Map<string, MediaStreamTrack>>(new Map())
   const liveKitPeerIdsRef = useRef<string[]>([])
   const liveKitIntentionalDisconnectRef = useRef(false)
   const liveKitReconnectTimerRef = useRef<number | null>(null)
@@ -2481,9 +2486,14 @@ export function MeetingPage() {
 
   function attachLiveKitRemoteTrack(peerId: string, track: RemoteTrack) {
     const mst = track.mediaStreamTrack
+    const isScreenShare = track.source === Track.Source.ScreenShare
     const stream = peerStreamRefs.current.get(peerId) ?? new MediaStream()
     for (const existing of stream.getTracks()) {
       if (existing.kind === mst.kind) {
+        // When a screen-share video arrives, save the camera track so we can restore it later.
+        if (isScreenShare && existing.kind === 'video') {
+          peerCameraTracksRef.current.set(peerId, existing)
+        }
         stream.removeTrack(existing)
       }
     }
@@ -2503,6 +2513,9 @@ export function MeetingPage() {
       setupSpeakerAnalyser(peerId, stream)
     }
     if (mst.kind === 'video') {
+      if (isScreenShare) {
+        setScreenSharingPeers(prev => { const s = new Set(prev); s.add(peerId); return s })
+      }
       queueMicrotask(() => syncPeerCameraOverlayRef.current(peerId))
       mst.addEventListener('ended', () => syncPeerCameraOverlayRef.current(peerId))
       mst.addEventListener('mute', () => syncPeerCameraOverlayRef.current(peerId))
@@ -2577,6 +2590,8 @@ export function MeetingPage() {
     liveKitRoomRef.current = null
     pendingLiveKitTracksByUserIdRef.current.clear()
     liveKitPublishedTracksRef.current = { video: null, audio: null }
+    liveKitPublishedScreenRef.current = null
+    peerCameraTracksRef.current.clear()
     if (!room) return
     try {
       if (room.state !== 'disconnected') await room.disconnect(false)
@@ -2608,8 +2623,8 @@ export function MeetingPage() {
     const { url, token } = await getLiveKitJoinToken(code)
     await ensureStream()
     const room = new Room({
-      adaptiveStream: true,
-      dynacast: true,
+      adaptiveStream: false,
+      dynacast: false,
       disconnectOnPageLeave: false,
       reconnectPolicy: new DefaultReconnectPolicy(),
     })
@@ -2628,6 +2643,29 @@ export function MeetingPage() {
     }
     room.on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
       onRemoteTrack(track, participant)
+    })
+    room.on(RoomEvent.TrackUnsubscribed, (track, _pub, participant) => {
+      if (track.source !== Track.Source.ScreenShare) return
+      const uid = participant.identity
+      const peerId = findPeerIdForUserId(participantRosterRef.current, uid)
+      if (!peerId) return
+      const stream = peerStreamRefs.current.get(peerId)
+      if (stream) {
+        stream.removeTrack(track.mediaStreamTrack)
+        // Restore the saved camera track if it's still live
+        const cameraTrack = peerCameraTracksRef.current.get(peerId)
+        if (cameraTrack && cameraTrack.readyState === 'live') {
+          stream.addTrack(cameraTrack)
+        }
+        peerCameraTracksRef.current.delete(peerId)
+        const videoEl = peerVideoRefs.current.get(peerId)
+        if (videoEl) videoEl.srcObject = stream
+        else if (activeSpeakerIdRef.current === peerId && speakerMainVideoRef.current) {
+          speakerMainVideoRef.current.srcObject = stream
+        }
+        queueMicrotask(() => syncPeerCameraOverlayRef.current(peerId))
+      }
+      setScreenSharingPeers(prev => { const s = new Set(prev); s.delete(peerId); return s })
     })
     room.on(RoomEvent.ParticipantDisconnected, p => {
       const uid = p.identity
@@ -2676,8 +2714,9 @@ export function MeetingPage() {
         if (pub.isSubscribed && pub.track) onRemoteTrack(pub.track, p)
       }
     }
-    for (const pid of peerList) {
-      const entry = participantRosterRef.current[pid]
+    // Flush any tracks that arrived before the roster was ready (keyed by LiveKit identity).
+    // Iterate all roster entries, not just peerList, in case someone joined while we were connecting.
+    for (const entry of Object.values(participantRosterRef.current)) {
       if (entry?.userId) flushPendingLiveKitTracksForUser(entry.userId)
     }
     appendLog('livekit', 'connected')
@@ -2691,16 +2730,23 @@ export function MeetingPage() {
     liveKitRoomRef.current = null
     pendingLiveKitTracksByUserIdRef.current.clear()
     liveKitPublishedTracksRef.current = { video: null, audio: null }
+    liveKitPublishedScreenRef.current = null
+    peerCameraTracksRef.current.clear()
     try {
       if (room) {
         const lp = room.localParticipant
         const ls = localStreamRef.current
-        if (room.state === 'connected' && ls) {
-          for (const t of ls.getTracks()) {
-            try {
-              await lp.unpublishTrack(t, false)
-            } catch {
-              // ignore
+        if (room.state === 'connected') {
+          // Unpublish camera/mic tracks
+          if (ls) {
+            for (const t of ls.getTracks()) {
+              try { await lp.unpublishTrack(t, false) } catch { /* ignore */ }
+            }
+          }
+          // Unpublish screen track if active
+          if (screenStreamRef.current) {
+            for (const t of screenStreamRef.current.getVideoTracks()) {
+              try { await lp.unpublishTrack(t, false) } catch { /* ignore */ }
             }
           }
         }
@@ -2771,6 +2817,7 @@ export function MeetingPage() {
     peerVideoRefs.current.delete(peerId)
     peerVideoCallbackRefs.current.delete(peerId)
     peerStreamRefs.current.delete(peerId)
+    peerCameraTracksRef.current.delete(peerId)
     teardownSpeakerAnalyser(peerId)
     void applyRemoteSpeakerTracks()
     setPeerShowVideoFallback(prev => {
@@ -2822,6 +2869,7 @@ export function MeetingPage() {
     peerVideoRefs.current.clear()
     peerVideoCallbackRefs.current.clear()
     peerStreamRefs.current.clear()
+    peerCameraTracksRef.current.clear()
     void applyRemoteSpeakerTracks()
     liveKitPeerIdsRef.current = []
     setPeerIds([])
@@ -4663,6 +4711,30 @@ export function MeetingPage() {
     screenStreamRef.current = null
     screenSharingRef.current = false
     socketRef.current?.emit('meeting:screenshare', { sharing: false })
+
+    if (mediaModeRef.current === 'livekit') {
+      const room = liveKitRoomRef.current
+      if (room?.state === 'connected') {
+        const screenTrack = liveKitPublishedScreenRef.current
+        if (screenTrack) {
+          try { await room.localParticipant.unpublishTrack(screenTrack, false) } catch { /* ignore */ }
+        }
+      }
+      liveKitPublishedScreenRef.current = null
+      scheduleLiveBroadcastCompositorSyncRef.current()
+      const cameraTrack = localStreamRef.current?.getVideoTracks()[0] ?? null
+      if (localPipRef.current && localStreamRef.current) {
+        localPipRef.current.srcObject = localStreamRef.current
+      }
+      setPipCamOff(!cameraTrack)
+      setScreenSharing(false)
+      if (!opts?.silent) {
+        playMeetingNotificationSound('screenShareEnd')
+        showToast('Screen sharing stopped')
+      }
+      return
+    }
+
     const cameraTrack = localStreamRef.current?.getVideoTracks()[0] ?? null
     for (const [remoteId, { pc }] of peersRef.current.entries()) {
       if (
@@ -4691,10 +4763,6 @@ export function MeetingPage() {
   }
 
   async function toggleScreenShare() {
-    if (mediaModeRef.current === 'livekit') {
-      showToast('Screen sharing is not available in LiveKit mode yet')
-      return
-    }
     if (screenSharingRef.current) { void stopScreenShare(); return }
     if (!navigator.mediaDevices?.getDisplayMedia) {
       showToast('Screen share is not supported on this browser/device')
@@ -4708,6 +4776,35 @@ export function MeetingPage() {
       screenStreamRef.current = screenStream
       screenSharingRef.current = true
       socketRef.current?.emit('meeting:screenshare', { sharing: true })
+
+      if (mediaModeRef.current === 'livekit') {
+        const room = liveKitRoomRef.current
+        if (room?.state === 'connected') {
+          try {
+            await room.localParticipant.publishTrack(screenTrack, { source: Track.Source.ScreenShare })
+            liveKitPublishedScreenRef.current = screenTrack
+          } catch (e) {
+            appendLog('livekit screen share publish error', String(e))
+            showToast('Unable to share screen')
+            screenSharingRef.current = false
+            screenStreamRef.current = null
+            screenStream.getTracks().forEach(t => t.stop())
+            return
+          }
+        }
+        scheduleLiveBroadcastCompositorSyncRef.current()
+        if (localPipRef.current) {
+          const pipStream = new MediaStream([screenTrack])
+          for (const t of (localStreamRef.current?.getAudioTracks() ?? [])) pipStream.addTrack(t)
+          localPipRef.current.srcObject = pipStream
+        }
+        setScreenSharing(true)
+        playMeetingNotificationSound('screenShare')
+        showToast('Screen sharing started')
+        screenTrack.onended = () => { void stopScreenShare() }
+        return
+      }
+
       for (const [remoteId, { pc }] of peersRef.current.entries()) {
         if (
           liveViewerPeerIdsRef.current.has(remoteId) &&
