@@ -7,7 +7,7 @@
     "prebuild": "npm run build -w @bandr/db",
     "dev": "nodemon",
     "build": "tsc",
-    "start": "node -r dotenv/config dist/index.js"
+    "start": "node dist/index.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1019.0",

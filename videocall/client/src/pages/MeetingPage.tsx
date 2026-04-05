@@ -332,6 +332,8 @@ export function MeetingPage() {
   const location = useLocation()
   const navigate = useNavigate()
   const code = (params.code ?? '').trim()
+  const meetingCodeRef = useRef(code)
+  meetingCodeRef.current = code
   const [speechLang, setSpeechLang] = useMeetingSpeechLanguage(code)
   const [captionLines, setCaptionLines] = useState<CaptionLine[]>([])
   const captionOverlayRecordingRef = useRef<{ speakerName: string; text: string } | null>(null)
@@ -354,6 +356,9 @@ export function MeetingPage() {
   const [callView, setCallView] = useState<CallView>('lobby')
   const callViewRef = useRef<CallView>('lobby')
   callViewRef.current = callView
+  const [waitingForHost, setWaitingForHost] = useState(false)
+  const waitingForHostRef = useRef(false)
+  waitingForHostRef.current = waitingForHost
   const [micEnabled, setMicEnabled] = useState(false)
   const micEnabledRef = useRef(micEnabled)
   micEnabledRef.current = micEnabled
@@ -365,13 +370,16 @@ export function MeetingPage() {
   const [toast, setToast] = useState<string | null>(null)
   const [inputSignal, setInputSignal] = useState('')
   const [connectBtnDisabled, setConnectBtnDisabled] = useState(false)
-  const [waitingForHost, setWaitingForHost] = useState(false)
   const [previewCamOff, setPreviewCamOff] = useState(true)
   const [pipCamOff, setPipCamOff] = useState(true)
   const [showDebug, setShowDebug] = useState(false)
   const [debugLog, setDebugLog] = useState('')
   const [hasWeakNetwork, setHasWeakNetwork] = useState(false)
   const [presenterPage, setPresenterPage] = useState(0)
+  /** `auto`: speaker spotlight + screen-share swipe when applicable. `gallery`: always show everyone in a grid. */
+  const [callVideoLayout, setCallVideoLayout] = useState<'auto' | 'gallery'>('auto')
+  const [layoutMenuOpen, setLayoutMenuOpen] = useState(false)
+  const layoutMenuRef = useRef<HTMLDivElement>(null)
   const [screenSharing, setScreenSharing] = useState(false)
   const [screenSharingPeers, setScreenSharingPeers] = useState<Set<string>>(new Set())
   const [peerShowVideoFallback, setPeerShowVideoFallback] = useState<Record<string, boolean>>({})
@@ -565,7 +573,10 @@ export function MeetingPage() {
     video: null,
     audio: null,
   })
-  const pendingLiveKitTracksByUserIdRef = useRef<Map<string, RemoteTrack[]>>(new Map())
+  /** Tracks received before we know `RemoteParticipant.sid` → signaling `peerId` mapping. */
+  const pendingLiveKitTracksBySidRef = useRef<Map<string, RemoteTrack[]>>(new Map())
+  /** LiveKit participant SID (per session) → signaling socket id for the participant tile. */
+  const liveKitSidToPeerIdRef = useRef<Map<string, string>>(new Map())
   /** Published screen-share MediaStreamTrack in LiveKit mode (separate from camera video). */
   const liveKitPublishedScreenRef = useRef<MediaStreamTrack | null>(null)
   /** Camera video track saved per peer when a screen-share track replaces it in the display stream. */
@@ -579,6 +590,7 @@ export function MeetingPage() {
   mediaModeRef.current = resolvedRtcMode()
   const localPreviewRef = useRef<HTMLVideoElement>(null)
   const localPipRef = useRef<HTMLVideoElement>(null)
+  const localMainGridRef = useRef<HTMLVideoElement>(null)
   const localPresenterRef = useRef<HTMLVideoElement>(null)
   const localStripRef = useRef<HTMLVideoElement>(null)
   const remoteMicMonitorAudioRef = useRef<HTMLAudioElement>(null)
@@ -627,6 +639,8 @@ export function MeetingPage() {
   const speakerAnalyserMapRef = useRef<Map<string, AnalyserEntry>>(new Map())
   const localSpeakerAnalyserRef = useRef<AnalyserEntry | null>(null)
   const activeSpeakerHoldRef = useRef<{ id: string | null; since: number }>({ id: null, since: 0 })
+  /** New spotlight candidate must stay dominant-loudest this long before we switch (reduces rapid flipping). */
+  const speakerHandoffPendingRef = useRef<{ id: string | null; since: number }>({ id: null, since: 0 })
   const smoothedLevelsRef = useRef<Map<string, number>>(new Map())
   const speakerMainVideoRef = useRef<HTMLVideoElement>(null)
 
@@ -696,7 +710,7 @@ export function MeetingPage() {
       const source = ctx.createMediaStreamSource(stream)
       const analyser = ctx.createAnalyser()
       analyser.fftSize = 512
-      analyser.smoothingTimeConstant = 0.4
+      analyser.smoothingTimeConstant = 0.55
       source.connect(analyser)
       speakerAnalyserMapRef.current.set(id, {
         source,
@@ -921,6 +935,23 @@ export function MeetingPage() {
     return () => document.removeEventListener('keydown', onKey)
   }, [callSettingsOpen])
 
+  useEffect(() => {
+    if (!layoutMenuOpen) return
+    const onDoc = (e: MouseEvent) => {
+      const el = layoutMenuRef.current
+      if (el && !el.contains(e.target as Node)) setLayoutMenuOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setLayoutMenuOpen(false)
+    }
+    document.addEventListener('mousedown', onDoc)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDoc)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [layoutMenuOpen])
+
   // auto-start camera when lobby opens
   useEffect(() => {
     if (callView !== 'lobby') return
@@ -939,9 +970,8 @@ export function MeetingPage() {
   }, [callView])
 
   // Sync local video elements whenever layout mounts or screen share starts/stops.
-  // localPresenterRef and localStripRef live inside the conditionally-rendered swipe
-  // container, so they mount only when presenterMode becomes true — we must re-run
-  // this effect then, not just on callView change.
+  // localPresenterRef, localStripRef, and localMainGridRef mount in different layout branches;
+  // re-run when call layout or share state changes so the active <video> gets the stream.
   useEffect(() => {
     if (callView !== 'call') return
     const camStream = localStreamRef.current
@@ -973,8 +1003,13 @@ export function MeetingPage() {
       localStripRef.current.srcObject = camStream
       void localStripRef.current.play().catch(() => {})
     }
-    // screenSharingPeers (Set identity) + screenSharing: re-run when presenter mode changes.
-  }, [callView, screenSharing, screenSharingPeers])
+
+    if (localMainGridRef.current && camStream) {
+      localMainGridRef.current.srcObject = camStream
+      void localMainGridRef.current.play().catch(() => {})
+    }
+    // screenSharingPeers (Set identity) + screenSharing + callVideoLayout: refs move between swipe vs gallery.
+  }, [callView, screenSharing, screenSharingPeers, callVideoLayout])
 
   // keep chat pinned to latest message
   useEffect(() => {
@@ -1003,7 +1038,7 @@ export function MeetingPage() {
         void el.play().catch(() => {})
       }
     }
-  }, [peerIds, screenSharingPeers])
+  }, [peerIds, screenSharingPeers, callVideoLayout])
 
   // Detect companion app and open WebSocket bridge
   useEffect(() => {
@@ -1264,7 +1299,7 @@ export function MeetingPage() {
       const source = ctx.createMediaStreamSource(stream)
       const analyser = ctx.createAnalyser()
       analyser.fftSize = 512
-      analyser.smoothingTimeConstant = 0.4
+      analyser.smoothingTimeConstant = 0.55
       source.connect(analyser)
       if (localSpeakerAnalyserRef.current) localSpeakerAnalyserRef.current.source.disconnect()
       localSpeakerAnalyserRef.current = {
@@ -1288,16 +1323,21 @@ export function MeetingPage() {
       activeSpeakerIdRef.current = null
       setSpeakingPeerIds(new Set())
       activeSpeakerHoldRef.current = { id: null, since: 0 }
+      speakerHandoffPendingRef.current = { id: null, since: 0 }
       return
     }
     const SILENCE_THRESHOLD = 0.015
     // Minimum time (ms) the current speaker must NOT be loudest before they can be replaced.
     // Resets whenever they are still the loudest, so mid-sentence pauses never count down.
-    const HOLD_MS = 3000
+    const HOLD_MS = 5500
     // New speaker must be this much louder than the current one to be eligible to take over.
-    const DOMINANCE_RATIO = 1.3
+    const DOMINANCE_RATIO = 1.55
     // EMA smoothing factor: lower = smoother (less sensitive to short bursts / coughs / noise).
-    const EMA_ALPHA = 0.25
+    const EMA_ALPHA = 0.18
+    // How long the takeover candidate must stay the dominant loudest before we switch (Meet/Zoom-style debounce).
+    const HANDOFF_STABLE_MS = 1600
+    // Shorter debounce when nobody has the spotlight yet (e.g. after silence) so the first speaker appears quickly.
+    const HANDOFF_STABLE_INITIAL_MS = 450
 
     const interval = setInterval(() => {
       const now = Date.now()
@@ -1338,27 +1378,43 @@ export function MeetingPage() {
 
       const hold = activeSpeakerHoldRef.current
 
+      if (loudestId === null) {
+        speakerHandoffPendingRef.current = { id: null, since: 0 }
+      }
+
       if (loudestId !== null && loudestId === hold.id) {
         // Current speaker is still the loudest — refresh since so the hold window only
         // starts counting down once they actually stop being the loudest.
         activeSpeakerHoldRef.current = { id: hold.id, since: now }
+        speakerHandoffPendingRef.current = { id: null, since: 0 }
       } else if (loudestId !== null && loudestId !== hold.id) {
         // Someone else is louder. Only switch if:
-        //   1. There is no current active speaker, OR
-        //   2. The current speaker hasn't been loudest for at least HOLD_MS (grace period), AND
-        //   3. The new speaker is meaningfully louder (hysteresis) to ignore brief cross-talk.
+        //   1. The new speaker is meaningfully louder (hysteresis) to ignore brief cross-talk, AND
+        //   2. The current speaker hasn't been loudest for at least HOLD_MS (grace period) — skipped when nobody has spotlight, AND
+        //   3. The same candidate has stayed dominant-loudest for HANDOFF_STABLE_* (debounce).
         const currentLevel = hold.id != null ? (smoothed.get(hold.id) ?? 0) : 0
         const newIsDominant = hold.id === null || loudestLevel > currentLevel * DOMINANCE_RATIO
-        if (newIsDominant && (hold.id === null || now - hold.since > HOLD_MS)) {
-          activeSpeakerHoldRef.current = { id: loudestId, since: now }
-          activeSpeakerIdRef.current = loudestId
-          setActiveSpeakerId(loudestId)
+        if (!newIsDominant) {
+          speakerHandoffPendingRef.current = { id: null, since: 0 }
+        } else {
+          const graceOk = hold.id === null || now - hold.since > HOLD_MS
+          const stableNeed = hold.id === null ? HANDOFF_STABLE_INITIAL_MS : HANDOFF_STABLE_MS
+          const pend = speakerHandoffPendingRef.current
+          if (loudestId !== pend.id) speakerHandoffPendingRef.current = { id: loudestId, since: now }
+          const p2 = speakerHandoffPendingRef.current
+          if (graceOk && p2.id === loudestId && now - p2.since >= stableNeed) {
+            activeSpeakerHoldRef.current = { id: loudestId, since: now }
+            activeSpeakerIdRef.current = loudestId
+            setActiveSpeakerId(loudestId)
+            speakerHandoffPendingRef.current = { id: null, since: 0 }
+          }
         }
       } else if (loudestId === null && hold.id !== null && now - hold.since > HOLD_MS) {
         // Nobody speaking for HOLD_MS — clear active speaker.
         activeSpeakerHoldRef.current = { id: null, since: now }
         activeSpeakerIdRef.current = null
         setActiveSpeakerId(null)
+        speakerHandoffPendingRef.current = { id: null, since: 0 }
       }
     }, 150)
 
@@ -1367,6 +1423,7 @@ export function MeetingPage() {
       setActiveSpeakerId(null)
       setSpeakingPeerIds(new Set())
       activeSpeakerHoldRef.current = { id: null, since: 0 }
+      speakerHandoffPendingRef.current = { id: null, since: 0 }
       smoothedLevelsRef.current.clear()
       if (speakerAudioCtxRef.current?.state !== 'closed') {
         void speakerAudioCtxRef.current?.close()
@@ -1504,6 +1561,10 @@ export function MeetingPage() {
     if (localStripRef.current) {
       localStripRef.current.srcObject = ls
       void localStripRef.current.play().catch(() => {})
+    }
+    if (localMainGridRef.current) {
+      localMainGridRef.current.srcObject = ls
+      void localMainGridRef.current.play().catch(() => {})
     }
   }
 
@@ -2489,6 +2550,41 @@ export function MeetingPage() {
     return undefined
   }
 
+  function forgetLiveKitSidMappingsForPeer(peerId: string) {
+    const m = liveKitSidToPeerIdRef.current
+    for (const [sid, pid] of [...m.entries()]) {
+      if (pid === peerId) m.delete(sid)
+    }
+  }
+
+  function applyLiveKitPeerBinding(peerId: string, liveKitSid: string) {
+    const m = liveKitSidToPeerIdRef.current
+    for (const [oldSid, pid] of [...m.entries()]) {
+      if (pid === peerId && oldSid !== liveKitSid) m.delete(oldSid)
+    }
+    m.set(liveKitSid, peerId)
+    const pend = pendingLiveKitTracksBySidRef.current.get(liveKitSid)
+    if (pend?.length) {
+      pendingLiveKitTracksBySidRef.current.delete(liveKitSid)
+      for (const t of pend) attachLiveKitRemoteTrack(peerId, t)
+    }
+  }
+
+  function flushPendingLiveKitTracksBySidMap() {
+    for (const [liveKitSid, peerId] of liveKitSidToPeerIdRef.current.entries()) {
+      const pend = pendingLiveKitTracksBySidRef.current.get(liveKitSid)
+      if (!pend?.length) continue
+      pendingLiveKitTracksBySidRef.current.delete(liveKitSid)
+      for (const t of pend) attachLiveKitRemoteTrack(peerId, t)
+    }
+  }
+
+  function liveKitTilePeerId(participant: RemoteParticipant): string | undefined {
+    const fromSid = liveKitSidToPeerIdRef.current.get(participant.sid)
+    if (fromSid) return fromSid
+    return findPeerIdForUserId(participantRosterRef.current, participant.identity)
+  }
+
   function attachLiveKitRemoteTrack(peerId: string, track: RemoteTrack) {
     const mst = track.mediaStreamTrack
     const isScreenShare = track.source === Track.Source.ScreenShare
@@ -2527,15 +2623,6 @@ export function MeetingPage() {
       mst.addEventListener('unmute', () => syncPeerCameraOverlayRef.current(peerId))
     }
     scheduleLiveBroadcastCompositorSyncRef.current()
-  }
-
-  function flushPendingLiveKitTracksForUser(userId: string) {
-    const pending = pendingLiveKitTracksByUserIdRef.current.get(userId)
-    if (!pending || pending.length === 0) return
-    const peerId = findPeerIdForUserId(participantRosterRef.current, userId)
-    if (!peerId) return
-    pendingLiveKitTracksByUserIdRef.current.delete(userId)
-    for (const t of pending) attachLiveKitRemoteTrack(peerId, t)
   }
 
   function clearLiveKitReconnectTimer() {
@@ -2593,7 +2680,7 @@ export function MeetingPage() {
   async function abandonLiveKitSessionForReconnect() {
     const room = liveKitRoomRef.current
     liveKitRoomRef.current = null
-    pendingLiveKitTracksByUserIdRef.current.clear()
+    pendingLiveKitTracksBySidRef.current.clear()
     liveKitPublishedTracksRef.current = { video: null, audio: null }
     liveKitPublishedScreenRef.current = null
     peerCameraTracksRef.current.clear()
@@ -2636,12 +2723,11 @@ export function MeetingPage() {
     liveKitRoomRef.current = room
     const onRemoteTrack = (track: RemoteTrack, participant: RemoteParticipant) => {
       if (participant.identity === room.localParticipant.identity) return
-      const uid = participant.identity
-      const peerId = findPeerIdForUserId(participantRosterRef.current, uid)
+      const peerId = liveKitTilePeerId(participant)
       if (!peerId) {
-        const cur = pendingLiveKitTracksByUserIdRef.current.get(uid) ?? []
+        const cur = pendingLiveKitTracksBySidRef.current.get(participant.sid) ?? []
         cur.push(track)
-        pendingLiveKitTracksByUserIdRef.current.set(uid, cur)
+        pendingLiveKitTracksBySidRef.current.set(participant.sid, cur)
         return
       }
       attachLiveKitRemoteTrack(peerId, track)
@@ -2651,8 +2737,7 @@ export function MeetingPage() {
     })
     room.on(RoomEvent.TrackUnsubscribed, (track, _pub, participant) => {
       if (track.source !== Track.Source.ScreenShare) return
-      const uid = participant.identity
-      const peerId = findPeerIdForUserId(participantRosterRef.current, uid)
+      const peerId = liveKitTilePeerId(participant)
       if (!peerId) return
       const stream = peerStreamRefs.current.get(peerId)
       if (stream) {
@@ -2673,10 +2758,9 @@ export function MeetingPage() {
       setScreenSharingPeers(prev => { const s = new Set(prev); s.delete(peerId); return s })
     })
     room.on(RoomEvent.ParticipantDisconnected, p => {
-      const uid = p.identity
-      const peerId = findPeerIdForUserId(participantRosterRef.current, uid)
+      const peerId = liveKitTilePeerId(p)
       if (peerId) removeLiveKitPeerMedia(peerId)
-      pendingLiveKitTracksByUserIdRef.current.delete(uid)
+      pendingLiveKitTracksBySidRef.current.delete(p.sid)
     })
     room.on(RoomEvent.Reconnecting, () => {
       appendLog('livekit', 'sdk reconnecting')
@@ -2686,6 +2770,8 @@ export function MeetingPage() {
       liveKitReconnectFailuresRef.current = 0
       appendLog('livekit', 'sdk reconnected')
       showToast('Media connection restored', 2500)
+      const s = room.localParticipant.sid
+      if (s) socketRef.current?.emit('meeting:livekit-bind', { liveKitSid: s })
     })
     room.on(RoomEvent.Disconnected, (reason?: DisconnectReason) => {
       if (liveKitRoomRef.current !== room) return
@@ -2705,6 +2791,8 @@ export function MeetingPage() {
     const ls = localStreamRef.current
     if (!ls) throw new Error('No local stream')
     const lp = room.localParticipant
+    const myLkSid = lp.sid
+    if (myLkSid) socketRef.current?.emit('meeting:livekit-bind', { liveKitSid: myLkSid })
     for (const t of ls.getAudioTracks()) {
       await lp.publishTrack(t)
       liveKitPublishedTracksRef.current.audio = t
@@ -2719,11 +2807,7 @@ export function MeetingPage() {
         if (pub.isSubscribed && pub.track) onRemoteTrack(pub.track, p)
       }
     }
-    // Flush any tracks that arrived before the roster was ready (keyed by LiveKit identity).
-    // Iterate all roster entries, not just peerList, in case someone joined while we were connecting.
-    for (const entry of Object.values(participantRosterRef.current)) {
-      if (entry?.userId) flushPendingLiveKitTracksForUser(entry.userId)
-    }
+    flushPendingLiveKitTracksBySidMap()
     appendLog('livekit', 'connected')
   }
 
@@ -2733,7 +2817,7 @@ export function MeetingPage() {
     liveKitIntentionalDisconnectRef.current = true
     const room = liveKitRoomRef.current
     liveKitRoomRef.current = null
-    pendingLiveKitTracksByUserIdRef.current.clear()
+    pendingLiveKitTracksBySidRef.current.clear()
     liveKitPublishedTracksRef.current = { video: null, audio: null }
     liveKitPublishedScreenRef.current = null
     peerCameraTracksRef.current.clear()
@@ -2830,6 +2914,7 @@ export function MeetingPage() {
   }
 
   function removeLiveKitPeerMedia(peerId: string) {
+    forgetLiveKitSidMappingsForPeer(peerId)
     peerVideoRefs.current.delete(peerId)
     peerVideoCallbackRefs.current.delete(peerId)
     peerStreamRefs.current.delete(peerId)
@@ -2894,6 +2979,8 @@ export function MeetingPage() {
     setPeerShowVideoFallback({})
     setHandRaisedByPeerId({})
     setMyHandRaised(false)
+    liveKitSidToPeerIdRef.current.clear()
+    pendingLiveKitTracksBySidRef.current.clear()
   }
 
   function getPeerVideoRef(remoteId: string) {
@@ -2949,6 +3036,15 @@ export function MeetingPage() {
       mySocketIdRef.current = socket.id ?? ''
       setCallLocalSocketId(socket.id ?? null)
       appendLog('connected', mySocketIdRef.current)
+      const meetingCode = meetingCodeRef.current.trim()
+      if (!meetingCode || !getToken()) return
+      const resumeCall = callViewRef.current === 'call'
+      const resumeLobby = waitingForHostRef.current
+      if (!resumeCall && !resumeLobby) return
+      appendLog('signaling reconnect — rejoining meeting', meetingCode)
+      socket.emit('meeting:join', meetingCode, (ack: unknown) => {
+        handleMeetingJoinAck(ack, { fromReconnect: true })
+      })
     })
     socket.on('connect_error', (err: Error) => {
       appendLog('connect_error', err.message)
@@ -2959,6 +3055,13 @@ export function MeetingPage() {
     socket.on('disconnect', (reason: string) => {
       appendLog('disconnected', reason)
       showToast('Disconnected from signaling')
+    })
+    socket.on('meeting:livekit-peer', (payload: unknown) => {
+      if (!payload || typeof payload !== 'object') return
+      const peerId = (payload as { peerId?: unknown }).peerId
+      const liveKitSid = (payload as { liveKitSid?: unknown }).liveKitSid
+      if (typeof peerId !== 'string' || typeof liveKitSid !== 'string') return
+      applyLiveKitPeerBinding(peerId, liveKitSid)
     })
     socket.on('meeting:peer-joined', (payload: unknown) => {
       if (!payload || typeof payload !== 'object') return
@@ -2973,8 +3076,7 @@ export function MeetingPage() {
           ...prev,
           [peerId]: { userName, userId, ...(userEmail ? { userEmail } : {}) },
         }
-        // Keep ref in sync immediately so LiveKit TrackSubscribed + flush see the new mapping
-        // (useEffect runs too late; otherwise tracks stay stuck in pendingLiveKitTracksByUserIdRef).
+        // Keep ref in sync immediately so LiveKit handlers see the new roster row.
         participantRosterRef.current = next
         return next
       })
@@ -2990,7 +3092,11 @@ export function MeetingPage() {
           liveKitPeerIdsRef.current = next
           return next
         })
-        if (userId) flushPendingLiveKitTracksForUser(userId)
+        const r = liveKitRoomRef.current
+        if (r?.state === ConnectionState.Connected) {
+          const s = r.localParticipant.sid
+          if (s) socketRef.current?.emit('meeting:livekit-bind', { liveKitSid: s })
+        }
       }
       // Re-announce screen share so the newly joined peer learns the current state
       if (screenSharingRef.current) {
@@ -3719,7 +3825,7 @@ export function MeetingPage() {
     })
   }
 
-  function finalizeJoin(a: Record<string, unknown>) {
+  function finalizeJoin(a: Record<string, unknown>, joinOpts?: { signalingReconnect?: boolean }) {
     mySocketIdRef.current = socketRef.current?.id ?? mySocketIdRef.current
     setCallLocalSocketId(mySocketIdRef.current || null)
     appendLog('joined', a)
@@ -3821,6 +3927,19 @@ export function MeetingPage() {
       participantRosterRef.current = nextRoster
       setParticipantRoster(nextRoster)
     }
+    {
+      liveKitSidToPeerIdRef.current.clear()
+      const lb = a.liveKitBindings
+      if (Array.isArray(lb)) {
+        for (const row of lb) {
+          if (!row || typeof row !== 'object') continue
+          const pid = (row as { peerId?: unknown }).peerId
+          const lk = (row as { liveKitSid?: unknown }).liveKitSid
+          if (typeof pid !== 'string' || typeof lk !== 'string') continue
+          applyLiveKitPeerBinding(pid, lk)
+        }
+      }
+    }
     if (resolvedRtcMode() === 'mesh') {
       for (const pid of peerList) {
         if (shouldInitiateOffer(pid)) void createAndSendOffer(pid).catch(e => appendLog('offer error', String(e)))
@@ -3900,14 +4019,21 @@ export function MeetingPage() {
       const mv = a.myVote
       setMyVote(mv === 'up' || mv === 'down' ? mv : null)
     }
-    primeMeetingNotificationAudio()
-    // peer-joined only fires for *others* when someone new arrives — play when you enter too
-    playMeetingNotificationSound('join')
+    if (!joinOpts?.signalingReconnect) {
+      primeMeetingNotificationAudio()
+      // peer-joined only fires for *others* when someone new arrives — play when you enter too
+      playMeetingNotificationSound('join')
+    }
     setCallView('call')
     startTimer()
     startNetworkStats()
     const n = typeof a.peerCount === 'number' ? a.peerCount : peerList.length + 1
-    showToast(n <= 1 ? "You're the only one here" : `${n} people in this call`)
+    if (!joinOpts?.signalingReconnect) {
+      showToast(n <= 1 ? "You're the only one here" : `${n} people in this call`)
+    } else {
+      appendLog('signaling reconnect — meeting state refreshed')
+      showToast('Connection restored', 2500)
+    }
 
     const focus = (location.state as { meetingFocus?: string } | null)?.meetingFocus
     if (focus === 'Whiteboard') {
@@ -3921,6 +4047,47 @@ export function MeetingPage() {
       setAgendaOpen(false)
       setNotesOpen(true)
     }
+  }
+
+  function handleMeetingJoinAck(ack: unknown, opts?: { fromReconnect?: boolean }) {
+    if (!ack || typeof ack !== 'object') {
+      if (opts?.fromReconnect) {
+        appendLog('rejoin: invalid ack')
+        showToast('Could not restore meeting after reconnect', 5000)
+      } else {
+        setStatusLine('Invalid join response')
+        setConnectBtnDisabled(false)
+      }
+      return
+    }
+    const a = ack as Record<string, unknown>
+    if (a.ok !== true) {
+      if (a.pending === true) {
+        const msg = typeof a.message === 'string' ? a.message : 'Waiting for host to admit you.'
+        setStatusLine(msg)
+        setWaitingForHost(true)
+        if (!opts?.fromReconnect) showToast(msg)
+        return
+      }
+      const msg = typeof a.error === 'string' ? a.error : 'Join failed'
+      setStatusLine(msg)
+      showToast(msg)
+      appendLog(ack)
+      setConnectBtnDisabled(false)
+      if (!opts?.fromReconnect) socketRef.current?.disconnect()
+      return
+    }
+    if (a.isHost !== true && (a.hostMode === 'mesh' || a.hostMode === 'livekit')) {
+      const hostMode = a.hostMode as RtcMode
+      if (hostMode !== resolvedRtcMode()) {
+        writeRtcModeToStorage(hostMode)
+        mediaModeRef.current = hostMode
+        if (!opts?.fromReconnect) {
+          showToast(`Host is using ${hostMode} mode — switching automatically`, 4000)
+        }
+      }
+    }
+    finalizeJoin(a, { signalingReconnect: opts?.fromReconnect })
   }
 
   function respondJoinRequest(requestId: string, accepted: boolean) {
@@ -4003,36 +4170,7 @@ export function MeetingPage() {
     registerSocketHandlers(socket)
 
     socket.emit('meeting:join', code, (ack: unknown) => {
-      if (!ack || typeof ack !== 'object') {
-        setStatusLine('Invalid join response')
-        setConnectBtnDisabled(false)
-        return
-      }
-      const a = ack as Record<string, unknown>
-      if (a.ok !== true) {
-        if (a.pending === true) {
-          const msg = typeof a.message === 'string' ? a.message : 'Waiting for host to admit you.'
-          setStatusLine(msg)
-          setWaitingForHost(true)
-          showToast(msg)
-          return
-        }
-        const msg = typeof a.error === 'string' ? a.error : 'Join failed'
-        setStatusLine(msg); showToast(msg); appendLog(ack)
-        setConnectBtnDisabled(false)
-        socketRef.current?.disconnect()
-        return
-      }
-      // If we are NOT the host and the host has already chosen a mode, adopt it.
-      if (a.isHost !== true && (a.hostMode === 'mesh' || a.hostMode === 'livekit')) {
-        const hostMode = a.hostMode as RtcMode
-        if (hostMode !== resolvedRtcMode()) {
-          writeRtcModeToStorage(hostMode)
-          mediaModeRef.current = hostMode
-          showToast(`Host is using ${hostMode} mode — switching automatically`, 4000)
-        }
-      }
-      finalizeJoin(a)
+      handleMeetingJoinAck(ack)
     })
   }
 
@@ -4099,6 +4237,8 @@ export function MeetingPage() {
     setAgendaOpen(false)
     setHostAgentOpen(false)
     setCallSettingsOpen(false)
+    setCallVideoLayout('auto')
+    setLayoutMenuOpen(false)
     setChatDraft('')
     setIsHostInCall(false)
     setHostPeerId(null)
@@ -5040,8 +5180,11 @@ export function MeetingPage() {
     ? peerIds.filter(id => id !== remotePresenterId)
     : peerIds
 
-  // Speaker spotlight: active when someone is speaking, no screen share, 2+ people in call
-  const speakerMode = !presenterMode && !isSoloInCall && activeSpeakerId !== null
+  const galleryLayout = callVideoLayout === 'gallery'
+  const presenterSwipeMode = presenterMode && !galleryLayout
+
+  // Speaker spotlight: active when someone is speaking, no screen share, 2+ people in call, and user did not pick gallery
+  const speakerMode = !presenterMode && !isSoloInCall && activeSpeakerId !== null && !galleryLayout
   const speakerIsLocal = speakerMode && activeSpeakerId === callLocalSocketId
   const nonSpeakerPeerIds = speakerMode
     ? peerIds.filter(id => id !== activeSpeakerId)
@@ -5059,14 +5202,26 @@ export function MeetingPage() {
     .map(([peerId]) => peerId)
   const raisedHandCount = raisedHandPeerIds.length
 
-  const gridStyle: React.CSSProperties =
-    peerIds.length === 0 ? {} :
-    peerIds.length === 1 ? { gridTemplateColumns: '1fr', gridTemplateRows: '1fr' } :
-    peerIds.length === 2 ? { gridTemplateColumns: 'repeat(2,1fr)', gridTemplateRows: '1fr' } :
-    peerIds.length <= 4 ? { gridTemplateColumns: 'repeat(2,1fr)', gridTemplateRows: 'repeat(2,1fr)' } :
-    peerIds.length <= 6 ? { gridTemplateColumns: 'repeat(3,1fr)', gridTemplateRows: 'repeat(2,1fr)' } :
-    peerIds.length <= 9 ? { gridTemplateColumns: 'repeat(3,1fr)', gridTemplateRows: 'repeat(3,1fr)' } :
-    { gridTemplateColumns: 'repeat(4,1fr)', gridTemplateRows: `repeat(${Math.ceil(peerIds.length / 4)},1fr)` }
+  const tiledGridCount = peerIds.length + 1
+  const gridStyleTiled: React.CSSProperties =
+    tiledGridCount <= 1 ? { gridTemplateColumns: '1fr', gridTemplateRows: '1fr' } :
+    tiledGridCount === 2 ? { gridTemplateColumns: 'repeat(2,1fr)', gridTemplateRows: '1fr' } :
+    tiledGridCount <= 4 ? { gridTemplateColumns: 'repeat(2,1fr)', gridTemplateRows: 'repeat(2,1fr)' } :
+    tiledGridCount <= 6 ? { gridTemplateColumns: 'repeat(3,1fr)', gridTemplateRows: 'repeat(2,1fr)' } :
+    tiledGridCount <= 9 ? { gridTemplateColumns: 'repeat(3,1fr)', gridTemplateRows: 'repeat(3,1fr)' } :
+    { gridTemplateColumns: 'repeat(4,1fr)', gridTemplateRows: `repeat(${Math.ceil(tiledGridCount / 4)},1fr)` }
+
+  const n = peerIds.length
+  const gridStyleAuto: React.CSSProperties =
+    n === 0 ? {} :
+    n === 1 ? { gridTemplateColumns: '1fr', gridTemplateRows: '1fr' } :
+    n === 2 ? { gridTemplateColumns: 'repeat(2,1fr)', gridTemplateRows: '1fr' } :
+    n <= 4 ? { gridTemplateColumns: 'repeat(2,1fr)', gridTemplateRows: 'repeat(2,1fr)' } :
+    n <= 6 ? { gridTemplateColumns: 'repeat(3,1fr)', gridTemplateRows: 'repeat(2,1fr)' } :
+    n <= 9 ? { gridTemplateColumns: 'repeat(3,1fr)', gridTemplateRows: 'repeat(3,1fr)' } :
+    { gridTemplateColumns: 'repeat(4,1fr)', gridTemplateRows: `repeat(${Math.ceil(n / 4)},1fr)` }
+
+  const gridStyle = galleryLayout ? gridStyleTiled : gridStyleAuto
 
   const stripTileCount = stripPeerIds.length + (presenterIsLocal ? 0 : 1)
   const stripGridStyle: React.CSSProperties =
@@ -5321,7 +5476,44 @@ export function MeetingPage() {
           {/* Video grid — regular mode (no screen share, nobody speaking yet) */}
           {!presenterMode && !speakerMode && (
             <div className="absolute inset-0 grid gap-1.5 bg-[#111]" style={gridStyle}>
-              {peerIds.length === 0 && (
+              {galleryLayout && (
+                <div className="group relative min-h-0 min-w-0 overflow-hidden rounded-[10px] bg-[#2d2e30]">
+                  <video
+                    ref={localMainGridRef}
+                    playsInline
+                    autoPlay
+                    muted
+                    className="block h-full w-full object-cover -scale-x-100"
+                  />
+                  {pipCamOff && (
+                    <VideoOffParticipantCard
+                      name={
+                        participantRoster[callLocalSocketId ?? '']?.userName
+                        || getJwtProfile(getToken() ?? '').name
+                        || 'You'
+                      }
+                      email={rosterEntryEmail(callLocalSocketId ?? '')}
+                    />
+                  )}
+                  {callLocalSocketId && speakingPeerIds.has(callLocalSocketId) && (
+                    <div className="pointer-events-none absolute inset-0 z-2 rounded-[10px] ring-[3px] ring-inset ring-green-400/80" />
+                  )}
+                  {callLocalSocketId && handRaisedByPeerId[callLocalSocketId] && (
+                    <div className="absolute top-2 right-2 z-3 flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
+                      ✋
+                    </div>
+                  )}
+                  <div className="absolute bottom-2.5 left-3 right-3 z-2 flex items-center justify-between gap-2 rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">
+                    <span>You</span>
+                    {!micEnabled && (
+                      <svg viewBox="0 0 24 24" fill="#ea4335" width="14" height="14" className="shrink-0" aria-hidden>
+                        <path d="M19 11h-1.7c0 .74-.16 1.43-.43 2.05l1.23 1.23c.56-.98.9-2.09.9-3.28zm-4.02.17c0-.06.02-.11.02-.17V5c0-1.66-1.34-3-3-3S9 3.34 9 5v.18l5.98 5.99zM4.27 3L3 4.27l6.01 6.01V11c0 1.66 1.33 3 2.99 3 .22 0 .44-.03.65-.08l1.66 1.66c-.71.33-1.5.52-2.31.52-2.76 0-5.3-2.1-5.3-5.1H5c0 3.41 2.72 6.23 6 6.72V21h2v-3.28c.91-.13 1.77-.45 2.54-.9L19.73 21 21 19.73 4.27 3z" />
+                      </svg>
+                    )}
+                  </div>
+                </div>
+              )}
+              {!galleryLayout && peerIds.length === 0 && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center gap-3.5 text-sm text-[#9aa0a6]">
                   <div className="flex h-16 w-16 items-center justify-center rounded-full bg-[#2d2e30]">
                     <svg viewBox="0 0 24 24" fill="#9aa0a6" width="32" height="32">
@@ -5329,6 +5521,13 @@ export function MeetingPage() {
                     </svg>
                   </div>
                   <p>Waiting for others to join&hellip;</p>
+                </div>
+              )}
+              {galleryLayout && peerIds.length === 0 && (
+                <div className="pointer-events-none absolute inset-0 flex items-end justify-center pb-[calc(88px+env(safe-area-inset-bottom,0px))] sm:pb-28">
+                  <p className="rounded-full bg-black/55 px-4 py-2 text-center text-[13px] text-[#9aa0a6] backdrop-blur-sm">
+                    Waiting for others to join&hellip;
+                  </p>
                 </div>
               )}
               {peerIds.map(id => (
@@ -5462,8 +5661,96 @@ export function MeetingPage() {
             </div>
           )}
 
+          {/* Screen share + gallery: full participant grid (shared screen hidden until user switches back to Presentation) */}
+          {presenterMode && galleryLayout && (
+            <div className="absolute inset-0 flex flex-col overflow-hidden bg-[#111]">
+              <div className="shrink-0 border-b border-white/8 bg-black/40 px-4 py-2.5 text-center max-sm:px-3 max-sm:py-2">
+                <p className="text-[12px] leading-snug text-white/55 max-sm:text-[11px]">
+                  <span className="font-semibold text-white/75">Gallery view</span>
+                  {' · '}
+                  Shared screen is hidden. Use the layout control to open <span className="text-white/80">Presentation</span> and swipe to the share.
+                </p>
+              </div>
+              <div className="min-h-0 flex-1 overflow-y-auto px-4 pt-3 pb-24 max-sm:px-2.5 max-sm:pb-[92px]">
+                <p className="mb-2 text-center text-[13px] font-semibold text-white/40">Participants ({stripTileCount})</p>
+                <div className="grid min-h-0 gap-2" style={stripGridStyle}>
+                  {!presenterIsLocal && (
+                    <div className="group relative min-h-0 min-w-0 overflow-hidden rounded-[10px] bg-[#2d2e30]">
+                      <video ref={localStripRef} playsInline autoPlay muted style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: 'scaleX(-1)' }} />
+                      <div className="absolute bottom-2.5 left-3 z-2 rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">You</div>
+                      {callLocalSocketId && speakingPeerIds.has(callLocalSocketId) && (
+                        <div className="pointer-events-none absolute inset-0 z-2 rounded-[10px] ring-[3px] ring-inset ring-green-400/80" />
+                      )}
+                      {callLocalSocketId && handRaisedByPeerId[callLocalSocketId] && (
+                        <div className="absolute top-2 right-2 z-3 flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
+                          ✋
+                        </div>
+                      )}
+                      {pipCamOff && (
+                        <VideoOffParticipantCard
+                          compact
+                          name={
+                            participantRoster[callLocalSocketId ?? '']?.userName
+                            || getJwtProfile(getToken() ?? '').name
+                            || 'You'
+                          }
+                          email={rosterEntryEmail(callLocalSocketId ?? '')}
+                        />
+                      )}
+                    </div>
+                  )}
+                  {stripPeerIds.map(id => (
+                    <div key={id} className="group relative min-h-0 min-w-0 overflow-hidden rounded-[10px] bg-[#2d2e30]">
+                      <video
+                        ref={getPeerVideoRef(id)}
+                        playsInline
+                        autoPlay
+                        style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block', transform: screenSharingPeers.has(id) ? 'none' : 'scaleX(-1)' }}
+                      />
+                      {showPeerVideoFallbackForPeer(id) && (
+                        <VideoOffParticipantCard compact name={rosterLabel(id)} email={rosterEntryEmail(id)} />
+                      )}
+                      {speakingPeerIds.has(id) && (
+                        <div className="pointer-events-none absolute inset-0 z-2 rounded-[10px] ring-[3px] ring-inset ring-green-400/80" />
+                      )}
+                      {handRaisedByPeerId[id] && (
+                        <div className="absolute top-2 right-2 z-3 flex h-8 w-8 items-center justify-center rounded-full border border-amber-300/50 bg-amber-500/95 text-lg shadow-lg" title="Raised hand">
+                          ✋
+                        </div>
+                      )}
+                      <div className="absolute bottom-2.5 left-3 z-2 max-w-[calc(100%-16px)] truncate rounded bg-black/55 px-2 py-0.5 text-[13px] text-white">{rosterLabel(id)}</div>
+                      {screenSharingPeers.has(id) && !controllingPeer && !controlledBy && (
+                        <button
+                          type="button"
+                          className="absolute bottom-2.5 left-1/2 z-10 flex -translate-x-1/2 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-full border border-white/20 bg-[#111]/75 px-3.5 py-1.5 text-xs font-semibold text-white opacity-0 backdrop-blur-sm transition-[opacity,background] hover:border-sky-400/40 hover:bg-blue-600/85 group-hover:opacity-100"
+                          onClick={() => requestControl(id)}
+                          title={companionAvailable ? 'Request control' : 'Requires Bandr Companion app'}
+                        >
+                          <RemoteConnectionIcon size={13} />
+                          {companionAvailable ? 'Request Control' : 'Needs Companion'}
+                        </button>
+                      )}
+                      {controllingPeer === id && (
+                        <div
+                          className="absolute inset-0 z-10 cursor-crosshair outline-3 -outline-offset-[3px] outline-blue-600/70 focus:outline-blue-500"
+                          onMouseMove={e => handleControlMouseMove(e, id)}
+                          onClick={e => handleControlClick(e, id)}
+                          onDoubleClick={e => handleControlDblClick(e, id)}
+                          onContextMenu={e => { e.preventDefault(); handleControlClick(e, id) }}
+                          onWheel={e => handleControlScroll(e, id)}
+                          onKeyDown={e => handleControlKey(e, id)}
+                          tabIndex={0}
+                        />
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Presenter mode — swipe between full-screen share and participant tiles */}
-          {presenterMode && (
+          {presenterSwipeMode && (
             <div className="absolute inset-0">
               <div
                 ref={swipeContainerRef}
@@ -5600,11 +5887,11 @@ export function MeetingPage() {
             </div>
           )}
 
-          {/* Local PiP */}
+          {/* Local PiP — Auto layout: self in corner while grid shows peers only. Tiled: hidden (self is in grid). */}
           <div
             className={cx(
               'z-15 overflow-hidden rounded-xl border border-white/12 bg-[#2d2e30] shadow-2xl',
-              (presenterMode || speakerMode) && 'hidden',
+              (presenterSwipeMode || speakerMode || galleryLayout) && 'hidden',
               isSoloInCall
                 ? 'absolute top-14 right-2.5 bottom-[104px] left-2.5 sm:top-[62px] sm:right-6 sm:bottom-[108px] sm:left-6'
                 : 'absolute right-2.5 bottom-[88px] aspect-video w-[min(168px,40vw)] sm:bottom-24 sm:right-4 sm:w-[196px]',
@@ -6884,6 +7171,86 @@ export function MeetingPage() {
             >
               ✋
             </button>
+            {(!isSoloInCall || presenterMode) && (
+              <div className="relative shrink-0" ref={layoutMenuRef}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setLayoutMenuOpen(o => !o)
+                    setCallSettingsOpen(false)
+                  }}
+                  className={cx(
+                    'flex h-14 w-14 cursor-pointer items-center justify-center rounded-full border text-white transition active:scale-95',
+                    layoutMenuOpen || galleryLayout
+                      ? 'border-sky-400/40 bg-blue-600/85 hover:bg-blue-600'
+                      : 'border-white/18 bg-[#3c4043]/90 hover:border-white/28 hover:bg-[#505458]',
+                  )}
+                  aria-haspopup="menu"
+                  aria-expanded={layoutMenuOpen}
+                  aria-label="Layout"
+                  title="Layout"
+                >
+                  <svg viewBox="0 0 24 24" fill="currentColor" width="22" height="22" aria-hidden>
+                    <path d="M4 8h4V4H4v4zm6 12h4v-4h-4v4zm-6 0h4v-4H4v4zm0-6h4v-4H4v4zm6 0h4v-4h-4v4zm6-10v4h4V4h-4zm-6 4h4V4h-4v4zm6 6h4v-4h-4v4zm0 6h4v-4h-4v4z" />
+                  </svg>
+                </button>
+                {layoutMenuOpen && (
+                  <div
+                    className="absolute bottom-[calc(100%+10px)] left-1/2 z-50 w-[min(340px,calc(100vw-28px))] -translate-x-1/2 overflow-hidden rounded-2xl border border-white/10 bg-[#1c1c1e]/98 py-2 shadow-2xl backdrop-blur-xl"
+                    role="menu"
+                    aria-label="Layout options"
+                  >
+                    <p className="px-3.5 pb-2 text-[0.65rem] font-bold uppercase tracking-wider text-white/35">Layout</p>
+                    <button
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={callVideoLayout === 'auto'}
+                      onClick={() => {
+                        setCallVideoLayout('auto')
+                        setLayoutMenuOpen(false)
+                      }}
+                      className={cx(
+                        'flex w-full items-start gap-3 px-3.5 py-2.5 text-left transition hover:bg-white/6',
+                        callVideoLayout === 'auto' && 'bg-white/5',
+                      )}
+                    >
+                      <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-white/25">
+                        {callVideoLayout === 'auto' && <span className="h-2.5 w-2.5 rounded-full bg-sky-400" />}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-[13px] font-semibold text-white/90">Auto</span>
+                        <span className="mt-0.5 block text-[12px] leading-snug text-white/45">
+                          Peers fill the grid; your camera stays in the small tile at the bottom. Spotlight follows the speaker; screen share uses the large slide with a swipeable people page.
+                        </span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={callVideoLayout === 'gallery'}
+                      onClick={() => {
+                        setCallVideoLayout('gallery')
+                        setLayoutMenuOpen(false)
+                      }}
+                      className={cx(
+                        'flex w-full items-start gap-3 px-3.5 py-2.5 text-left transition hover:bg-white/6',
+                        callVideoLayout === 'gallery' && 'bg-white/5',
+                      )}
+                    >
+                      <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-white/25">
+                        {callVideoLayout === 'gallery' && <span className="h-2.5 w-2.5 rounded-full bg-sky-400" />}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-[13px] font-semibold text-white/90">Tiled</span>
+                        <span className="mt-0.5 block text-[12px] leading-snug text-white/45">
+                          You appear in the grid with everyone else. While someone shares, the grid shows people only—pick Auto to see the shared screen again.
+                        </span>
+                      </span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
             <button
               type="button"
               className={cx(
@@ -6892,7 +7259,10 @@ export function MeetingPage() {
                   ? 'border-sky-400/40 bg-blue-600/85 hover:bg-blue-600'
                   : 'border-white/18 bg-[#3c4043]/90 hover:border-white/28 hover:bg-[#505458]',
               )}
-              onClick={() => setCallSettingsOpen(v => !v)}
+              onClick={() => {
+                setCallSettingsOpen(v => !v)
+                setLayoutMenuOpen(false)
+              }}
               title={callSettingsOpen ? 'Close settings' : 'Call settings'}
               aria-label={callSettingsOpen ? 'Close settings' : 'Open call settings'}
               aria-expanded={callSettingsOpen}
