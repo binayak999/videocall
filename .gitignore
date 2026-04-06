@@ -1,4 +1,5 @@
 /electron/
+/videocall/
 
 # Dependencies
 node_modules/
