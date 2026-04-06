@@ -1,31 +1,13 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Navigate, useOutletContext } from 'react-router-dom'
-import type { NexivoOutletContext } from '../components/Layout'
-import { errorMessage, patchSystemRtcMode } from '../lib/api'
-import {
-  defaultRtcModeFromEnv,
-  readRtcModeFromStorage,
-  resolvedRtcMode,
-  type RtcMode,
-  writeRtcModeToStorage,
-} from '../lib/rtcMode'
+import { defaultRtcModeFromEnv, readRtcModeFromStorage, type RtcMode, writeRtcModeToStorage } from '../lib/rtcMode'
 
 function cx(...classes: Array<string | false | null | undefined>): string {
   return classes.filter(Boolean).join(' ')
 }
 
 export function ControlPage() {
-  const {
-    systemRtcLoaded,
-    systemRtcMode,
-    systemRtcPersisted,
-    canControlRtcMode,
-    refreshSystemRtcMode,
-  } = useOutletContext<NexivoOutletContext>()
   const envDefault = useMemo(() => defaultRtcModeFromEnv(), [])
   const [stored, setStored] = useState<RtcMode | null>(null)
-  const [busy, setBusy] = useState(false)
-  const [err, setErr] = useState<string | null>(null)
 
   useEffect(() => {
     setStored(readRtcModeFromStorage())
@@ -36,150 +18,112 @@ export function ControlPage() {
     return () => window.removeEventListener('storage', onStorage)
   }, [])
 
-  const globalMode = systemRtcMode ?? envDefault
-  const effectivePick = systemRtcMode ?? envDefault
+  const effective: RtcMode = stored ?? envDefault
 
-  const applySystemMode = async (mode: RtcMode) => {
-    setErr(null)
-    setBusy(true)
-    try {
-      await patchSystemRtcMode(mode)
-      await refreshSystemRtcMode()
-    } catch (e: unknown) {
-      setErr(errorMessage(e))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  if (!systemRtcLoaded) {
-    return (
-      <div className="flex min-h-0 flex-1 items-center justify-center px-4 py-12 text-sm text-(--nexivo-text-muted)">
-        Loading…
-      </div>
-    )
-  }
-
-  if (!canControlRtcMode) {
-    return <Navigate to="/" replace />
-  }
-
-  const card =
-    'rounded-2xl border border-(--nexivo-border-subtle) bg-(--nexivo-muted-surface) p-5 sm:p-6 shadow-sm'
-
-  const optionBase =
-    'flex flex-col gap-1 rounded-xl border px-4 py-3.5 text-left transition sm:min-h-[5.5rem]'
+  const card = 'rounded-xl border border-(--nexivo-border-subtle) bg-(--nexivo-muted-surface) p-5'
+  const radioRow = 'flex items-start gap-3 rounded-xl border border-(--nexivo-border-subtle) bg-(--nexivo-input-bg) p-4 transition'
 
   return (
-    <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto overflow-x-hidden">
-      <div className="mx-auto w-full max-w-lg px-4 py-6 sm:px-5 sm:py-8">
-        <header className="mb-6 min-w-0">
-          <h1 className="text-xl font-bold tracking-tight text-(--nexivo-text) sm:text-2xl">Control</h1>
-          <p className="mt-2 max-w-prose text-sm leading-relaxed text-(--nexivo-text-muted)">
-            Set the organization-wide default (mesh or LiveKit). Saved in the database for all users; individual browsers or
-            meeting hosts can still override for a session.
-          </p>
-        </header>
+    <div className="mx-auto w-full max-w-xl px-5 py-5 text-left">
+      <h1 className="text-xl font-bold tracking-tight text-(--nexivo-text)">Control</h1>
+      <p className="mt-1 text-sm text-(--nexivo-text-muted)">
+        Pick how call media is carried: mesh (peer-to-peer over the existing signaling server) or LiveKit (SFU). Both stay
+        available; changing this reloads the app and applies to the next meeting you join.
+      </p>
+      <div className="mt-3 flex items-start gap-2 rounded-xl border border-[#f59e0b]/40 bg-[#f59e0b]/8 px-4 py-3">
+        <svg className="mt-0.5 h-4 w-4 shrink-0 text-[#f59e0b]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M12 2a10 10 0 100 20A10 10 0 0012 2z" />
+        </svg>
+        <p className="text-sm text-(--nexivo-text-muted)">
+          <span className="font-semibold text-(--nexivo-text)">Host controls the mode.</span>{' '}
+          When you start a meeting as the host, your selected mode is applied to every participant automatically.
+          Guests who join after you adopt your mode and don't need to change anything here.
+        </p>
+      </div>
 
-        <section className={card}>
-          <div className="flex flex-wrap items-start justify-between gap-3 border-b border-(--nexivo-border-subtle) pb-4">
-            <div>
-              <h2 className="text-sm font-semibold text-(--nexivo-text)">Global default</h2>
-              <p className="mt-1 font-mono text-lg font-semibold tracking-tight text-(--nexivo-text)">{globalMode}</p>
-            </div>
+      <div className={cx('mt-5 space-y-4', card)}>
+        <div>
+          <div className="text-sm font-semibold text-(--nexivo-text)">Meeting transport</div>
+          <div className="mt-1 text-sm text-(--nexivo-text-muted)">
+            Current: <span className="font-semibold text-(--nexivo-text)">{effective}</span>
+            {stored ? (
+              <span className="text-(--nexivo-text-muted)"> (overridden in this browser)</span>
+            ) : (
+              <span className="text-(--nexivo-text-muted)"> (default from env)</span>
+            )}
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <button
+            type="button"
+            className={cx(radioRow, effective === 'mesh' && 'border-[#f59e0b] ring-2 ring-[#f59e0b]/35')}
+            onClick={() => {
+              writeRtcModeToStorage('mesh')
+              setStored('mesh')
+              window.location.reload()
+            }}
+          >
             <span
               className={cx(
-                'shrink-0 rounded-full px-2.5 py-1 text-[0.65rem] font-bold uppercase tracking-wider',
-                systemRtcPersisted
-                  ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
-                  : 'bg-(--nexivo-input-bg) text-(--nexivo-text-muted)',
+                'mt-1 inline-flex h-4 w-4 items-center justify-center rounded-full border',
+                effective === 'mesh' ? 'border-[#f59e0b]' : 'border-(--nexivo-border)',
               )}
-              title={
-                systemRtcPersisted
-                  ? 'Value is stored in PostgreSQL (SystemSetting).'
-                  : 'No DB row yet; using server environment until you save.'
-              }
             >
-              {systemRtcPersisted ? 'Saved in database' : 'Env default only'}
+              {effective === 'mesh' && <span className="h-2 w-2 rounded-full bg-[#f59e0b]" />}
             </span>
-          </div>
+            <span className="flex-1">
+              <span className="block text-sm font-semibold text-(--nexivo-text)">Mesh (current signaling)</span>
+              <span className="mt-0.5 block text-sm text-(--nexivo-text-muted)">
+                Peer-to-peer media. Easiest to run, but doesn’t scale well to many participants.
+              </span>
+            </span>
+          </button>
 
-          {systemRtcMode === null ? (
-            <p className="mt-4 text-sm text-(--nexivo-text-muted)">
-              API unreachable — showing build default <span className="font-mono font-semibold">{envDefault}</span>. Fix the API
-              connection, then refresh.
-            </p>
-          ) : (
-            <div className="mt-5 space-y-3">
-              <p className="text-sm text-(--nexivo-text-secondary)">Choose transport — writes to the database for all users.</p>
-              {err ? <p className="text-sm text-red-400">{err}</p> : null}
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <button
-                  type="button"
-                  disabled={busy || effectivePick === 'mesh'}
-                  onClick={() => void applySystemMode('mesh')}
-                  className={cx(
-                    optionBase,
-                    effectivePick === 'mesh'
-                      ? 'border-[#f59e0b] bg-[#f59e0b]/10 ring-2 ring-[#f59e0b]/30'
-                      : 'border-(--nexivo-border-subtle) bg-(--nexivo-input-bg) hover:border-(--nexivo-border)',
-                    busy && effectivePick !== 'mesh' ? 'opacity-60' : '',
-                  )}
-                >
-                  <span className="text-sm font-semibold text-(--nexivo-text)">Mesh</span>
-                  <span className="text-xs leading-snug text-(--nexivo-text-muted)">Peer-to-peer via signaling. Simple, smaller groups.</span>
-                </button>
-                <button
-                  type="button"
-                  disabled={busy || effectivePick === 'livekit'}
-                  onClick={() => void applySystemMode('livekit')}
-                  className={cx(
-                    optionBase,
-                    effectivePick === 'livekit'
-                      ? 'border-[#f59e0b] bg-[#f59e0b]/10 ring-2 ring-[#f59e0b]/30'
-                      : 'border-(--nexivo-border-subtle) bg-(--nexivo-input-bg) hover:border-(--nexivo-border)',
-                    busy && effectivePick !== 'livekit' ? 'opacity-60' : '',
-                  )}
-                >
-                  <span className="text-sm font-semibold text-(--nexivo-text)">LiveKit</span>
-                  <span className="text-xs leading-snug text-(--nexivo-text-muted)">SFU — needs LiveKit server and API credentials.</span>
-                </button>
-              </div>
-              {busy ? <p className="text-xs text-(--nexivo-text-muted)">Saving to database…</p> : null}
-            </div>
-          )}
-        </section>
-
-        <section className={cx('mt-5', card)}>
-          <h2 className="text-sm font-semibold text-(--nexivo-text)">This browser</h2>
-          <p className="mt-2 text-sm leading-relaxed text-(--nexivo-text-muted)">
-            Effective mode:{' '}
-            <span className="font-mono font-semibold text-(--nexivo-text)">{resolvedRtcMode()}</span>
-            {stored ? (
-              <span> — includes a local value (preference or last host sync).</span>
-            ) : (
-              <span> — follows the global default above.</span>
-            )}
-          </p>
-          <div className="mt-4 flex flex-col gap-3 border-t border-(--nexivo-border-subtle) pt-4 sm:flex-row sm:items-center sm:justify-between">
-            <p className="text-sm text-(--nexivo-text-muted)">
-              Clear local storage so the global default applies again (reloads the page).
-            </p>
-            <button
-              type="button"
-              disabled={!stored}
-              className="h-10 shrink-0 rounded-xl border border-(--nexivo-border-subtle) bg-(--nexivo-input-bg) px-4 text-sm font-semibold text-(--nexivo-text) transition hover:border-(--nexivo-border) disabled:opacity-30"
-              onClick={() => {
-                writeRtcModeToStorage(null)
-                setStored(null)
-                window.location.reload()
-              }}
+          <button
+            type="button"
+            className={cx(radioRow, effective === 'livekit' && 'border-[#f59e0b] ring-2 ring-[#f59e0b]/35')}
+            onClick={() => {
+              writeRtcModeToStorage('livekit')
+              setStored('livekit')
+              window.location.reload()
+            }}
+          >
+            <span
+              className={cx(
+                'mt-1 inline-flex h-4 w-4 items-center justify-center rounded-full border',
+                effective === 'livekit' ? 'border-[#f59e0b]' : 'border-(--nexivo-border)',
+              )}
             >
-              Clear local override
-            </button>
+              {effective === 'livekit' && <span className="h-2 w-2 rounded-full bg-[#f59e0b]" />}
+            </span>
+            <span className="flex-1">
+              <span className="block text-sm font-semibold text-(--nexivo-text)">LiveKit (SFU)</span>
+              <span className="mt-0.5 block text-sm text-(--nexivo-text-muted)">
+                SFU media with simulcast/adaptive streaming. Best quality and scalability, needs LiveKit server.
+              </span>
+            </span>
+          </button>
+        </div>
+
+        <div className="flex items-center justify-between gap-3 border-t border-(--nexivo-border-subtle) pt-4">
+          <div className="text-sm text-(--nexivo-text-muted)">
+            Reset to env default: <span className="font-semibold text-(--nexivo-text)">{envDefault}</span>
           </div>
-        </section>
+          <button
+            type="button"
+            className="h-9 rounded-lg border border-(--nexivo-border-subtle) bg-(--nexivo-input-bg) px-3 text-sm font-semibold text-(--nexivo-text) transition hover:border-(--nexivo-border)"
+            onClick={() => {
+              writeRtcModeToStorage(null)
+              setStored(null)
+              window.location.reload()
+            }}
+          >
+            Reset
+          </button>
+        </div>
       </div>
     </div>
   )
 }
+

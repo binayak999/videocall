@@ -964,8 +964,10 @@ export function MeetingPage() {
       localStripRef.current.srcObject = camStream
       void localStripRef.current.play().catch(() => {})
     }
-    // screenSharingPeers (Set identity) + screenSharing: re-run when presenter mode changes.
-  }, [callView, screenSharing, screenSharingPeers])
+    // activeSpeakerId / presenterPage: new <video> nodes mount when entering speaker spotlight or
+    // swiping presenter mode — they need srcObject after mount (refs were null on prior runs).
+    // camEnabled: turning camera on after call must refresh elements that mounted while off.
+  }, [callView, screenSharing, screenSharingPeers, activeSpeakerId, presenterPage, camEnabled])
 
   // keep chat pinned to latest message
   useEffect(() => {
@@ -994,7 +996,7 @@ export function MeetingPage() {
         void el.play().catch(() => {})
       }
     }
-  }, [peerIds, screenSharingPeers])
+  }, [peerIds, screenSharingPeers, activeSpeakerId, presenterPage])
 
   // Detect companion app and open WebSocket bridge
   useEffect(() => {

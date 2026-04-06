@@ -1,17 +1,9 @@
-import dotenv from "dotenv";
-import path from "node:path";
-
-// `dotenv/config` only reads `process.cwd()/.env`, so SUPERADMIN_EMAILS and other api-only vars are missing
-// when the process starts from the monorepo root. Load repo + package env explicitly; api `.env` wins.
-const apiPackageRoot = path.join(__dirname, "..");
-const serverMonorepoRoot = path.join(apiPackageRoot, "..", "..");
-dotenv.config({ path: path.join(serverMonorepoRoot, ".env") });
-dotenv.config({ path: path.join(apiPackageRoot, ".env"), override: true });
-
+import "dotenv/config";
 import "./types/express-augmentation";
 import { createHmac } from "node:crypto";
 import fs from "node:fs";
 import https from "node:https";
+import path from "node:path";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -23,7 +15,6 @@ import { authMiddleware } from "./middleware/auth";
 import { meetingRecordingUploadHandler } from "./routes/meetingRecordingUpload";
 import { meetingsRouter } from "./routes/meetings";
 import { recordingsListRouter } from "./routes/recordings";
-import { systemRtcModeRouter } from "./routes/systemRtcMode";
 import { translateRouter } from "./routes/translate";
 import { hostAgentTranscribeHandler } from "./routes/hostAgentTranscribe";
 
@@ -309,7 +300,6 @@ app.get("/api/openapi.json", (req, res) => {
 });
 
 app.use("/api/auth", authRouter);
-app.use("/api/system", systemRtcModeRouter);
 app.use("/api/meetings", meetingsRouter);
 app.use("/api/translate", translateRouter);
 app.use("/api/recordings", recordingsListRouter);

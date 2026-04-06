@@ -2,13 +2,6 @@ export type RtcMode = 'mesh' | 'livekit'
 
 const STORAGE_KEY = 'bandr:rtcMode'
 
-/** Server default from GET /api/system/rtc-mode (set by Layout after fetch). */
-let serverRtcDefault: RtcMode | null = null
-
-export function setServerRtcDefault(mode: RtcMode | null): void {
-  serverRtcDefault = mode
-}
-
 export function readRtcModeFromStorage(): RtcMode | null {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
@@ -34,6 +27,6 @@ export function defaultRtcModeFromEnv(): RtcMode {
 }
 
 export function resolvedRtcMode(): RtcMode {
-  return readRtcModeFromStorage() ?? serverRtcDefault ?? defaultRtcModeFromEnv()
+  return readRtcModeFromStorage() ?? defaultRtcModeFromEnv()
 }
 

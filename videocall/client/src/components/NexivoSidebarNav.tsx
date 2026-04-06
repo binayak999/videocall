@@ -2,7 +2,6 @@ import { type ReactNode } from 'react'
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { clearToken } from '../lib/auth'
 import { useAuthToken } from '../lib/useAuthToken'
-import { useLayoutApp } from './LayoutAppContext'
 
 function cx(...classes: Array<string | false | null | undefined>): string {
   return classes.filter(Boolean).join(' ')
@@ -74,11 +73,8 @@ export function NexivoSidebarNav() {
   const { pathname } = useLocation()
   const [searchParams] = useSearchParams()
   const authed = useAuthToken() !== null
-  const { systemRtcLoaded, canControlRtcMode } = useLayoutApp()
   const panel = searchParams.get('panel')
   const tab = searchParams.get('tab')
-
-  const showControlNav = systemRtcLoaded && canControlRtcMode
 
   const authedItems = authed
     ? ([
@@ -117,8 +113,7 @@ export function NexivoSidebarNav() {
       ] as const)
     : []
 
-  const coreNav = showControlNav ? navItems : navItems.filter(i => i.key !== 'control')
-  const items = [...coreNav, ...authedItems, ...guestItems]
+  const items = [...navItems, ...authedItems, ...guestItems]
 
   function navActive(navKey: (typeof items)[number]['key']): boolean {
     if (navKey === 'recordings') return pathname.startsWith('/recordings')
