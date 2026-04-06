@@ -114,8 +114,3 @@ model MeetingCaption {
 
   @@index([meetingId, createdAt])
 }
-
-model SystemSetting {
-  key   String @id
-  value String
-}

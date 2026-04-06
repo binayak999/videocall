@@ -824,12 +824,6 @@ export function buildOpenApi(req: Request): Record<string, unknown> {
                     message: { type: "string" },
                     knowledgeBase: { type: "string" },
                     meetingContext: { type: "string" },
-                    duoHostMode: { type: "boolean" },
-                    autopilotFast: {
-                      type: "boolean",
-                      description:
-                        "When true, uses lower max_tokens and a tighter prompt for faster in-call autopilot replies.",
-                    },
                   },
                 },
               },

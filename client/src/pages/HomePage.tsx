@@ -120,7 +120,7 @@ export function HomePage() {
             'rounded-full px-3 py-1.5 text-xs font-semibold transition no-underline sm:px-4 sm:text-sm',
             !showNotesPanel && tab === 'create' ? 'bg-[#f59e0b] text-black' : pillInactive,
           )}
-        > 
+        >
           Create
         </Link>
         <Link
@@ -129,7 +129,7 @@ export function HomePage() {
             'rounded-full px-3 py-1.5 text-xs font-semibold transition no-underline sm:px-4 sm:text-sm',
             showNotesPanel ? 'bg-[#f59e0b] text-black' : pillInactive,
           )}
-        > 
+        >
           Notes
         </Link>
         {authed && (

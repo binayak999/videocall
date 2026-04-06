@@ -20,34 +20,6 @@ const CANVAS_H = 720
 const CAPTURE_FPS = 24
 const STRIP_H = 140
 
-/** Detect track set changes when callers mutate a MediaStream in place (common with LiveKit). */
-function streamPlaybackFingerprint(s: MediaStream | null): string {
-  if (!s) return ''
-  return [...s.getTracks()]
-    .map(t => `${t.kind}:${t.id}:${t.readyState}:${t.muted}`)
-    .sort()
-    .join('|')
-}
-
-/**
- * Dedicated playback stream for compositor &lt;video&gt; elements. Cloning avoids Chrome/Chromium
- * failing to decode WebRTC (especially SFU/LiveKit) when the same MediaStream is already bound
- * to visible tiles, and attaching elements to the document avoids zero videoWidth on off-DOM videos.
- */
-function cloneStreamForVideoPlayback(src: MediaStream | null): MediaStream | null {
-  if (!src) return null
-  const out = new MediaStream()
-  for (const t of src.getTracks()) {
-    if (t.kind !== 'video') continue
-    try {
-      out.addTrack(t.clone())
-    } catch {
-      out.addTrack(t)
-    }
-  }
-  return out.getVideoTracks().length > 0 ? out : null
-}
-
 function drawVideoCover(
   ctx: CanvasRenderingContext2D,
   v: HTMLVideoElement,
@@ -89,9 +61,6 @@ export class LiveBroadcastCompositor {
   private raf = 0
   private running = false
   private videoEls = new Map<string, HTMLVideoElement>()
-  /** Last fingerprint we built playback clones for (per tile / screen key). */
-  private playbackFingerprintByKey = new Map<string, string>()
-  private hiddenMount: HTMLDivElement | null = null
   private audioCtx: AudioContext | null = null
   private gainMaster: GainNode | null = null
   private audioSources = new Map<string, MediaStreamAudioSourceNode>()
@@ -133,19 +102,10 @@ export class LiveBroadcastCompositor {
     if (this.raf) cancelAnimationFrame(this.raf)
     this.raf = 0
     for (const v of this.videoEls.values()) {
-      const s = v.srcObject as MediaStream | null
-      if (s) {
-        for (const tr of s.getTracks()) tr.stop()
-      }
       v.srcObject = null
       v.remove()
     }
     this.videoEls.clear()
-    this.playbackFingerprintByKey.clear()
-    if (this.hiddenMount) {
-      this.hiddenMount.remove()
-      this.hiddenMount = null
-    }
     for (const n of this.audioSources.values()) {
       try {
         n.disconnect()
@@ -181,17 +141,6 @@ export class LiveBroadcastCompositor {
     this.syncAudio()
   }
 
-  private ensureHiddenMount(): HTMLDivElement {
-    if (this.hiddenMount) return this.hiddenMount
-    const d = document.createElement('div')
-    d.setAttribute('aria-hidden', 'true')
-    d.style.cssText =
-      'position:fixed;left:0;top:0;width:0;height:0;opacity:0;overflow:hidden;pointer-events:none;z-index:-1'
-    document.body.appendChild(d)
-    this.hiddenMount = d
-    return d
-  }
-
   private ensureVideo(key: string): HTMLVideoElement {
     let v = this.videoEls.get(key)
     if (!v) {
@@ -200,28 +149,9 @@ export class LiveBroadcastCompositor {
       v.playsInline = true
       v.setAttribute('playsinline', '')
       v.setAttribute('webkit-playsinline', '')
-      this.ensureHiddenMount().appendChild(v)
       this.videoEls.set(key, v)
     }
     return v
-  }
-
-  private stopPlaybackOnVideo(v: HTMLVideoElement): void {
-    const s = v.srcObject as MediaStream | null
-    if (s) {
-      for (const tr of s.getTracks()) tr.stop()
-    }
-    v.srcObject = null
-  }
-
-  private bindVideoPlayback(key: string, src: MediaStream | null): void {
-    const fp = streamPlaybackFingerprint(src)
-    if (this.playbackFingerprintByKey.get(key) === fp) return
-    this.playbackFingerprintByKey.set(key, fp)
-    const v = this.ensureVideo(key)
-    this.stopPlaybackOnVideo(v)
-    v.srcObject = cloneStreamForVideoPlayback(src)
-    void v.play().catch(() => {})
   }
 
   private syncVideos(): void {
@@ -233,21 +163,29 @@ export class LiveBroadcastCompositor {
       if (!keys.has(k)) {
         const v = this.videoEls.get(k)
         if (v) {
-          this.stopPlaybackOnVideo(v)
+          v.srcObject = null
           v.remove()
         }
         this.videoEls.delete(k)
-        this.playbackFingerprintByKey.delete(k)
       }
     }
 
     if (this.screenMain) {
       const k = `screen:${this.screenMain.stream.id}`
-      this.bindVideoPlayback(k, this.screenMain.stream)
+      const v = this.ensureVideo(k)
+      if (v.srcObject !== this.screenMain.stream) {
+        v.srcObject = this.screenMain.stream
+        void v.play().catch(() => {})
+      }
     }
 
     for (const t of this.tiles) {
-      this.bindVideoPlayback(t.key, t.stream)
+      const v = this.ensureVideo(t.key)
+      const next = t.stream
+      if (v.srcObject !== next) {
+        v.srcObject = next
+        void v.play().catch(() => {})
+      }
     }
   }
 

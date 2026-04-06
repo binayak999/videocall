@@ -27,7 +27,7 @@ export async function verifyRecaptchaV3(
   req: Request,
   token: string | undefined,
   expectedAction: string,
-): Promise<{ ok: true } | { ok: false; status: number; error: string; detail?: string }> {
+): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
   const secret = process.env.RECAPTCHA_SECRET_KEY?.trim();
   if (!secret) {
     return { ok: true };
@@ -56,15 +56,7 @@ export async function verifyRecaptchaV3(
   }
 
   if (!data.success) {
-    const codes = data["error-codes"];
-    const detail =
-      Array.isArray(codes) && codes.length > 0 ? codes.join(", ") : undefined;
-    return {
-      ok: false,
-      status: 400,
-      error: "reCAPTCHA verification failed",
-      detail,
-    };
+    return { ok: false, status: 400, error: "reCAPTCHA verification failed" };
   }
 
   const minRaw = process.env.RECAPTCHA_MIN_SCORE?.trim();

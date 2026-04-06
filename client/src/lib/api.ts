@@ -103,28 +103,6 @@ export async function getLiveKitJoinToken(meetingCode: string): Promise<{ url: s
   )
 }
 
-export type SystemRtcModeResponse = {
-  rtcMode: 'mesh' | 'livekit'
-  canControl: boolean
-  /** True when `SystemSetting` row `rtc_mode` exists (global value is stored in DB, not only env). */
-  persisted: boolean
-}
-
-/** Sends Bearer token when logged in so the API can return `canControl` for superadmins. */
-export async function fetchSystemRtcMode(): Promise<SystemRtcModeResponse> {
-  return await requestJson<SystemRtcModeResponse>('/api/system/rtc-mode', { auth: true })
-}
-
-export async function patchSystemRtcMode(
-  rtcMode: 'mesh' | 'livekit',
-): Promise<{ rtcMode: 'mesh' | 'livekit'; persisted: true }> {
-  return await requestJson<{ rtcMode: 'mesh' | 'livekit'; persisted: true }>('/api/system/rtc-mode', {
-    method: 'PATCH',
-    body: JSON.stringify({ rtcMode }),
-    auth: true,
-  })
-}
-
 export type MeetingCaptionRow = {
   id: string
   speakerUserId: string

@@ -37,7 +37,6 @@ async function runChatCompletion(opts: {
   priorMessages: ChatTurn[]
   userMessage: string
   maxTokens: number
-  temperature: number
 }): Promise<string> {
   const messages: Array<{ role: string; content: string }> = [
     { role: "system", content: opts.system },
@@ -47,7 +46,7 @@ async function runChatCompletion(opts: {
 
   const body: Record<string, unknown> = {
     model: opts.model,
-    temperature: opts.temperature,
+    temperature: 0.35,
     max_tokens: opts.maxTokens,
     messages,
   }
@@ -82,7 +81,6 @@ function buildHostAgentSystem(input: {
   knowledgeBase: string
   meetingContext: string
   duoHostMode: boolean
-  autopilotFast: boolean
 }): string {
   const kb = input.knowledgeBase.trim()
   const ctx = input.meetingContext.trim()
@@ -111,11 +109,7 @@ Rules:
 - If the knowledge base has relevant facts, use them. If not, you may use general knowledge but say so, and ask one clarifying question if needed (except in duo mode for casual back-and-forth, where a light acknowledgment is enough).
 - Meeting context may be incomplete or misheard—treat it as hints only.
 - Do not invent policies, dates, numbers, or commitments for the host.
-${input.duoHostMode ? "- In duo mode, prefer helpful continuity over interrogating with clarifying questions." : "- If the latest message is ambiguous, ask one clarifying question instead of guessing."}${
-    input.autopilotFast
-      ? "\n- Autopilot (live): keep answers as short as possible—usually one sentence, two at most unless they clearly need detail. Stop as soon as the point is made so speech plays back quickly."
-      : ""
-  }`
+${input.duoHostMode ? "- In duo mode, prefer helpful continuity over interrogating with clarifying questions." : "- If the latest message is ambiguous, ask one clarifying question instead of guessing."}`
 }
 
 export function isHostAgentLlmNotConfiguredError(e: unknown): boolean {
@@ -129,8 +123,6 @@ export async function runHostAgentChat(input: {
   meetingContext: string
   conversationHistory?: ChatTurn[]
   duoHostMode?: boolean
-  /** Shorter replies + lower max_tokens for in-call autopilot latency. */
-  autopilotFast?: boolean
 }): Promise<{ reply: string; provider: "huggingface" | "openai" }> {
   const msg = input.userMessage.trim()
   if (!msg) {
@@ -140,7 +132,6 @@ export async function runHostAgentChat(input: {
   const kb = input.knowledgeBase.trim()
   const ctx = input.meetingContext.trim()
   const duoHostMode = Boolean(input.duoHostMode)
-  const autopilotFast = Boolean(input.autopilotFast)
   const priorMessages = Array.isArray(input.conversationHistory) ? input.conversationHistory : []
 
   const system = buildHostAgentSystem({
@@ -148,17 +139,7 @@ export async function runHostAgentChat(input: {
     knowledgeBase: kb,
     meetingContext: ctx,
     duoHostMode,
-    autopilotFast,
   })
-
-  const maxTokens = autopilotFast
-    ? duoHostMode
-      ? 140
-      : 110
-    : duoHostMode
-      ? 420
-      : 320
-  const temperature = autopilotFast ? 0.28 : 0.35
 
   const hfToken =
     process.env.HUGGINGFACE_API_TOKEN?.trim() || process.env.HF_TOKEN?.trim()
@@ -178,8 +159,7 @@ export async function runHostAgentChat(input: {
       system,
       priorMessages,
       userMessage: msg,
-      maxTokens,
-      temperature,
+      maxTokens: duoHostMode ? 420 : 320,
     })
     return { reply, provider: "huggingface" }
   }
@@ -196,8 +176,7 @@ export async function runHostAgentChat(input: {
       system,
       priorMessages,
       userMessage: msg,
-      maxTokens,
-      temperature,
+      maxTokens: duoHostMode ? 420 : 320,
     })
     return { reply, provider: "openai" }
   }
