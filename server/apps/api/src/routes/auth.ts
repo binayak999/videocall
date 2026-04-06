@@ -46,7 +46,9 @@ router.post("/register", async (req, res) => {
     "register",
   );
   if (!cap.ok) {
-    res.status(cap.status).json({ error: cap.error });
+    res
+      .status(cap.status)
+      .json({ error: cap.error, ...(cap.detail ? { detail: cap.detail } : {}) });
     return;
   }
 
@@ -118,7 +120,9 @@ router.post("/login", async (req, res) => {
     "login",
   );
   if (!cap.ok) {
-    res.status(cap.status).json({ error: cap.error });
+    res
+      .status(cap.status)
+      .json({ error: cap.error, ...(cap.detail ? { detail: cap.detail } : {}) });
     return;
   }
 
@@ -171,7 +175,9 @@ router.post("/google", async (req, res) => {
     "google_login",
   );
   if (!cap.ok) {
-    res.status(cap.status).json({ error: cap.error });
+    res
+      .status(cap.status)
+      .json({ error: cap.error, ...(cap.detail ? { detail: cap.detail } : {}) });
     return;
   }
 

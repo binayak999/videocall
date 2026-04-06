@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { nanoid } from "nanoid";
-import { AccessToken } from "livekit-server-sdk";
+import { AccessToken, TrackSource } from "livekit-server-sdk";
 import { prisma } from "@bandr/db";
 import {
   buildRecordingObjectKey,
@@ -340,6 +340,7 @@ router.post("/:code/host-agent/chat", authMiddleware, async (req, res) => {
     meetingContext?: unknown;
     conversationHistory?: unknown;
     duoHostMode?: unknown;
+    autopilotFast?: unknown;
   };
   const message = typeof body.message === "string" ? body.message.trim() : "";
   const knowledgeBase =
@@ -348,6 +349,7 @@ router.post("/:code/host-agent/chat", authMiddleware, async (req, res) => {
     typeof body.meetingContext === "string" ? body.meetingContext.trim() : "";
   const conversationHistory = parseHostAgentConversationHistory(body.conversationHistory);
   const duoHostMode = body.duoHostMode === true;
+  const autopilotFast = body.autopilotFast === true;
 
   if (message.length === 0) {
     res.status(400).json({ error: "message is required" });
@@ -394,6 +396,7 @@ router.post("/:code/host-agent/chat", authMiddleware, async (req, res) => {
         meetingContext,
         conversationHistory,
         duoHostMode,
+        autopilotFast,
       });
       res.json({ reply, provider });
     } catch (e: unknown) {
@@ -671,6 +674,13 @@ router.post("/:code/livekit/token", authMiddleware, async (req, res) => {
       canPublish: true,
       canSubscribe: true,
       canPublishData: true,
+      /** Explicit sources so screen share is never blocked by a restrictive default grant. */
+      canPublishSources: [
+        TrackSource.MICROPHONE,
+        TrackSource.CAMERA,
+        TrackSource.SCREEN_SHARE,
+        TrackSource.SCREEN_SHARE_AUDIO,
+      ],
     });
     const token = await at.toJwt();
     res.json({ url, token });
