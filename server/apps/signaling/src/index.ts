@@ -131,6 +131,37 @@ const roomAttentionPeers = new Map<
   Map<string, { userId: string; userName: string; attentive: boolean; at: number }>
 >();
 
+/** room → signaling peerId → LiveKit `Participant.sid` (unique per media session). */
+const roomLiveKitSidByPeerId = new Map<string, Map<string, string>>();
+
+function liveKitBindingsForClients(room: string): { peerId: string; liveKitSid: string }[] {
+  const m = roomLiveKitSidByPeerId.get(room);
+  if (!m) return [];
+  const adapter = io.sockets.adapter.rooms.get(room);
+  if (!adapter) return [];
+  const out: { peerId: string; liveKitSid: string }[] = [];
+  for (const [peerId, liveKitSid] of m) {
+    if (adapter.has(peerId)) out.push({ peerId, liveKitSid });
+  }
+  return out;
+}
+
+function recordLiveKitBind(room: string, peerId: string, liveKitSid: string): void {
+  let inner = roomLiveKitSidByPeerId.get(room);
+  if (!inner) {
+    inner = new Map();
+    roomLiveKitSidByPeerId.set(room, inner);
+  }
+  inner.set(peerId, liveKitSid);
+}
+
+function forgetLiveKitBind(room: string, peerId: string): void {
+  const inner = roomLiveKitSidByPeerId.get(room);
+  if (!inner) return;
+  inner.delete(peerId);
+  if (inner.size === 0) roomLiveKitSidByPeerId.delete(room);
+}
+
 function buildAttentionRoster(room: string): {
   userId: string;
   userName: string;
@@ -573,6 +604,7 @@ async function buildJoinApprovedPayload(
     whiteboardEditors: [...(roomWhiteboardEditors.get(room) ?? new Set<string>())],
     handRaisedPeerIds: raisedPeerIds,
     meetingRecordingActive: roomMeetingRecording.get(room) === true,
+    liveKitBindings: liveKitBindingsForClients(room),
     ...voteJoinFields(room, reqData.userId),
   };
 }
@@ -681,6 +713,7 @@ function leaveMeeting(socket: Socket): void {
     ap.delete(socket.id);
     if (ap.size === 0) roomAttentionPeers.delete(room);
   }
+  forgetLiveKitBind(room, socket.id);
   emitAttentionSyncToHosts(room);
   void socket.leave(room);
   socket.data.meetingRoom = undefined;
@@ -730,6 +763,7 @@ function leaveMeeting(socket: Socket): void {
     roomVoteByUserId.delete(room);
     roomAttentionPeers.delete(room);
     roomLiveStreamActive.delete(room);
+    roomLiveKitSidByPeerId.delete(room);
     purgeLiveCollabStateForRoom(room);
   }
 }
@@ -865,6 +899,21 @@ io.on("connection", (socket) => {
 
   socket.on("meeting:leave", () => {
     leaveMeeting(socket);
+  });
+
+  /** LiveKit: map this socket's tile to `RemoteParticipant.sid` for correct video routing (esp. duplicate userIds). */
+  socket.on("meeting:livekit-bind", (msg: unknown) => {
+    const sd = socket.data as MeetingSocketData;
+    const room = sd.meetingRoom;
+    if (!room || sd.role === "live-viewer") return;
+    if (!msg || typeof msg !== "object") return;
+    const liveKitSid = (msg as { liveKitSid?: unknown }).liveKitSid;
+    if (typeof liveKitSid !== "string" || liveKitSid.length === 0) return;
+    recordLiveKitBind(room, socket.id, liveKitSid);
+    socket.to(room).emit("meeting:livekit-peer", {
+      peerId: socket.id,
+      liveKitSid,
+    });
   });
 
   // ── Multi-camera source ───────────────────────────────────────────────────
@@ -1133,6 +1182,7 @@ io.on("connection", (socket) => {
       whiteboardEditors: [...(roomWhiteboardEditors.get(room) ?? new Set<string>())],
       handRaisedPeerIds: handRaisedPeerIdsHost,
       meetingRecordingActive: roomMeetingRecording.get(room) === true,
+      liveKitBindings: liveKitBindingsForClients(room),
       ...voteJoinFields(room, selfData.userId),
     });
     if (roomLiveStreamActive.get(room)) {
