@@ -71,6 +71,22 @@ const roomWhiteboardState = new Map<string, boolean>();
 const roomWhiteboardOwner = new Map<string, string>();
 const roomWhiteboardEditors = new Map<string, Set<string>>();
 const roomHostUserId = new Map<string, string>();
+/** Host-chosen media path for the meeting; kept in sync with client `meeting:rtc-mode`. */
+const roomRtcMode = new Map<string, "mesh" | "livekit">();
+
+function parseMeetingJoinArg(raw: unknown): { code: string; rtcMode: "mesh" | "livekit" | null } {
+  if (typeof raw === "string") {
+    return { code: raw.trim(), rtcMode: null };
+  }
+  if (raw && typeof raw === "object") {
+    const o = raw as Record<string, unknown>;
+    const code = typeof o.code === "string" ? o.code.trim() : "";
+    const rm = o.rtcMode;
+    const rtcMode = rm === "mesh" || rm === "livekit" ? rm : null;
+    return { code, rtcMode };
+  }
+  return { code: "", rtcMode: null };
+}
 /** room → peer socketIds with raised hands */
 const roomHandRaisedPeers = new Map<string, Set<string>>();
 /** True while the meeting host has announced active in-call recording (client-side capture). */
@@ -605,6 +621,7 @@ async function buildJoinApprovedPayload(
     handRaisedPeerIds: raisedPeerIds,
     meetingRecordingActive: roomMeetingRecording.get(room) === true,
     liveKitBindings: liveKitBindingsForClients(room),
+    hostMode: roomRtcMode.get(room) ?? null,
     ...voteJoinFields(room, reqData.userId),
   };
 }
@@ -757,6 +774,7 @@ function leaveMeeting(socket: Socket): void {
     roomWhiteboardOwner.delete(room);
     roomWhiteboardEditors.delete(room);
     roomHostUserId.delete(room);
+    roomRtcMode.delete(room);
     roomMeetingRecording.delete(room);
     roomPendingJoinIds.delete(room);
     roomActiveVote.delete(room);
@@ -1025,7 +1043,7 @@ io.on("connection", (socket) => {
     });
   });
 
-  socket.on("meeting:join", async (code: unknown, cb: unknown) => {
+  socket.on("meeting:join", async (rawJoin: unknown, cb: unknown) => {
     if (typeof cb !== "function") return;
     const ack = cb as (v: Record<string, unknown>) => void;
     if ((socket.data as MeetingSocketData).role === "live-viewer") {
@@ -1033,12 +1051,11 @@ io.on("connection", (socket) => {
       return;
     }
 
-    if (typeof code !== "string" || code.trim().length === 0) {
+    const { code: trimmed, rtcMode: joinRtcMode } = parseMeetingJoinArg(rawJoin);
+    if (trimmed.length === 0) {
       ack({ ok: false, error: "Invalid meeting code" });
       return;
     }
-
-    const trimmed = code.trim();
     let meeting: { id: string; hostId: string } | null;
     try {
       meeting = await prisma.meeting.findUnique({
@@ -1118,6 +1135,10 @@ io.on("connection", (socket) => {
       return;
     }
 
+    if (joinRtcMode) {
+      roomRtcMode.set(room, joinRtcMode);
+    }
+
     let existingIds: string[];
     let peerRosterForAck: {
       peerId: string;
@@ -1183,11 +1204,29 @@ io.on("connection", (socket) => {
       handRaisedPeerIds: handRaisedPeerIdsHost,
       meetingRecordingActive: roomMeetingRecording.get(room) === true,
       liveKitBindings: liveKitBindingsForClients(room),
+      hostMode: roomRtcMode.get(room) ?? null,
       ...voteJoinFields(room, selfData.userId),
     });
     if (roomLiveStreamActive.get(room)) {
       emitLiveViewerCountToHost(room);
     }
+  });
+
+  socket.on("meeting:rtc-mode", (payload: unknown) => {
+    const room = socket.data.meetingRoom as string | undefined;
+    if (!room || !payload || typeof payload !== "object") return;
+    const m = payload as { mode?: unknown };
+    const mode = m.mode;
+    if (mode !== "mesh" && mode !== "livekit") return;
+    const hostUserId = roomHostUserId.get(room);
+    const sd = socket.data as MeetingSocketData;
+    if (!hostUserId || sd.userId !== hostUserId) return;
+    roomRtcMode.set(room, mode);
+    socket.to(room).emit("meeting:rtc-mode", {
+      peerId: socket.id,
+      mode,
+      isHost: true,
+    });
   });
 
   socket.on("live:join", async (code: unknown, cb: unknown) => {

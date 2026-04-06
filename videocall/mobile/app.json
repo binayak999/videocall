@@ -1,0 +1,43 @@
+{
+  "expo": {
+    "name": "Nexivo",
+    "slug": "nexivo-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "nexivo",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.itsbinayak.nexivomobile"
+    },
+    "android": {
+      "package": "com.itsbinayak.nexivomobile",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      },
+      "edgeToEdgeEnabled": true,
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-dev-client",
+      "expo-router",
+      "expo-secure-store",
+      "@livekit/react-native-expo-plugin",
+      "@config-plugins/react-native-webrtc"
+    ],
+    "extra": {
+      "recaptchaSiteKey": "6LfBHJ8sAAAAAEnvCGwOcjINUYaxJczLTQFe2FBc"
+    }
+  }
+}

@@ -1,0 +1,45 @@
+{
+  "name": "bandr-companion",
+  "version": "1.0.0",
+  "description": "Bandr Companion – enables OS-level remote control in meetings",
+  "main": "dist/main.js",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "start": "npm run build && electron dist/main.js",
+    "dev": "tsc --watch & electron dist/main.js",
+    "rebuild": "electron-rebuild -f -w @jitsi/robotjs",
+    "postinstall": "electron-rebuild -f -w @jitsi/robotjs || true",
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder"
+  },
+  "dependencies": {
+    "ws": "^8.17.0"
+  },
+  "optionalDependencies": {
+    "@jitsi/robotjs": "^0.6.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.10",
+    "electron": "^29.4.0",
+    "electron-builder": "^24.13.3",
+    "electron-rebuild": "^3.2.9",
+    "typescript": "^5.4.5"
+  },
+  "build": {
+    "appId": "com.bandr.companion",
+    "productName": "Bandr Companion",
+    "asar": true,
+    "asarUnpack": ["**/*.node"],
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": "dmg"
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "linux": {
+      "target": "AppImage"
+    }
+  }
+}
