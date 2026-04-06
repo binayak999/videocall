@@ -1,0 +1,7 @@
+# Dependencies (any depth)
+node_modules/
+
+# Directories
+mobile/
+electron/
+docs/
