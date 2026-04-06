@@ -2576,7 +2576,7 @@ export function MeetingPage() {
     }
   }
 
-  async function establishLiveKitRoom(_peerList: string[]) {
+  async function establishLiveKitRoom(peerList: string[]) {
     const { url, token } = await getLiveKitJoinToken(code)
     await ensureStream()
     const room = new Room({
